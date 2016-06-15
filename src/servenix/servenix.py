@@ -139,7 +139,7 @@ class NixServer(Flask):
         :return: A flask app.
         :rtype: :py:class:`Flask`
         """
-        app = Flask("servenix:{}".format(self._nix_store_path))
+        app = Flask(__name__)
 
         @app.route('/')
         def hello_world():
@@ -198,6 +198,7 @@ def _get_args():
     return parser.parse_args()
 
 def main():
+    """Main entry point."""
     try:
         NIX_BIN_PATH = os.environ["NIX_BIN_PATH"]
         assert exists(join(NIX_BIN_PATH, "nix-store"))
