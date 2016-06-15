@@ -2,24 +2,25 @@
 import os
 from os.path import exists, isdir, join
 import argparse
-from flask import Flask, make_response
-from werkzeug.exceptions import HTTPException
+from flask import Flask, make_response, send_file
 from subprocess import check_output
 import re
 
 _HASH_REGEX=re.compile(r"[a-z0-9]{32}")
 _PATH_REGEX=re.compile(r"([a-z0-9]{32})-.*")
 
-class NoSuchObject(HTTPException):
+class NoSuchObject(IOError):
     """Raises when a store object can't be found."""
-    code = 404
     def __init__(self, message):
         self.message = message
 
-    def get_description(self):
-        """Override so that it can produce a description"""
-        return self.message
-
+def check_output_str(command):
+    """Call check_output and convert into a string."""
+    result = check_output(command)
+    if hasattr(result, "decode"):
+        return result.decode("utf-8")
+    else:
+        return result
 
 class NixServer(Flask):
     """Serves nix packages."""
@@ -37,9 +38,12 @@ class NixServer(Flask):
             "WantMassQuery: 1",
             "Priority: 30"
         ])
-        # The extension given to served compressed objects.
-        self._nar_extention = (".nar.xz" if self._compression_type == "xz"
-                               else ".nar.bz2")
+        if self._compression_type == "bzip2":
+            self._content_type = "application/x-bzip2"
+            self._nar_extension = ".nar.bz2"
+        else:
+            self._content_type = "application/x-xz"
+            self._nar_extension = ".nar.xz"
 
     def store_path_from_hash(self, store_object_hash):
         """Look up a store path using its hash.
@@ -59,17 +63,22 @@ class NixServer(Flask):
         if store_object_hash in self._hashes_to_paths:
             return self._hashes_to_paths[store_object_hash]
         store_objects = os.listdir(self._nix_store_path)
-        for obj in store_objects:
-            match = _PATH_REGEX.match(obj)
-            if match is None:
-                continue
-            full_path = join(self._nix_store_path, obj)
-            _hash = match.group(1)
-            self._hashes_to_paths[_hash] = full_path
-            if _hash == store_object_hash:
-                return full_path
-        raise NoSuchObject("No object with hash {} was found."
-                           .format(store_object_hash))
+        try:
+            for obj in store_objects:
+                if hasattr(obj, "decode"):
+                    obj = obj.decode("utf-8")
+                match = _PATH_REGEX.match(obj)
+                if match is None:
+                    continue
+                full_path = join(self._nix_store_path, obj)
+                _hash = match.group(1)
+                self._hashes_to_paths[_hash] = full_path
+                if _hash == store_object_hash:
+                    return full_path
+            raise NoSuchObject("No object with hash {} was found."
+                               .format(store_object_hash))
+        except TypeError as err:
+            import pdb; pdb.set_trace()
 
     def get_object_info(self, store_path):
         """Given a store path, get some information about the path.
@@ -82,8 +91,8 @@ class NixServer(Flask):
         """
         if store_path in self._paths_to_info:
             return self._paths_to_info[store_path]
-        # Commands wi
-        nix_store_q = lambda option: check_output([
+        # Invoke nix-store with various queries to get package info.
+        nix_store_q = lambda option: check_output_str([
             "{}/nix-store".format(self._nix_bin_path),
             "--query", option, store_path
         ]).strip()
@@ -100,6 +109,29 @@ class NixServer(Flask):
             info["Deriver"] = deriver
         self._paths_to_info[store_path] = info
         return info
+
+    def build_nar(self, store_path):
+        """Build a nix archive (nar) and return the resulting path."""
+        # Construct a nix expression which will produce a nar.
+        nar_expr = "".join([
+            "(import <nix/nar.nix> {",
+            'storePath = "{}";'.format(store_path),
+            'hashAlgo = "sha256";',
+            'compressionType = "{}";'.format(self._compression_type),
+            "})"])
+        # Nix-build this expression, resulting in a store
+        compressed_path = check_output_str([
+            join(self._nix_bin_path, "nix-build"),
+            "--expr", nar_expr
+        ]).strip()
+
+        # This path will contain a compressed file; return its path.
+        contents = os.listdir(compressed_path)
+        for filename in contents:
+            if hasattr(filename, "decode"):
+                filename = filename.decode("utf-8")
+            if filename.endswith(self._nar_extension):
+                return join(compressed_path, filename)
 
     def make_app(self):
         """Create a flask app and set up routes on it.
@@ -131,17 +163,22 @@ class NixServer(Flask):
             # Add a few more keys to the store object, specific to the
             # compression type we're serving.
             store_info["Url"] = "nar/{}{}".format(obj_hash,
-                                                  self._nar_extention)
+                                                  self._nar_extension)
             store_info["Compression"] = self._compression_type
             info_string = "\n".join("{}: {}".format(k, v)
                              for k, v in store_info.items()) + "\n"
             return make_response((info_string, 200,
                                  {"Content-Type": "text/x-nix-narinfo"}))
 
-        @app.route("/nar/<obj_hash>.{}".format(self._nar_extension))
+        @app.route("/nar/<obj_hash>{}".format(self._nar_extension))
         def serve_nar(obj_hash):
             """Return the compressed binary from the nix store."""
-            return ""
+            try:
+                store_path = self.store_path_from_hash(obj_hash)
+            except NoSuchObject as err:
+                return (err.message, 404)
+            nar_path = self.build_nar(store_path)
+            return send_file(nar_path, mimetype=self._content_type)
 
         @app.errorhandler(500)
         def h(error):
