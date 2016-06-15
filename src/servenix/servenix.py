@@ -180,10 +180,6 @@ class NixServer(Flask):
             nar_path = self.build_nar(store_path)
             return send_file(nar_path, mimetype=self._content_type)
 
-        @app.errorhandler(500)
-        def h(error):
-            import pdb; pdb.set_trace()
-
         return app
 
 
