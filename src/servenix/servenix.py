@@ -1,26 +1,17 @@
 """Serve nix store objects over HTTP."""
+import argparse
 import os
 from os.path import exists, isdir, join
-import argparse
-from flask import Flask, make_response, send_file
-from subprocess import check_output
 import re
+from subprocess import check_output
+
+from flask import Flask, make_response, send_file
+
+from servenix.utils import decode_str
+from servenix.exceptions import NoSuchObject
 
 _HASH_REGEX=re.compile(r"[a-z0-9]{32}")
 _PATH_REGEX=re.compile(r"([a-z0-9]{32})-.*")
-
-class NoSuchObject(IOError):
-    """Raises when a store object can't be found."""
-    def __init__(self, message):
-        self.message = message
-
-def check_output_str(command):
-    """Call check_output and convert into a string."""
-    result = check_output(command)
-    if hasattr(result, "decode"):
-        return result.decode("utf-8")
-    else:
-        return result
 
 class NixServer(Flask):
     """Serves nix packages."""
@@ -62,23 +53,18 @@ class NixServer(Flask):
         """
         if store_object_hash in self._hashes_to_paths:
             return self._hashes_to_paths[store_object_hash]
-        store_objects = os.listdir(self._nix_store_path)
-        try:
-            for obj in store_objects:
-                if hasattr(obj, "decode"):
-                    obj = obj.decode("utf-8")
-                match = _PATH_REGEX.match(obj)
-                if match is None:
-                    continue
-                full_path = join(self._nix_store_path, obj)
-                _hash = match.group(1)
-                self._hashes_to_paths[_hash] = full_path
-                if _hash == store_object_hash:
-                    return full_path
-            raise NoSuchObject("No object with hash {} was found."
-                               .format(store_object_hash))
-        except TypeError as err:
-            import pdb; pdb.set_trace()
+        store_objects = map(decode_str, os.listdir(self._nix_store_path))
+        for obj in store_objects:
+            match = _PATH_REGEX.match(obj)
+            if match is None:
+                continue
+            full_path = join(self._nix_store_path, obj)
+            _hash = match.group(1)
+            self._hashes_to_paths[_hash] = full_path
+            if _hash == store_object_hash:
+                return full_path
+        raise NoSuchObject("No object with hash {} was found."
+                           .format(store_object_hash))
 
     def get_object_info(self, store_path):
         """Given a store path, get some information about the path.
@@ -92,10 +78,10 @@ class NixServer(Flask):
         if store_path in self._paths_to_info:
             return self._paths_to_info[store_path]
         # Invoke nix-store with various queries to get package info.
-        nix_store_q = lambda option: check_output_str([
+        nix_store_q = lambda option: decode_str(check_output([
             "{}/nix-store".format(self._nix_bin_path),
             "--query", option, store_path
-        ]).strip()
+        ])).strip()
         info = {
             "StorePath": store_path,
             "NarHash": nix_store_q("--hash"),
@@ -120,16 +106,14 @@ class NixServer(Flask):
             'compressionType = "{}";'.format(self._compression_type),
             "})"])
         # Nix-build this expression, resulting in a store
-        compressed_path = check_output_str([
+        compressed_path = decode_str(check_output([
             join(self._nix_bin_path, "nix-build"),
             "--expr", nar_expr
-        ]).strip()
+        ])).strip()
 
         # This path will contain a compressed file; return its path.
-        contents = os.listdir(compressed_path)
+        contents = map(decode_str, os.listdir(compressed_path))
         for filename in contents:
-            if hasattr(filename, "decode"):
-                filename = filename.decode("utf-8")
             if filename.endswith(self._nar_extension):
                 return join(compressed_path, filename)
 
@@ -141,10 +125,6 @@ class NixServer(Flask):
         """
         app = Flask(__name__)
 
-        @app.route('/')
-        def hello_world():
-            return 'Hello, World!'
-
         @app.route("/nix-cache-info")
         def nix_cache_info():
             """Return information about the binary cache."""
@@ -152,6 +132,16 @@ class NixServer(Flask):
 
         @app.route("/<obj_hash>.narinfo")
         def get_narinfo(obj_hash):
+            """Given an object's 32-character hash, return information on it.
+
+            The information includes the object's size (uncompressed), sha256
+            hash, store path, and reference graph.
+
+            If the object isn't found, return a 404.
+
+            :param obj_hash: First 32 characters of the object's store path.
+            :type obj_hash: ``str``
+            """
             if _HASH_REGEX.match(obj_hash) is None:
                  return ("Hash {} must match {}"
                          .format(obj_hash, _HASH_REGEX.pattern), 400)
@@ -172,7 +162,13 @@ class NixServer(Flask):
 
         @app.route("/nar/<obj_hash>{}".format(self._nar_extension))
         def serve_nar(obj_hash):
-            """Return the compressed binary from the nix store."""
+            """Return the compressed binary from the nix store.
+
+            If the object isn't found, return a 404.
+
+            :param obj_hash: First 32 characters of the object's store path.
+            :type obj_hash: ``str``
+            """
             try:
                 store_path = self.store_path_from_hash(obj_hash)
             except NoSuchObject as err:
@@ -192,6 +188,7 @@ def _get_args():
                         choices=("xz", "bzip2"),
                         help="How served objects should be compressed.")
     return parser.parse_args()
+
 
 def main():
     """Main entry point."""
