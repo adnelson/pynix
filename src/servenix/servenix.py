@@ -96,9 +96,9 @@ class NixServer(Flask):
             "FileSize": str(file_size),
             "FileHash": "sha256:{}".format(file_hash)
         }
-        references = nix_store_q("--references").replace("\n", " ")
-        if references != "":
-            info["References"] = references
+        references = nix_store_q("--references").split()
+        if references != []:
+            info["References"] = " ".join(map(basename, references))
         deriver = nix_store_q("--deriver")
         if deriver != "unknown-deriver":
             info["Deriver"] = deriver
