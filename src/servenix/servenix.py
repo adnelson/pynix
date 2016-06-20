@@ -162,7 +162,7 @@ class NixServer(Flask):
                 return (err.message, 404)
             # Add a few more keys to the store object, specific to the
             # compression type we're serving.
-            store_info["Url"] = "nar/{}{}".format(obj_hash,
+            store_info["URL"] = "nar/{}{}".format(obj_hash,
                                                   self._nar_extension)
             store_info["Compression"] = self._compression_type
             info_string = "\n".join("{}: {}".format(k, v)
