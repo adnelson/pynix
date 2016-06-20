@@ -4,9 +4,9 @@
 
 let
   pkgs = import pkgsPath {};
-  inherit (pkgs) nix lib;
+  inherit (pkgs) nix lib coreutils;
   pythonPackages = pkgs.python3Packages;
-  inherit (pythonPackages) buildPythonPackage;
+  inherit (pythonPackages) buildPythonPackage flask;
 in
 
 
@@ -18,7 +18,8 @@ buildPythonPackage rec {
   ];
   propagatedBuildInputs = [
     nix
-    pythonPackages.flask
+    coreutils
+    flask
   ];
   src = ./.;
   makeWrapperArgs = [

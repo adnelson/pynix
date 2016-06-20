@@ -1,14 +1,14 @@
 """Serve nix store objects over HTTP."""
 import argparse
 import os
-from os.path import exists, isdir, join
+from os.path import exists, isdir, join, basename
 import re
 from subprocess import check_output
 
 from flask import Flask, make_response, send_file
 
 from servenix.utils import decode_str
-from servenix.exceptions import NoSuchObject
+from servenix.exceptions import NoSuchObject, NoNarGenerated
 
 _HASH_REGEX=re.compile(r"[a-z0-9]{32}")
 _PATH_REGEX=re.compile(r"([a-z0-9]{32})-.*")
@@ -82,10 +82,19 @@ class NixServer(Flask):
             "{}/nix-store".format(self._nix_bin_path),
             "--query", option, store_path
         ])).strip()
+        # Build the compressed version. Compute its hash and size.
+        nar_path = self.build_nar(store_path)
+        du = check_output("du -sb {}".format(nar_path), shell=True)
+        file_size = int(du.split()[0])
+        file_hash = decode_str(check_output(
+            "nix-hash --type sha256 --base32 --flat {}".format(nar_path),
+            shell=True)).strip()
         info = {
             "StorePath": store_path,
             "NarHash": nix_store_q("--hash"),
             "NarSize": nix_store_q("--size"),
+            "FileSize": str(file_size),
+            "FileHash": "sha256:{}".format(file_hash)
         }
         references = nix_store_q("--references").replace("\n", " ")
         if references != "":
@@ -105,7 +114,7 @@ class NixServer(Flask):
             'hashAlgo = "sha256";',
             'compressionType = "{}";'.format(self._compression_type),
             "})"])
-        # Nix-build this expression, resulting in a store
+        # Nix-build this expression, resulting in a store object.
         compressed_path = decode_str(check_output([
             join(self._nix_bin_path, "nix-build"),
             "--expr", nar_expr
@@ -116,6 +125,7 @@ class NixServer(Flask):
         for filename in contents:
             if filename.endswith(self._nar_extension):
                 return join(compressed_path, filename)
+        raise NoNarGenerated(compressed_path, self._nar_extension)
 
     def make_app(self):
         """Create a flask app and set up routes on it.
