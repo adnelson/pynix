@@ -105,7 +105,8 @@ class NixServer(Flask):
             db = join(self._nix_state_path, "nix", "db", "db.sqlite")
             logging.warn("Incorrect hash {} stored for path {}. Updating."
                          .format(registered_store_obj_hash, store_path))
-            query = ("UPDATE ValidPaths SET hash = '{}' where path = '{}';"
+            query = ("UPDATE ValidPaths SET hash = 'sha256:{}' "
+                     "where path = '{}';"
                      .format(computed_store_obj_hash, store_path))
             proc = Popen(['sqlite3', db], stdin=PIPE, stderr=PIPE)
             err = decode_str(proc.communicate(input=bytes(query, "utf-8"))[1])
