@@ -101,7 +101,7 @@ class NixServer(Flask):
             info["References"] = " ".join(map(basename, references))
         deriver = nix_store_q("--deriver")
         if deriver != "unknown-deriver":
-            info["Deriver"] = deriver
+            info["Deriver"] = basename(deriver)
         self._paths_to_info[store_path] = info
         return info
 
