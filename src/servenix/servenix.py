@@ -117,7 +117,7 @@ class NixServer(Flask):
         # Nix-build this expression, resulting in a store object.
         compressed_path = decode_str(check_output([
             join(self._nix_bin_path, "nix-build"),
-            "--expr", nar_expr
+            "--expr", nar_expr, "--no-out-link"
         ])).strip()
 
         # This path will contain a compressed file; return its path.
