@@ -1,9 +1,9 @@
 """Serve nix store objects over HTTP."""
 import argparse
 import os
-from os.path import exists, isdir, join, basename
+from os.path import exists, isdir, join, basename, dirname
 import re
-from subprocess import check_output
+from subprocess import check_output, Popen, PIPE
 
 from flask import Flask, make_response, send_file
 
@@ -15,8 +15,10 @@ _PATH_REGEX=re.compile(r"([a-z0-9]{32})-.*")
 
 class NixServer(Flask):
     """Serves nix packages."""
-    def __init__(self, nix_store_path, nix_bin_path, compression_type):
+    def __init__(self, nix_store_path, nix_bin_path, nix_state_path,
+                 compression_type):
         self._nix_store_path = nix_store_path
+        self._nix_state_path = nix_state_path
         self._nix_bin_path = nix_bin_path
         self._compression_type = compression_type
         # Cache mapping object hashes to store paths.
@@ -89,10 +91,30 @@ class NixServer(Flask):
         file_hash = decode_str(check_output(
             "nix-hash --type sha256 --base32 --flat {}".format(nar_path),
             shell=True)).strip()
+        # Some paths have corrupt hashes stored in the sqlite
+        # database. I'm not sure why this happens, but we check the
+        # actual hash using nix-hash and if it doesn't match what
+        # `nix-store -q --hash` says, we update the sqlite database to
+        # fix the error.
+        computed_store_obj_hash = decode_str(check_output(
+            "nix-hash --type sha256 {}".format(store_path),
+            shell=True)).strip()
+        registered_store_obj_hash = nix_store_q("--hash")
+        if computed_store_obj_hash != registered_store_obj_hash:
+            db = join(self._nix_state_path, "nix", "db", "db.sqlite")
+            logging.warn("Incorrect hash {} stored for path {}. Updating."
+                         .format(registered_store_obj_hash, store_path))
+            query = ("UPDATE ValidPaths SET hash = '{}' where path = '{}';"
+                     .format(computed_store_obj_hash, store_path))
+            proc = Popen(['sqlite3', db], stdin=PIPE, stderr=PIPE)
+            _, err = proc.communicate(input=query)
+            if proc.wait() != 0:
+                raise CouldNotUpdateHash(path, computed_store_obj_hash,
+                                         registered_store_obj_hash)
         info = {
             "StorePath": store_path,
             "NarHash": nix_store_q("--hash"),
-            "NarSize": nix_store_q("--size"),
+            "NarSize": computed_store_obj_hash,
             "FileSize": str(file_size),
             "FileHash": "sha256:{}".format(file_hash)
         }
@@ -203,15 +225,28 @@ def _get_args():
 def main():
     """Main entry point."""
     try:
-        NIX_BIN_PATH = os.environ["NIX_BIN_PATH"]
-        assert exists(join(NIX_BIN_PATH, "nix-store"))
-        NIX_STORE_PATH = os.environ["NIX_STORE_PATH"]
-        assert isdir(NIX_STORE_PATH)
+        nix_bin_path = os.environ["NIX_BIN_PATH"]
+        assert exists(join(nix_bin_path, "nix-store"))
+        # The store path can be given explicitly, or else it will be
+        # inferred to be 2 levels up from the bin path. E.g., if the
+        # bin path is /foo/bar/123-nix/bin, the store directory will
+        # be /foo/bar.
+        nix_store_path = os.environ.get("NIX_STORE_PATH",
+                                        dirname(dirname(nix_bin_path)))
+        assert isdir(nix_store_path), \
+            "Nix store directory {} doesn't exist".format(nix_store_path)
+        # The state path can be given explicitly, or else it will be
+        # inferred to be sibling to the store directory.
+        nix_state_path = os.environ.get("NIX_STATE_PATH",
+                                        join(dirname(nix_store_path), "var"))
+        assert isdir(nix_state_path), \
+            "Nix state directory {} doesn't exist".format(nix_state_path)
     except KeyError as err:
         exit("Invalid environment: variable {} must be set.".format(err))
     args = _get_args()
-    nixserver = NixServer(nix_store_path=NIX_STORE_PATH,
-                          nix_bin_path=NIX_BIN_PATH,
+    nixserver = NixServer(nix_store_path=nix_store_path,
+                          nix_state_path=nix_state_path,
+                          nix_bin_path=nix_bin_path,
                           compression_type=args.compression_type)
     app = nixserver.make_app()
     app.run(port=args.port)
