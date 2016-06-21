@@ -244,19 +244,6 @@ def main():
             "Nix state directory {} doesn't exist".format(nix_state_path)
     except KeyError as err:
         exit("Invalid environment: variable {} must be set.".format(err))
-    db = join(nix_state_path, "nix", "db", "db.sqlite")
-    store_path = '/opt/ns/nix/store/002lkaccqahn2as9vgq56qgqrn36dlhb-python_testing'
-    registered_store_obj_hash = '0hql4j2prkwx87f4d1isjh7kr9f2xfbywcjg14ldk56s2qx563y8'
-    computed_store_obj_hash = registered_store_obj_hash
-    logging.warn("Incorrect hash {} stored for path {}. Updating."
-                 .format(registered_store_obj_hash, store_path))
-    query = ("UPDATE ValidPaths SET hash = 'sha256:{}' where path = '{}';"
-             .format(computed_store_obj_hash, store_path))
-    proc = Popen(['sqlite3', db], stdin=PIPE, stderr=PIPE)
-    err = decode_str(proc.communicate(input=bytes(query, "utf-8"))[1])
-    if proc.wait() != 0:
-        raise CouldNotUpdateHash(path, registered_store_obj_hash,
-                                 computed_store_obj_hash, err)
     args = _get_args()
     nixserver = NixServer(nix_store_path=nix_store_path,
                           nix_state_path=nix_state_path,
