@@ -1,5 +1,6 @@
 """Serve nix store objects over HTTP."""
 import argparse
+import logging
 import os
 from os.path import exists, isdir, join, basename, dirname
 import re
@@ -8,7 +9,7 @@ from subprocess import check_output, Popen, PIPE
 from flask import Flask, make_response, send_file
 
 from servenix.utils import decode_str
-from servenix.exceptions import NoSuchObject, NoNarGenerated
+from servenix.exceptions import NoSuchObject, NoNarGenerated, CouldNotUpdateHash
 
 _HASH_REGEX=re.compile(r"[a-z0-9]{32}")
 _PATH_REGEX=re.compile(r"([a-z0-9]{32})-.*")
@@ -109,12 +110,12 @@ class NixServer(Flask):
             proc = Popen(['sqlite3', db], stdin=PIPE, stderr=PIPE)
             _, err = proc.communicate(input=query)
             if proc.wait() != 0:
-                raise CouldNotUpdateHash(path, computed_store_obj_hash,
-                                         registered_store_obj_hash)
+                raise CouldNotUpdateHash(path, registered_store_obj_hash,
+                                         computed_store_obj_hash, err)
         info = {
             "StorePath": store_path,
-            "NarHash": nix_store_q("--hash"),
-            "NarSize": computed_store_obj_hash,
+            "NarHash": computed_store_obj_hash,
+            "NarSize": nix_store_q("--size"),
             "FileSize": str(file_size),
             "FileHash": "sha256:{}".format(file_hash)
         }
@@ -243,6 +244,18 @@ def main():
             "Nix state directory {} doesn't exist".format(nix_state_path)
     except KeyError as err:
         exit("Invalid environment: variable {} must be set.".format(err))
+    db = join(nix_state_path, "nix", "db", "db.sqlite")
+    registered_store_obj_hash = '0hql4j2prkwx87f4d1isjh7kr9f2xfbywcjg14ldk56s2qx563y8'
+    computed_store_obj_hash = registered_store_obj_hash
+    logging.warn("Incorrect hash {} stored for path {}. Updating."
+                 .format(registered_store_obj_hash, store_path))
+    query = ("UPDATE ValidPaths SET hash = 'sha256:{}' where path = '{}';"
+             .format(computed_store_obj_hash, store_path))
+    proc = Popen(['sqlite3', db], stdin=PIPE, stderr=PIPE)
+    _, err = proc.communicate(input=query)
+    if proc.wait() != 0:
+        raise CouldNotUpdateHash(path, registered_store_obj_hash,
+                                 computed_store_obj_hash, err)
     args = _get_args()
     nixserver = NixServer(nix_store_path=nix_store_path,
                           nix_state_path=nix_state_path,
