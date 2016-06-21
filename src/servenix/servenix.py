@@ -115,7 +115,7 @@ class NixServer(Flask):
                                          computed_store_obj_hash, err)
         info = {
             "StorePath": store_path,
-            "NarHash": computed_store_obj_hash,
+            "NarHash": "sha256:{}".format(computed_store_obj_hash),
             "NarSize": nix_store_q("--size"),
             "FileSize": str(file_size),
             "FileHash": "sha256:{}".format(file_hash)
