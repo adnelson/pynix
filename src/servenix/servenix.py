@@ -97,10 +97,9 @@ class NixServer(Flask):
         # actual hash using nix-hash and if it doesn't match what
         # `nix-store -q --hash` says, we update the sqlite database to
         # fix the error.
-        computed_store_obj_hash = decode_str(check_output(
-            "nix-hash --type sha256 {}".format(store_path),
-            shell=True)).strip()
-        correct_hash = "sha256:{}".format(computed_store_obj_hash)
+        hash_cmd = "nix-hash --type sha256 --base32 {}".format(store_path)
+        store_obj_hash = decode_str(check_output(hash_cmd, shell=True)).strip()
+        correct_hash = "sha256:{}".format(store_obj_hash)
         registered_store_obj_hash = nix_store_q("--hash")
         if correct_hash != registered_store_obj_hash:
             db = join(self._nix_state_path, "nix", "db", "db.sqlite")
