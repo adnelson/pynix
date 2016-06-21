@@ -100,22 +100,23 @@ class NixServer(Flask):
         computed_store_obj_hash = decode_str(check_output(
             "nix-hash --type sha256 {}".format(store_path),
             shell=True)).strip()
+        correct_hash = "sha256:{}".format(computed_store_obj_hash)
         registered_store_obj_hash = nix_store_q("--hash")
-        if computed_store_obj_hash != registered_store_obj_hash:
+        if correct_hash != registered_store_obj_hash:
             db = join(self._nix_state_path, "nix", "db", "db.sqlite")
             logging.warn("Incorrect hash {} stored for path {}. Updating."
                          .format(registered_store_obj_hash, store_path))
-            query = ("UPDATE ValidPaths SET hash = 'sha256:{}' "
+            query = ("UPDATE ValidPaths SET hash = '{}' "
                      "where path = '{}';"
-                     .format(computed_store_obj_hash, store_path))
+                     .format(correct_hash, store_path))
             proc = Popen(['sqlite3', db], stdin=PIPE, stderr=PIPE)
             err = decode_str(proc.communicate(input=bytes(query, "utf-8"))[1])
             if proc.wait() != 0:
                 raise CouldNotUpdateHash(path, registered_store_obj_hash,
-                                         computed_store_obj_hash, err)
+                                         correct_hash, err)
         info = {
             "StorePath": store_path,
-            "NarHash": "sha256:{}".format(computed_store_obj_hash),
+            "NarHash": correct_hash,
             "NarSize": nix_store_q("--size"),
             "FileSize": str(file_size),
             "FileHash": "sha256:{}".format(file_hash)
