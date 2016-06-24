@@ -31,7 +31,7 @@ class NixServer(Flask):
             "StoreDir: {}".format(self._nix_store_path),
             "WantMassQuery: 1",
             "Priority: 30"
-        ])
+        ]) + "\n"
         if self._compression_type == "bzip2":
             self._content_type = "application/x-bzip2"
             self._nar_extension = ".nar.bz2"
@@ -222,6 +222,8 @@ def _get_args():
     parser = argparse.ArgumentParser(prog="servenix")
     parser.add_argument("--port", type=int, default=5000,
                         help="Port to listen on.")
+    parser.add_argument("--host", default="localhost", 
+                        help="Host to listen on.")
     parser.add_argument("--compression-type", default="xz",
                         choices=("xz", "bzip2"),
                         help="How served objects should be compressed.")
@@ -255,7 +257,7 @@ def main():
                           nix_bin_path=nix_bin_path,
                           compression_type=args.compression_type)
     app = nixserver.make_app()
-    app.run(port=args.port)
+    app.run(port=args.port, host=args.host)
 
 if __name__ == "__main__":
     main()
