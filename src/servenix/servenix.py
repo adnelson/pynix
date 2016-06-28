@@ -5,11 +5,14 @@ import os
 from os.path import exists, isdir, join, basename, dirname
 import re
 from subprocess import check_output, Popen, PIPE
+import sqlite3
 
 from flask import Flask, make_response, send_file, request
+import six
 
-from servenix.utils import decode_str
-from servenix.exceptions import NoSuchObject, NoNarGenerated, CouldNotUpdateHash
+from servenix.utils import decode_str, strip_output
+from servenix.exceptions import (NoSuchObject, NoNarGenerated,
+                                 CouldNotUpdateHash, ClientError)
 
 _HASH_REGEX=re.compile(r"[a-z0-9]{32}")
 _PATH_REGEX=re.compile(r"([a-z0-9]{32})-.*")
@@ -21,6 +24,7 @@ class NixServer(Flask):
         self._nix_store_path = nix_store_path
         self._nix_state_path = nix_state_path
         self._nix_bin_path = nix_bin_path
+        self._db_path = join(self._nix_state_path, "nix", "db", "db.sqlite")
         self._compression_type = compression_type
         # Cache mapping object hashes to store paths.
         self._hashes_to_paths = {}
@@ -81,40 +85,36 @@ class NixServer(Flask):
         if store_path in self._paths_to_info:
             return self._paths_to_info[store_path]
         # Invoke nix-store with various queries to get package info.
-        nix_store_q = lambda option: decode_str(check_output([
+        nix_store_q = lambda option: strip_output([
             "{}/nix-store".format(self._nix_bin_path),
             "--query", option, store_path
-        ])).strip()
+        ])
         # Build the compressed version. Compute its hash and size.
         nar_path = self.build_nar(store_path)
-        du = check_output("du -sb {}".format(nar_path), shell=True)
+        du = strip_output("du -sb {}".format(nar_path))
         file_size = int(du.split()[0])
-        file_hash = decode_str(check_output(
-            "nix-hash --type sha256 --base32 --flat {}".format(nar_path),
-            shell=True)).strip()
+        file_hash = strip_output("nix-hash --type sha256 --base32 --flat {}"
+                                 .format(nar_path))
         # Some paths have corrupt hashes stored in the sqlite
         # database. I'm not sure why this happens, but we check the
         # actual hash using nix-hash and if it doesn't match what
         # `nix-store -q --hash` says, we update the sqlite database to
         # fix the error.
-        hash_cmd = "nix-hash --type sha256 --base32 {}".format(store_path)
-        store_obj_hash = decode_str(check_output(hash_cmd, shell=True)).strip()
-        correct_hash = "sha256:{}".format(store_obj_hash)
         registered_store_obj_hash = nix_store_q("--hash")
+        correct_hash = "sha256:{}".format(strip_output(
+            "nix-hash --type sha256 --base32 {}".format(store_path)))
         if correct_hash != registered_store_obj_hash:
-            db = join(self._nix_state_path, "nix", "db", "db.sqlite")
             logging.warn("Incorrect hash {} stored for path {}. Updating."
                          .format(registered_store_obj_hash, store_path))
             # Compute the hash without the base32 encoding.
             full_hash_cmd = "nix-hash --type sha256 {}".format(store_path)
-            full_hash = \
-                decode_str(check_output(full_hash_cmd, shell=True)).strip()
-            query = ("UPDATE ValidPaths SET hash = '{}' "
-                     "where path = 'sha256:{}';"
-                     .format(full_hash, store_path))
-            proc = Popen(['sqlite3', db], stdin=PIPE, stderr=PIPE)
-            err = decode_str(proc.communicate(input=bytes(query, "utf-8"))[1])
-            if proc.wait() != 0:
+            full_hash = strip_output(full_hash_cmd)
+            try:
+                with sqlite3.connect(self._db_path) as con:
+                    con.execute("UPDATE ValidPaths SET hash = '{}' "
+                                "WHERE path = 'sha256:{}';"
+                                .format(full_hash, store_path))
+            except sqlite3.OperationalError as err:
                 raise CouldNotUpdateHash(path, registered_store_obj_hash,
                                          correct_hash, err)
         info = {
@@ -142,11 +142,12 @@ class NixServer(Flask):
             'hashAlgo = "sha256";',
             'compressionType = "{}";'.format(self._compression_type),
             "})"])
+
         # Nix-build this expression, resulting in a store object.
-        compressed_path = decode_str(check_output([
+        compressed_path = strip_output([
             join(self._nix_bin_path, "nix-build"),
             "--expr", nar_expr, "--no-out-link"
-        ])).strip()
+        ])
 
         # This path will contain a compressed file; return its path.
         contents = map(decode_str, os.listdir(compressed_path))
@@ -223,8 +224,18 @@ class NixServer(Flask):
             JSON array containing store paths which were in the
             request but are not in the local nix store.
             """
-            input_paths = request.get_json()
-            
+            paths = request.get_json()
+            if not isinstance(paths, list) or \
+                    not all(lambda x: isinstance(x, six.string_types), paths):
+                raise ClientError("Expected a list of path strings")
+            for path in paths:
+                pass
+
+        @app.errorhandler(ClientError)
+        def handle_invalid_usage(error):
+            response = jsonify(error.to_dict())
+            response.status_code = error.status_code
+            return response
 
         return app
 
@@ -234,7 +245,7 @@ def _get_args():
     parser = argparse.ArgumentParser(prog="servenix")
     parser.add_argument("--port", type=int, default=5000,
                         help="Port to listen on.")
-    parser.add_argument("--host", default="localhost", 
+    parser.add_argument("--host", default="localhost",
                         help="Host to listen on.")
     parser.add_argument("--compression-type", default="xz",
                         choices=("xz", "bzip2"),

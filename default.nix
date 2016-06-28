@@ -6,21 +6,20 @@ let
   pkgs = import pkgsPath {};
   inherit (pkgs) nix lib coreutils sqlite;
   pythonPackages = pkgs.python3Packages;
-  inherit (pythonPackages) buildPythonPackage flask;
 in
 
-
-buildPythonPackage rec {
-  name = "servenix";
+pythonPackages.buildPythonPackage rec {
+  name = "servenix-local-dev";
   version = "0.0.0.dev0";
   buildInputs = [
     pythonPackages.ipython
   ];
   propagatedBuildInputs = [
-    nix
-    sqlite
     coreutils
-    flask
+    nix
+    pythonPackages.flask
+    pythonPackages.six
+    sqlite
   ];
   src = ./.;
   makeWrapperArgs = [
