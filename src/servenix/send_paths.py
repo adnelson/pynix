@@ -103,7 +103,7 @@ class StoreObjectSender(object):
             logging.debug("{} is already on the server.".format(path))
             return
         # First send all of the object's references.
-        for ref in get_references(path):
+        for ref in self.get_references(path):
             self.send_object(path)
         # Now we can send the object itself. Generate a dump of the
         # file and stream it into the import url.
@@ -124,11 +124,15 @@ class StoreObjectSender(object):
         :type paths: ``str``
         """
         to_send = self.query_store_paths(paths)
+        num_to_send = len(to_send)
         if self._dry_run is True:
             for path in to_send:
                 logging.debug(path)
-        logging.info("Total of {} paths will be sent."
-                     .format(len(to_send)))
+        if num_to_send > 0:
+            logging.info("Total of {} paths will be sent."
+                         .format(len(to_send)))
+        else:
+            logging.info("No paths need to be sent. Server is up-to-date.")
         if self._dry_run is False:
             for path in paths:
                 self.send_object(path)
@@ -137,7 +141,8 @@ class StoreObjectSender(object):
 def _get_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(prog="sendnix")
-    parser.add_argument("-e", "--endpoint", required=True,
+    parser.add_argument("-e", "--endpoint",
+                        default=os.environ.get("NIX_REPO_HTTP"),
                         help="Endpoint of nix server to send to.")
     parser.add_argument("--dry-run", action="store_true", default=False,
                         help="If true, reports which paths would be sent.")
@@ -151,6 +156,8 @@ def _get_args():
 def main():
     """Main entry point."""
     args = _get_args()
+    if args.endpoint is None:
+        exit("Endpoint is required. Use --endpoint or set NIX_REPO_HTTP.")
     logging.basicConfig(level=getattr(logging, args.log_level))
     sender = StoreObjectSender(endpoint=args.endpoint, dry_run=args.dry_run)
     sender.send_objects(args.paths)
