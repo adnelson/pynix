@@ -21,7 +21,7 @@ _PATH_REGEX=re.compile(r"([a-z0-9]{32})-[^' \n/]*$")
 class NixServer(Flask):
     """Serves nix packages."""
     def __init__(self, nix_store_path, nix_bin_path, nix_state_path,
-                 compression_type, debug):
+                 compression_type, debug, logger):
         # Path to the local nix store.
         self._nix_store_path = nix_store_path
         # Path to the local nix state directory.
@@ -55,6 +55,8 @@ class NixServer(Flask):
             self._nar_extension = ".nar.xz"
         # Enable interactive debugging on unknown errors.
         self._debug = debug
+        # Logger for messaging.
+        self._logger = logger
 
     def store_path_from_hash(self, store_object_hash):
         """Look up a store path using its hash.
@@ -135,7 +137,7 @@ class NixServer(Flask):
             correct_hash = "sha256:{}".format(
                 strip_output("nix-hash --type sha256 {}".format(store_path)))
             if correct_hash != _hash:
-                logging.warn("Incorrect hash {} stored for path {}. Updating."
+                self._logger.warn("Incorrect hash {} stored for path {}. Updating."
                              .format(registered_store_obj_hash, store_path))
                 self._db.execute("UPDATE ValidPaths SET hash = '{}' "
                                  "WHERE path = '{}'"
@@ -309,8 +311,8 @@ class NixServer(Flask):
         @app.errorhandler(BaseHTTPError)
         def handle_http_error(error):
             if error.status_code >= 500:
-                logging.exception(error)
-            logging.error(error.message)
+                self._logger.exception(error)
+            self._logger.error(error.message)
             response = jsonify(error.to_dict())
             response.status_code = error.status_code
             return response
@@ -319,7 +321,7 @@ class NixServer(Flask):
             @app.errorhandler(Exception)
             def handle_unknown(error):
                 """If we encounter an unknown error, this will be triggered."""
-                logging.exception(error)
+                self._logger.exception(error)
                 if sys.stdin.isatty():
                     import ipdb
                     ipdb.set_trace()
@@ -340,6 +342,9 @@ def _get_args():
                         help="How served objects should be compressed.")
     parser.add_argument("--debug", action="store_true", default=False,
                         help="Enable interactive debugging on unknown errors.")
+    parser.add_argument("--log-level", help="Log messages level.",
+                        default="INFO", choices=("CRITICAL", "ERROR", "INFO",
+                                                 "WARNING", "DEBUG"))
     return parser.parse_args()
 
 
@@ -365,11 +370,14 @@ def main():
     except KeyError as err:
         exit("Invalid environment: variable {} must be set.".format(err))
     args = _get_args()
+    logger = logging.getLogger(__name__)
+    logger.setLevel(getattr(logging, args.log_level))
     nixserver = NixServer(nix_store_path=nix_store_path,
                           nix_state_path=nix_state_path,
                           nix_bin_path=nix_bin_path,
                           compression_type=args.compression_type,
-                          debug=args.debug)
+                          debug=args.debug,
+                          logger=logger)
     app = nixserver.make_app()
     app.run(port=args.port, host=args.host)
 
