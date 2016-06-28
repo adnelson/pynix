@@ -64,7 +64,7 @@ class StoreObjectSender(object):
         # server to see which paths are already there.
         url = "{}/query-paths".format(self._endpoint)
         data = json.dumps(list(full_path_set))
-        headers = {"Content Type": "application/json"}
+        headers = {"Content-Type": "application/json"}
         logging.info("Asking the nix server about {} paths."
                      .format(len(full_path_set)))
         response = requests.get(url, headers=headers, data=data)

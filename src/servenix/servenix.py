@@ -248,9 +248,15 @@ class NixServer(Flask):
             on the server, and False otherwise.
             """
             paths = request.get_json()
-            if not isinstance(paths, list) or \
-                    not all(isinstance(p, six.string_types) for p in paths):
-                raise ClientError("Expected a list of path strings")
+            if not isinstance(paths, list):
+                raise ClientError("Expected a list, but got a {}"
+                                  .format(type(paths).__name__))
+            else:
+                for p in paths:
+                    if not isinstance(p, six.string_types):
+                        raise ClientError("List element {} is not a string."
+                                          .format(p))
+
             # Dictionary where we'll store the path results. Keys are
             # paths; values are True if the path is in the store and
             # False otherwise.
@@ -302,7 +308,9 @@ class NixServer(Flask):
 
         @app.errorhandler(BaseHTTPError)
         def handle_http_error(error):
-            logging.exception(error)
+            if error.status_code >= 500:
+                logging.exception(error)
+            logging.error(error.message)
             response = jsonify(error.to_dict())
             response.status_code = error.status_code
             return response
