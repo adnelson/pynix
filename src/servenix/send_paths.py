@@ -103,9 +103,10 @@ class StoreObjectSender(object):
         if path in self._objects_on_server:
             logging.debug("{} is already on the server.".format(path))
             return
-        # First send all of the object's references.
+        # First send all of the object's references. Skip self-references.
         for ref in self.get_references(path):
-            self.send_object(path)
+            if ref != path:
+                self.send_object(path)
         # Now we can send the object itself. Generate a dump of the
         # file and stream it into the import url.
         logging.info("Sending server a new store path {}".format(path))
