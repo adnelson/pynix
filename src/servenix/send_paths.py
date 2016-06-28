@@ -60,12 +60,16 @@ class StoreObjectSender(object):
                 if path not in full_path_set:
                     recur(self.get_references(path))
                     full_path_set.add(path)
+        recur(paths)
 
         # Now that we have the full list built up, send it to the
         # server to see which paths are already there.
         url = "{}/query-paths".format(self._endpoint)
         data = json.dumps(list(full_path_set))
         headers = {"Content-Type": "application/json"}
+        if len(full_path_set) == 0:
+            # No point in making a request if we don't have any paths.
+            return set()
         logging.info("Asking the nix server about {} paths."
                      .format(len(full_path_set)))
         response = requests.get(url, headers=headers, data=data)
