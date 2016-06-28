@@ -1,5 +1,6 @@
 """Module for sending store objects to a running servenix instance."""
 import argparse
+import json
 import logging
 
 import requests
