@@ -80,9 +80,10 @@ class NixServer(Flask):
             if full_path is None:
                 raise NoSuchObject("No object with hash {} was found."
                                    .format(store_object_hash))
-            self._hashes_to_paths[store_object_hash] = full_path
             # fetchone returns a tuple, so grab its first element.
-            return full_path[0]
+            full_path = full_path[0]
+            self._hashes_to_paths[store_object_hash] = full_path
+            return full_path
 
     def check_in_store(self, store_path):
         """Check that a store path exists in the nix store.
@@ -161,6 +162,9 @@ class NixServer(Flask):
     def build_nar(self, store_path):
         """Build a nix archive (nar) and return the resulting path."""
         # Construct a nix expression which will produce a nar.
+        if isinstance(store_path, tuple):
+            store_path = store_path[0]
+
         nar_expr = "".join([
             "(import <nix/nar.nix> {",
             'storePath = "{}";'.format(store_path),
