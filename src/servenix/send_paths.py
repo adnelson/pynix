@@ -4,6 +4,7 @@ import json
 import logging
 
 import requests
+import six
 
 from servenix.utils import strip_output
 
