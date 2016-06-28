@@ -6,7 +6,7 @@ from os.path import exists, isdir, join, basename, dirname
 import re
 from subprocess import check_output, Popen, PIPE
 
-from flask import Flask, make_response, send_file
+from flask import Flask, make_response, send_file, request
 
 from servenix.utils import decode_str
 from servenix.exceptions import NoSuchObject, NoNarGenerated, CouldNotUpdateHash
@@ -213,6 +213,18 @@ class NixServer(Flask):
                 return (err.message, 404)
             nar_path = self.build_nar(store_path)
             return send_file(nar_path, mimetype=self._content_type)
+
+        @app.route("/get-missing-paths")
+        def get_missing_paths():
+            """Given a list of store paths, return which are not in the store.
+
+            The request must contain JSON containing a single array
+            with a list of store path strings. The response will be a
+            JSON array containing store paths which were in the
+            request but are not in the local nix store.
+            """
+            input_paths = request.get_json()
+            
 
         return app
 
