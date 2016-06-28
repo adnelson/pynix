@@ -21,7 +21,7 @@ _PATH_REGEX=re.compile(r"([a-z0-9]{32})-[^' \n/]*$")
 class NixServer(Flask):
     """Serves nix packages."""
     def __init__(self, nix_store_path, nix_bin_path, nix_state_path,
-                 compression_type, debug, logger):
+                 compression_type, debug):
         # Path to the local nix store.
         self._nix_store_path = nix_store_path
         # Path to the local nix state directory.
@@ -55,8 +55,6 @@ class NixServer(Flask):
             self._nar_extension = ".nar.xz"
         # Enable interactive debugging on unknown errors.
         self._debug = debug
-        # Logger for messaging.
-        self._logger = logger
 
     def store_path_from_hash(self, store_object_hash):
         """Look up a store path using its hash.
@@ -137,7 +135,7 @@ class NixServer(Flask):
             correct_hash = "sha256:{}".format(
                 strip_output("nix-hash --type sha256 {}".format(store_path)))
             if correct_hash != _hash:
-                self._logger.warn("Incorrect hash {} stored for path {}. Updating."
+                logging.warn("Incorrect hash {} stored for path {}. Updating."
                              .format(registered_store_obj_hash, store_path))
                 self._db.execute("UPDATE ValidPaths SET hash = '{}' "
                                  "WHERE path = '{}'"
@@ -258,11 +256,14 @@ class NixServer(Flask):
                     if not isinstance(p, six.string_types):
                         raise ClientError("List element {} is not a string."
                                           .format(p))
+            logging.debug("Request asked about {} paths".format(len(paths)))
 
             # Dictionary where we'll store the path results. Keys are
             # paths; values are True if the path is in the store and
             # False otherwise.
             path_results = {}
+            found = 0
+            not_found = 0
             # Validate that all paths match the path regex; this will make
             # the SQL query we build correct and safe.
             for path in paths:
@@ -275,8 +276,12 @@ class NixServer(Flask):
                 try:
                     self.check_in_store(path)
                     path_results[path] = True
+                    found += 1
                 except NoSuchObject:
                     path_results[path] = False
+                    not_found += 1
+            logging.debug("{} of these paths were found, and {} were not."
+                          .format(found, not_found))
             return jsonify(path_results)
 
         @app.route("/import-path", methods=["POST"])
@@ -311,8 +316,8 @@ class NixServer(Flask):
         @app.errorhandler(BaseHTTPError)
         def handle_http_error(error):
             if error.status_code >= 500:
-                self._logger.exception(error)
-            self._logger.error(error.message)
+                logging.exception(error)
+            logging.error(error.message)
             response = jsonify(error.to_dict())
             response.status_code = error.status_code
             return response
@@ -321,7 +326,7 @@ class NixServer(Flask):
             @app.errorhandler(Exception)
             def handle_unknown(error):
                 """If we encounter an unknown error, this will be triggered."""
-                self._logger.exception(error)
+                logging.exception(error)
                 if sys.stdin.isatty():
                     import ipdb
                     ipdb.set_trace()
@@ -370,14 +375,12 @@ def main():
     except KeyError as err:
         exit("Invalid environment: variable {} must be set.".format(err))
     args = _get_args()
-    logger = logging.getLogger(__name__)
-    logger.setLevel(getattr(logging, args.log_level))
+    logging.basicConfig(level=getattr(logging, args.log_level))
     nixserver = NixServer(nix_store_path=nix_store_path,
                           nix_state_path=nix_state_path,
                           nix_bin_path=nix_bin_path,
                           compression_type=args.compression_type,
-                          debug=args.debug,
-                          logger=logger)
+                          debug=args.debug)
     app = nixserver.make_app()
     app.run(port=args.port, host=args.host)
 

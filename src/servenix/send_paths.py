@@ -10,13 +10,11 @@ from servenix.utils import strip_output
 
 class StoreObjectSender(object):
     """Wraps some state for sending store objects."""
-    def __init__(self, endpoint, dry_run, logger):
+    def __init__(self, endpoint, dry_run):
         #: Server running servenix (string).
         self._endpoint = endpoint
         #: If true, no actual paths will be sent.
         self._dry_run = dry_run
-        #: Logger.
-        self._logger = logger
         #: Cache of direct path references (string -> strings).
         self._path_references = {}
         #: Set of paths known to exist on the server already (set of strings).
@@ -68,8 +66,8 @@ class StoreObjectSender(object):
         url = "{}/query-paths".format(self._endpoint)
         data = json.dumps(list(full_path_set))
         headers = {"Content-Type": "application/json"}
-        self._logger.info("Asking the nix server about {} paths."
-                          .format(len(full_path_set)))
+        logging.info("Asking the nix server about {} paths."
+                     .format(len(full_path_set)))
         response = requests.get(url, headers=headers, data=data)
         response.raise_for_status()
 
@@ -98,14 +96,14 @@ class StoreObjectSender(object):
         """
         # Check if the object is already on the server; if so we can stop.
         if path in self._objects_on_server:
-            self._logger.debug("{} is already on the server.".format(path))
+            logging.debug("{} is already on the server.".format(path))
             return
         # First send all of the object's references.
         for ref in get_references(path):
             self.send_object(path)
         # Now we can send the object itself. Generate a dump of the
         # file and stream it into the import url.
-        self._logger.info("Sending server a new store path {}".format(path))
+        logging.info("Sending server a new store path {}".format(path))
         proc = Popen("nix-store --export {}".format(path),
                      shell=True, stdout=PIPE)
         url = "{}/import-path".format(self._endpoint)
@@ -124,9 +122,9 @@ class StoreObjectSender(object):
         to_send = self.query_store_paths(paths)
         if self._dry_run is True:
             for path in to_send:
-                self._logger.debug(path)
-        self._logger.info("Total of {} paths will be sent."
-                          .format(len(to_send)))
+                logging.debug(path)
+        logging.info("Total of {} paths will be sent."
+                     .format(len(to_send)))
         if self._dry_run is False:
             for path in paths:
                 self.send_object(path)
@@ -149,8 +147,6 @@ def _get_args():
 def main():
     """Main entry point."""
     args = _get_args()
-    logger = logging.getLogger(__name__)
-    logger.setLevel(getattr(logging, args.log_level))
-    sender = StoreObjectSender(endpoint=args.endpoint, dry_run=args.dry_run,
-                               logger=logger)
+    logging.basicConfig(level=getattr(logging, args.log_level))
+    sender = StoreObjectSender(endpoint=args.endpoint, dry_run=args.dry_run)
     sender.send_objects(args.paths)
