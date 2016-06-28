@@ -12,7 +12,7 @@ import six
 
 from servenix.utils import decode_str, strip_output
 from servenix.exceptions import (NoSuchObject, NoNarGenerated,
-                                 BaseHTTPError,
+                                 BaseHTTPError, NixImportFailed,
                                  CouldNotUpdateHash, ClientError)
 
 _HASH_REGEX=re.compile(r"[a-z0-9]{32}")
@@ -267,6 +267,35 @@ class NixServer(Flask):
                     path_results[path] = False
             return jsonify(path_results)
 
+        @app.route("/import-path", methods=["POST"])
+        def import_path():
+            """Receives a new store object.
+
+            Request should contain binary data which can be fed into
+            the 'nix-store --import' command (which is to say, the
+            request should be the result of a call to `nix-store
+            --export`, or an equivalent). Note that the import will
+            fail if the all of the path's references do not already
+            exist on the server. It is up to the client to ensure
+            that paths are sent in the correct order.
+
+            After the object is successfully imported, a compressed
+            NAR will be created automatically.
+            """
+            # TODO: compressed exports?
+            proc = Popen([join(self._nix_bin_path, "nix-store"), "--import"],
+                         stdin=PIPE, stderr=PIPE, stdout=PIPE)
+            # Stream the request data into the subprocess.
+            out, err = proc.communicate(input=request.stream)
+            if proc.wait() != 0:
+                raise NixImportFailed(err)
+            # The resulting path is printed to stdout. Grab it here.
+            result_path = decode_str(out).strip()
+            # Spin off a thread to build a NAR of the path.
+            Thread(target=self.build_nar, args=(result_path,)).start()
+            # Return the path as an indicator of success.
+            return (result_path, 200)
+
         @app.errorhandler(BaseHTTPError)
         def handle_http_error(error):
             logging.exception(error)
@@ -278,11 +307,11 @@ class NixServer(Flask):
             @app.errorhandler(Exception)
             def handle_unknown(error):
                 """If we encounter an unknown error, this will be triggered."""
-                import ipdb
-                import traceback
-                print("".join(traceback.format_tb(error.__traceback__)))
-                print(error)
-                ipdb.set_trace()
+                logging.exception(error)
+                if sys.stdin.isatty():
+                    import ipdb
+                    ipdb.set_trace()
+                return ("An unknown error occurred", 500)
 
         return app
 

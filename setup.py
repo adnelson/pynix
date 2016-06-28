@@ -24,6 +24,9 @@ setuptools.setup(
     provides=setuptools.find_packages("src"),
     install_requires=open("requirements.txt").readlines(),
     entry_points={
-        "console_scripts": ["servenix = servenix.servenix:main"]
+        "console_scripts": [
+            "servenix = servenix.servenix:main"
+            "sendnix = servenix.send_paths:main"
+        ]
     }
 )
