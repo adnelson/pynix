@@ -10,7 +10,7 @@ let
 in
 
 pythonPackages.buildPythonPackage rec {
-  name = "servenix-local-dev";
+  name = "servenix-local";
   version = "0.0.0.dev0";
   buildInputs = [
     pythonPackages.ipython
