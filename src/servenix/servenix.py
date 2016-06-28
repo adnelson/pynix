@@ -7,29 +7,40 @@ import re
 from subprocess import check_output, Popen, PIPE
 import sqlite3
 
-from flask import Flask, make_response, send_file, request
+from flask import Flask, make_response, send_file, request, jsonify
 import six
 
 from servenix.utils import decode_str, strip_output
 from servenix.exceptions import (NoSuchObject, NoNarGenerated,
+                                 BaseHTTPError,
                                  CouldNotUpdateHash, ClientError)
 
 _HASH_REGEX=re.compile(r"[a-z0-9]{32}")
-_PATH_REGEX=re.compile(r"([a-z0-9]{32})-.*")
+_PATH_REGEX=re.compile(r"([a-z0-9]{32})-[^' \n/]*$")
 
 class NixServer(Flask):
     """Serves nix packages."""
     def __init__(self, nix_store_path, nix_bin_path, nix_state_path,
-                 compression_type):
+                 compression_type, debug):
+        # Path to the local nix store.
         self._nix_store_path = nix_store_path
+        # Path to the local nix state directory.
         self._nix_state_path = nix_state_path
+        # Path to the folder containing nix binaries.
         self._nix_bin_path = nix_bin_path
-        self._db_path = join(self._nix_state_path, "nix", "db", "db.sqlite")
+        # Connection to the local nix SQLite database.
+        self._db = sqlite3.connect(
+            join(self._nix_state_path, "nix", "db", "db.sqlite"))
+        # Matches valid nix store paths (local to this store)
+        self._full_store_path_regex = re.compile(
+            join(self._nix_store_path, _PATH_REGEX.pattern))
         self._compression_type = compression_type
         # Cache mapping object hashes to store paths.
         self._hashes_to_paths = {}
         # Cache mapping store paths to object info.
         self._paths_to_info = {}
+        # Set of known store paths.
+        self._known_store_paths = set()
         # A static string telling a nix client what this store serves.
         self._cache_info = "\n".join([
             "StoreDir: {}".format(self._nix_store_path),
@@ -42,6 +53,8 @@ class NixServer(Flask):
         else:
             self._content_type = "application/x-xz"
             self._nar_extension = ".nar.xz"
+        # Enable interactive debugging on unknown errors.
+        self._debug = debug
 
     def store_path_from_hash(self, store_object_hash):
         """Look up a store path using its hash.
@@ -60,23 +73,42 @@ class NixServer(Flask):
         """
         if store_object_hash in self._hashes_to_paths:
             return self._hashes_to_paths[store_object_hash]
-        store_objects = map(decode_str, os.listdir(self._nix_store_path))
-        for obj in store_objects:
-            match = _PATH_REGEX.match(obj)
-            if match is None:
-                continue
-            full_path = join(self._nix_store_path, obj)
-            _hash = match.group(1)
-            self._hashes_to_paths[_hash] = full_path
-            if _hash == store_object_hash:
-                return full_path
-        raise NoSuchObject("No object with hash {} was found."
-                           .format(store_object_hash))
+        with self._db:
+            query = ("SELECT path FROM ValidPaths WHERE path LIKE '{}%'"
+                     .format(join(self._nix_store_path, store_object_hash)))
+            full_path = self._db.execute(query).fetchone()
+            if full_path is None:
+                raise NoSuchObject("No object with hash {} was found."
+                                   .format(store_object_hash))
+            self._hashes_to_paths[store_object_hash] = full_path
+            # fetchone returns a tuple, so grab its first element.
+            return full_path[0]
+
+    def check_in_store(self, store_path):
+        """Check that a store path exists in the nix store.
+
+        :param store_path: Path to an object in the nix store. Is assumed
+            to match the full path regex.
+        :type store_path: ``str``
+
+        :raises: :py:class:`NoSuchObject` if the object isn't in the store.
+        """
+        if store_path in self._known_store_paths:
+            return
+        with self._db:
+            query = ("SELECT path FROM ValidPaths WHERE path = '{}'"
+                     .format(store_path))
+            if self._db.execute(query).fetchone() is None:
+                raise NoSuchObject("No object with path {} was found."
+                                   .format(store_path))
+            self._known_store_paths.add(store_path)
 
     def get_object_info(self, store_path):
         """Given a store path, get some information about the path.
 
-        :param store_path: Path to the object in the store.
+        :param store_path: Path to the object in the store. The path is assumed
+            to exist in the store and in the SQLite database. The path must
+            conform to the path regex.
         :type store_path: ``str``
 
         :return: A dictionary of store object information.
@@ -84,51 +116,44 @@ class NixServer(Flask):
         """
         if store_path in self._paths_to_info:
             return self._paths_to_info[store_path]
-        # Invoke nix-store with various queries to get package info.
-        nix_store_q = lambda option: strip_output([
-            "{}/nix-store".format(self._nix_bin_path),
-            "--query", option, store_path
-        ])
         # Build the compressed version. Compute its hash and size.
         nar_path = self.build_nar(store_path)
         du = strip_output("du -sb {}".format(nar_path))
         file_size = int(du.split()[0])
         file_hash = strip_output("nix-hash --type sha256 --base32 --flat {}"
                                  .format(nar_path))
-        # Some paths have corrupt hashes stored in the sqlite
-        # database. I'm not sure why this happens, but we check the
-        # actual hash using nix-hash and if it doesn't match what
-        # `nix-store -q --hash` says, we update the sqlite database to
-        # fix the error.
-        registered_store_obj_hash = nix_store_q("--hash")
-        correct_hash = "sha256:{}".format(strip_output(
-            "nix-hash --type sha256 --base32 {}".format(store_path)))
-        if correct_hash != registered_store_obj_hash:
-            logging.warn("Incorrect hash {} stored for path {}. Updating."
-                         .format(registered_store_obj_hash, store_path))
-            # Compute the hash without the base32 encoding.
-            full_hash_cmd = "nix-hash --type sha256 {}".format(store_path)
-            full_hash = strip_output(full_hash_cmd)
-            try:
-                with sqlite3.connect(self._db_path) as con:
-                    con.execute("UPDATE ValidPaths SET hash = '{}' "
-                                "WHERE path = 'sha256:{}';"
-                                .format(full_hash, store_path))
-            except sqlite3.OperationalError as err:
-                raise CouldNotUpdateHash(path, registered_store_obj_hash,
-                                         correct_hash, err)
+        with self._db:
+            basic_query = ("SELECT id, hash, deriver, narSize FROM ValidPaths "
+                           "WHERE path = '{}'".format(store_path))
+            _id, _hash, deriver, nar_size = \
+                self._db.execute(basic_query).fetchone()
+            # Some paths have corrupt hashes stored in the sqlite
+            # database. I'm not sure why this happens, but we check the
+            # actual hash using nix-hash and if it doesn't match what
+            # is stored in the database, we update the database.
+            correct_hash = "sha256:{}".format(
+                strip_output("nix-hash --type sha256 {}".format(store_path)))
+            if correct_hash != _hash:
+                logging.warn("Incorrect hash {} stored for path {}. Updating."
+                             .format(registered_store_obj_hash, store_path))
+                self._db.execute("UPDATE ValidPaths SET hash = '{}' "
+                                 "WHERE path = '{}'"
+                                 .format(correct_hash, store_path))
+            references_query = ("SELECT path FROM Refs JOIN ValidPaths "
+                                "ON reference = id WHERE referrer = {}"
+                                .format(_id))
+            references = self._db.execute(references_query).fetchall()
         info = {
             "StorePath": store_path,
             "NarHash": correct_hash,
-            "NarSize": nix_store_q("--size"),
+            "NarSize": nar_size,
             "FileSize": str(file_size),
             "FileHash": "sha256:{}".format(file_hash)
         }
-        references = nix_store_q("--references").split()
         if references != []:
-            info["References"] = " ".join(map(basename, references))
-        deriver = nix_store_q("--deriver")
-        if deriver != "unknown-deriver":
+            info["References"] = " ".join(basename(ref[0])
+                                          for ref in references)
+        if deriver is not None and deriver != "":
             info["Deriver"] = basename(deriver)
         self._paths_to_info[store_path] = info
         return info
@@ -147,7 +172,7 @@ class NixServer(Flask):
         compressed_path = strip_output([
             join(self._nix_bin_path, "nix-build"),
             "--expr", nar_expr, "--no-out-link"
-        ])
+        ], shell=False)
 
         # This path will contain a compressed file; return its path.
         contents = map(decode_str, os.listdir(compressed_path))
@@ -182,13 +207,10 @@ class NixServer(Flask):
             :type obj_hash: ``str``
             """
             if _HASH_REGEX.match(obj_hash) is None:
-                 return ("Hash {} must match {}"
-                         .format(obj_hash, _HASH_REGEX.pattern), 400)
-            try:
-                store_path = self.store_path_from_hash(obj_hash)
-                store_info = self.get_object_info(store_path)
-            except NoSuchObject as err:
-                return (err.message, 404)
+                raise ClientError("Hash {} must match {}"
+                                  .format(obj_hash, _HASH_REGEX.pattern), 400)
+            store_path = self.store_path_from_hash(obj_hash)
+            store_info = self.get_object_info(store_path)
             # Add a few more keys to the store object, specific to the
             # compression type we're serving.
             store_info["URL"] = "nar/{}{}".format(obj_hash,
@@ -208,34 +230,59 @@ class NixServer(Flask):
             :param obj_hash: First 32 characters of the object's store path.
             :type obj_hash: ``str``
             """
-            try:
-                store_path = self.store_path_from_hash(obj_hash)
-            except NoSuchObject as err:
-                return (err.message, 404)
+            store_path = self.store_path_from_hash(obj_hash)
             nar_path = self.build_nar(store_path)
             return send_file(nar_path, mimetype=self._content_type)
 
-        @app.route("/get-missing-paths")
-        def get_missing_paths():
-            """Given a list of store paths, return which are not in the store.
+        @app.route("/query-paths")
+        def query_paths():
+            """Given a list of store paths, find which are/not in the store.
 
             The request must contain JSON containing a single array
             with a list of store path strings. The response will be a
-            JSON array containing store paths which were in the
-            request but are not in the local nix store.
+            JSON dictionary mapping store paths to True if they exist
+            on the server, and False otherwise.
             """
             paths = request.get_json()
             if not isinstance(paths, list) or \
-                    not all(lambda x: isinstance(x, six.string_types), paths):
+                    not all(isinstance(p, six.string_types) for p in paths):
                 raise ClientError("Expected a list of path strings")
+            # Dictionary where we'll store the path results. Keys are
+            # paths; values are True if the path is in the store and
+            # False otherwise.
+            path_results = {}
+            # Validate that all paths match the path regex; this will make
+            # the SQL query we build correct and safe.
             for path in paths:
-                pass
+                match = self._full_store_path_regex.match(path)
+                if match is None:
+                    raise ClientError(
+                        "Encountered invalid store path '{}': does not match "
+                        "pattern '{}'"
+                        .format(path, self._full_store_path_regex.pattern))
+                try:
+                    self.check_in_store(path)
+                    path_results[path] = True
+                except NoSuchObject:
+                    path_results[path] = False
+            return jsonify(path_results)
 
-        @app.errorhandler(ClientError)
-        def handle_invalid_usage(error):
+        @app.errorhandler(BaseHTTPError)
+        def handle_http_error(error):
+            logging.exception(error)
             response = jsonify(error.to_dict())
             response.status_code = error.status_code
             return response
+
+        if self._debug is True:
+            @app.errorhandler(Exception)
+            def handle_unknown(error):
+                """If we encounter an unknown error, this will be triggered."""
+                import ipdb
+                import traceback
+                print("".join(traceback.format_tb(error.__traceback__)))
+                print(error)
+                ipdb.set_trace()
 
         return app
 
@@ -250,6 +297,8 @@ def _get_args():
     parser.add_argument("--compression-type", default="xz",
                         choices=("xz", "bzip2"),
                         help="How served objects should be compressed.")
+    parser.add_argument("--debug", action="store_true", default=False,
+                        help="Enable interactive debugging on unknown errors.")
     return parser.parse_args()
 
 
@@ -257,7 +306,7 @@ def main():
     """Main entry point."""
     try:
         nix_bin_path = os.environ["NIX_BIN_PATH"]
-        assert exists(join(nix_bin_path, "nix-store"))
+        assert exists(join(nix_bin_path, "nix-build"))
         # The store path can be given explicitly, or else it will be
         # inferred to be 2 levels up from the bin path. E.g., if the
         # bin path is /foo/bar/123-nix/bin, the store directory will
@@ -278,7 +327,8 @@ def main():
     nixserver = NixServer(nix_store_path=nix_store_path,
                           nix_state_path=nix_state_path,
                           nix_bin_path=nix_bin_path,
-                          compression_type=args.compression_type)
+                          compression_type=args.compression_type,
+                          debug=args.debug)
     app = nixserver.make_app()
     app.run(port=args.port, host=args.host)
 

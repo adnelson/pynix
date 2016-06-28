@@ -22,13 +22,15 @@ def decode_str(string):
     else:
         return string
 
-def strip_output(command):
+def strip_output(command, shell=True):
     """Execute a bash command, and return its stripped output.
 
-    :param command: A bash command, either a string or list.
+    :param command: A command, either a string or list.
     :type command: ``str`` or ``list`` of ``str``
+    :param shell: Execute the command as a shell command.
+    :type shell: ``bool``
 
     :return: The resulting stdout, stripped of trailing whitespace.
     :rtype: ``str``
     """
-    return decode_str(check_output(command, shell=True)).strip()
+    return decode_str(check_output(command, shell=shell)).strip()
