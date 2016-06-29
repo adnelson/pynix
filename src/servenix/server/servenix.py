@@ -183,9 +183,8 @@ class NixServer(Flask):
         contents = map(decode_str, os.listdir(compressed_path))
         for filename in contents:
             if filename.endswith(self._nar_extension):
-                result = join(compressed_path, filename)
-                logging.info("Successfully generated NAR: {}".format(result))
-                return result
+                logging.info("Generated NAR: {}".format(compressed_path))
+                return join(compressed_path, filename)
         raise NoNarGenerated(compressed_path, self._nar_extension)
 
     def make_app(self):
@@ -311,8 +310,9 @@ class NixServer(Flask):
                 raise NixImportFailed(err)
             # The resulting path is printed to stdout. Grab it here.
             result_path = decode_str(out).strip()
-            # Spin off a thread to build a NAR of the path and add its info.
-            Thread(target=self.get_object_info, args=(result_path,)).start()
+            # Spin off a thread to build a NAR of the path, to speed
+            # up future fetches.
+            Thread(target=self.build_nar, args=(result_path,)).start()
             # Return the path as an indicator of success.
             return (result_path, 200)
 
