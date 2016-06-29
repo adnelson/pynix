@@ -290,22 +290,42 @@ class NixServer(Flask):
         def import_path():
             """Receives a new store object.
 
-            Request should contain binary data which can be fed into
-            the 'nix-store --import' command (which is to say, the
-            request should be the result of a call to `nix-store
-            --export`, or an equivalent). Note that the import will
-            fail if the all of the path's references do not already
-            exist on the server. It is up to the client to ensure
-            that paths are sent in the correct order.
+            The request should contain binary data which can be fed
+            into the 'nix-store --import' command (which is to say,
+            the request should be the result of a call to `nix-store
+            --export`, or an equivalent). The binary data can
+            optionally be compressed with gzip, in which case the
+            "Content-Type" header should be set appropriately.
+
+            Note that the import will fail if the all of the path's
+            references do not already exist on the server. It is up to
+            the client to ensure that paths are sent in the correct
+            order.
 
             After the object is successfully imported, a compressed
             NAR will be created automatically.
             """
+            content_type = request.headers.get("content-type")
+            def decompress(program):
+                proc = Popen(program, stdin=PIPE, stdout=PIPE, shell=True)
+                out = proc.communicate(input=request.data)[0]
+                if proc.wait() != 0:
+                    raise ServerError("Decompression with '{}' failed"
+                                      .format(program))
+                return out
+            if content_type is None or content_type == "":
+                data = request.data
+            elif content_type == "application/x-gzip":
+                data = decompress("gzip -d")
+            else:
+                msg = "Unsupported content type '{}'".format(content_type)
+                raise ClientError(msg)
+
             # TODO: compressed exports?
             proc = Popen([join(self._nix_bin_path, "nix-store"), "--import"],
                          stdin=PIPE, stderr=PIPE, stdout=PIPE)
             # Get the request data and send it to the subprocess.
-            out, err = proc.communicate(input=request.data)
+            out, err = proc.communicate(input=data)
             if proc.wait() != 0:
                 raise NixImportFailed(err)
             # The resulting path is printed to stdout. Grab it here.
