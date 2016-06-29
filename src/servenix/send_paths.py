@@ -109,7 +109,10 @@ class StoreObjectSender(object):
         for ref in self.get_references(path):
             self.send_object(ref)
         # Now we can send the object itself. Generate a dump of the
-        # file and stream it into the import url.
+        # file and send it to the import url. For now we're not using
+        # streaming because it's not entirely clear that this is
+        # possible with current requests, or indeed possible in
+        # general without knowing the file size.
         logging.info("Sending server a new store path {}".format(path))
         out = check_output("nix-store --export {}".format(path), shell=True)
         url = "{}/import-path".format(self._endpoint)

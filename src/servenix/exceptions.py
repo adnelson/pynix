@@ -33,7 +33,7 @@ class NoSuchObject(BaseHTTPError):
     """
     status_code = 404
     def __init__(self, message):
-        self.message = message
+        BaseHTTPError.__init__(self, message=message)
 
 
 class NoNarGenerated(ServerError):
@@ -47,10 +47,13 @@ class NoNarGenerated(ServerError):
 class CouldNotUpdateHash(ServerError):
     """Raised when we couldn't update an invalid hash."""
     def __init__(self, path, stored_hash, valid_hash, message):
-        self.message = ("Couldn't update the hash of path {} from {} to {}: {}"
-                        .format(path, stored_hash, valid_hash, message))
+        message = ("Couldn't update the hash of path {} from {} to {}: {}"
+                   .format(path, stored_hash, valid_hash, message))
+        ServerError.__init__(self, message=message)
+
 
 class NixImportFailed(BaseHTTPError):
     """Raised when we couldn't import a store object."""
     def __init__(self, err_message):
-        self.message = "Couldn't perform the import: {}".format(err_message)
+        message = "Couldn't perform the import: {}".format(err_message)
+        BaseHTTPError.__init__(self, message=message)

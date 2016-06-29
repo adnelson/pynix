@@ -6,6 +6,7 @@ from os.path import exists, isdir, join, basename, dirname
 import re
 from subprocess import check_output, Popen, PIPE
 import sqlite3
+from threading import Thread
 
 from flask import Flask, make_response, send_file, request, jsonify
 import six
@@ -182,7 +183,9 @@ class NixServer(Flask):
         contents = map(decode_str, os.listdir(compressed_path))
         for filename in contents:
             if filename.endswith(self._nar_extension):
-                return join(compressed_path, filename)
+                result = join(compressed_path, filename)
+                logging.info("Successfully generated NAR: {}".format(result))
+                return result
         raise NoNarGenerated(compressed_path, self._nar_extension)
 
     def make_app(self):
@@ -302,8 +305,8 @@ class NixServer(Flask):
             # TODO: compressed exports?
             proc = Popen([join(self._nix_bin_path, "nix-store"), "--import"],
                          stdin=PIPE, stderr=PIPE, stdout=PIPE)
-            # Stream the request data into the subprocess.
-            out, err = proc.communicate(input=request.stream)
+            # Get the request data and send it to the subprocess.
+            out, err = proc.communicate(input=request.data)
             if proc.wait() != 0:
                 raise NixImportFailed(err)
             # The resulting path is printed to stdout. Grab it here.
