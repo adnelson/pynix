@@ -3,6 +3,7 @@ import argparse
 import json
 import logging
 import os
+from subprocess import Popen, PIPE, check_output
 
 import requests
 import six
@@ -36,7 +37,8 @@ class StoreObjectSender(object):
         if path not in self._path_references:
             refs = strip_output("nix-store --query --references {}"
                                 .format(path))
-            self._path_references[path] = refs.split()
+            refs = refs.split()
+            self._path_references[path] = [r for r in refs if r != path]
         return self._path_references[path]
 
     def query_store_paths(self, paths):
@@ -105,15 +107,13 @@ class StoreObjectSender(object):
             return
         # First send all of the object's references. Skip self-references.
         for ref in self.get_references(path):
-            if ref != path:
-                self.send_object(path)
+            self.send_object(ref)
         # Now we can send the object itself. Generate a dump of the
         # file and stream it into the import url.
         logging.info("Sending server a new store path {}".format(path))
-        proc = Popen("nix-store --export {}".format(path),
-                     shell=True, stdout=PIPE)
+        out = check_output("nix-store --export {}".format(path), shell=True)
         url = "{}/import-path".format(self._endpoint)
-        response = requests.post(url, data=proc.stdout)
+        response = requests.post(url, data=out)
         # Check the response code.
         response.raise_for_status()
         # Register that the store path has been sent.
