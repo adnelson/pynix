@@ -311,8 +311,8 @@ class NixServer(Flask):
                 raise NixImportFailed(err)
             # The resulting path is printed to stdout. Grab it here.
             result_path = decode_str(out).strip()
-            # Spin off a thread to build a NAR of the path.
-            Thread(target=self.build_nar, args=(result_path,)).start()
+            # Spin off a thread to build a NAR of the path and add its info.
+            Thread(target=self.get_object_info, args=(result_path,)).start()
             # Return the path as an indicator of success.
             return (result_path, 200)
 
