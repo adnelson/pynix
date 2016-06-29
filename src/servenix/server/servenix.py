@@ -378,7 +378,8 @@ def main():
     except KeyError as err:
         exit("Invalid environment: variable {} must be set.".format(err))
     args = _get_args()
-    logging.basicConfig(level=getattr(logging, args.log_level))
+    logging.basicConfig(level=getattr(logging, args.log_level),
+                        format="%(message)s")
     nixserver = NixServer(nix_store_path=nix_store_path,
                           nix_state_path=nix_state_path,
                           nix_bin_path=nix_bin_path,

@@ -163,6 +163,7 @@ def main():
     args = _get_args()
     if args.endpoint is None:
         exit("Endpoint is required. Use --endpoint or set NIX_REPO_HTTP.")
-    logging.basicConfig(level=getattr(logging, args.log_level))
+    logging.basicConfig(level=getattr(logging, args.log_level),
+                        format="%(message)s")
     sender = StoreObjectSender(endpoint=args.endpoint, dry_run=args.dry_run)
     sender.send_objects(args.paths)
