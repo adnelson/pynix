@@ -51,13 +51,9 @@ class NixServer(Flask):
         if self._compression_type == "bzip2":
             self._content_type = "application/x-bzip2"
             self._nar_extension = ".nar.bz2"
-        elif self._compression_type == "xz":
+        else:
             self._content_type = "application/x-xz"
             self._nar_extension = ".nar.xz"
-        else:
-            # Shouldn't happen, but just in case:
-            raise ValueError("Invalid compression type {}"
-                             .format(self._compression_type))
         # Enable interactive debugging on unknown errors.
         self._debug = debug
 
@@ -297,48 +293,22 @@ class NixServer(Flask):
             Request should contain binary data which can be fed into
             the 'nix-store --import' command (which is to say, the
             request should be the result of a call to `nix-store
-            --export`, or an equivalent). The data can optionally be
-            compressed in xz, gz, or bz2 compression. If so, the
-            appropriate content-type header must be set.
-
-
-            Note that the import will fail if the all of the path's
-            references do not already exist on the server. It is up to
-            the client to ensure that paths are sent in the correct
-            order, or the request will fail.
+            --export`, or an equivalent). Note that the import will
+            fail if the all of the path's references do not already
+            exist on the server. It is up to the client to ensure
+            that paths are sent in the correct order.
 
             After the object is successfully imported, a compressed
-            NAR will be created automatically. However, the response
-            will be not wait for the NAR to be created before being
-            sent.
+            NAR will be created automatically.
             """
-            content_type = requests.headers.get("content-type")
-            # Decompress the input data if content type is set.
-            if content_type is None:
-                decompressor = "cat"
-            elif content_type == "application/x-xz":
-                decompressor = "xz -d"
-            elif content_type == "application/x-bzip2":
-                decompressor = "bzip2 -d"
-            elif content_type == "application/x-gzip":
-                decompressor = "gzip -d"
-            else:
-                msg = "Unsupported content type {}".format(content_type)
-                raise ClientError(msg)
-
-            # Create a process to decompress the data.
-            decompress_proc = Popen(decompressor, shell=True, stdin=PIPE,
-                                    stdout=PIPE)
-            # Pipe that process into `nix-store --import`.
-            import_proc = Popen(
-                [join(self._nix_bin_path, "nix-store"), "--import"],
-                stdin=decompress_proc.stdout, stderr=PIPE, stdout=PIPE)
-            # Send the decompression process the request data.
-            decompress_proc.communicate(input=request.data)
-            # The resulting path is printed to stdout. Grab it here.
-            out, err = import_proc.communicate()
-            if import_proc.wait() != 0:
+            # TODO: compressed exports?
+            proc = Popen([join(self._nix_bin_path, "nix-store"), "--import"],
+                         stdin=PIPE, stderr=PIPE, stdout=PIPE)
+            # Get the request data and send it to the subprocess.
+            out, err = proc.communicate(input=request.data)
+            if proc.wait() != 0:
                 raise NixImportFailed(err)
+            # The resulting path is printed to stdout. Grab it here.
             result_path = decode_str(out).strip()
             # Spin off a thread to build a NAR of the path, to speed
             # up future fetches.

@@ -27,12 +27,6 @@ Now you can use it on another machine:
 $ nix-build my_package --option binary-caches http://my_nix_server:5000
 ```
 
-Note that at present `servenix` directly accesses the nix SQLite
-database, so it must be run as a user with privileges on that
-database. This currently prevents it from running on a standard
-`nixos` installation without root privileges. Future work will
-hopefully remove this limitation.
-
 ## Serving Nix Objects
 
 Nix has a concept of *binary substitution*, where a pre-built package
