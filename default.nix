@@ -1,26 +1,29 @@
 {
   pkgsPath ? <nixpkgs>,
+  pkgs ? import pkgsPath {}
 }:
 
 let
-  pkgs = import pkgsPath {};
-  inherit (pkgs) nix lib coreutils sqlite;
+  # Use .out so we have the binaries callable
+  nix = pkgs.nix.out;
+  inherit (pkgs) lib coreutils sqlite;
   pythonPackages = pkgs.python3Packages;
-  inherit (pythonPackages) buildPythonPackage flask;
 in
 
-
-buildPythonPackage rec {
-  name = "servenix";
+pythonPackages.buildPythonPackage rec {
+  name = "servenix-local";
   version = "0.0.0.dev0";
   buildInputs = [
     pythonPackages.ipython
   ];
   propagatedBuildInputs = [
-    nix
-    sqlite
     coreutils
-    flask
+    nix
+    pythonPackages.ipdb
+    pythonPackages.flask
+    pythonPackages.requests2
+    pythonPackages.six
+    sqlite
   ];
   src = ./.;
   makeWrapperArgs = [
