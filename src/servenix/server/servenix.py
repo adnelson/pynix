@@ -11,7 +11,7 @@ from threading import Thread
 from flask import Flask, make_response, send_file, request, jsonify
 import six
 
-from servenix.common.utils import decode_str, strip_output
+from servenix.common.utils import decode_str, strip_output, find_nix_paths
 from servenix.common.exceptions import (NoSuchObject, NoNarGenerated,
                                         BaseHTTPError, NixImportFailed,
                                         CouldNotUpdateHash, ClientError)
@@ -358,31 +358,13 @@ def _get_args():
 
 def main():
     """Main entry point."""
-    try:
-        nix_bin_path = os.environ["NIX_BIN_PATH"]
-        assert exists(join(nix_bin_path, "nix-build"))
-        # The store path can be given explicitly, or else it will be
-        # inferred to be 2 levels up from the bin path. E.g., if the
-        # bin path is /foo/bar/123-nix/bin, the store directory will
-        # be /foo/bar.
-        nix_store_path = os.environ.get("NIX_STORE_PATH",
-                                        dirname(dirname(nix_bin_path)))
-        assert isdir(nix_store_path), \
-            "Nix store directory {} doesn't exist".format(nix_store_path)
-        # The state path can be given explicitly, or else it will be
-        # inferred to be sibling to the store directory.
-        nix_state_path = os.environ.get("NIX_STATE_PATH",
-                                        join(dirname(nix_store_path), "var"))
-        assert isdir(nix_state_path), \
-            "Nix state directory {} doesn't exist".format(nix_state_path)
-    except KeyError as err:
-        exit("Invalid environment: variable {} must be set.".format(err))
+    nix_paths = find_nix_paths()
     args = _get_args()
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(message)s")
-    nixserver = NixServer(nix_store_path=nix_store_path,
-                          nix_state_path=nix_state_path,
-                          nix_bin_path=nix_bin_path,
+    nixserver = NixServer(nix_store_path=nix_paths["nix_store_path"],
+                          nix_state_path=nix_paths["nix_state_path"],
+                          nix_bin_path=nix_paths["nix_bin_path"],
                           compression_type=args.compression_type,
                           debug=args.debug)
     app = nixserver.make_app()

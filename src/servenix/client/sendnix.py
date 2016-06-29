@@ -4,11 +4,12 @@ import json
 import logging
 import os
 from subprocess import Popen, PIPE, check_output
+import sqlite3
 
 import requests
 import six
 
-from servenix.common.utils import strip_output
+from servenix.common.utils import strip_output, find_nix_paths
 
 class StoreObjectSender(object):
     """Wraps some state for sending store objects."""
@@ -73,6 +74,8 @@ class StoreObjectSender(object):
         if len(full_path_set) == 0:
             # No point in making a request if we don't have any paths.
             return set()
+        for p in full_path_set:
+            logging.debug("Querying path {}".format(p))
         logging.info("Asking the nix server about {} paths."
                      .format(len(full_path_set)))
         response = requests.get(url, headers=headers, data=data)
@@ -114,9 +117,13 @@ class StoreObjectSender(object):
         # possible with current requests, or indeed possible in
         # general without knowing the file size.
         logging.info("Sending server a new store path {}".format(path))
-        out = check_output("nix-store --export {}".format(path), shell=True)
+        export_proc = Popen("nix-store --export {}".format(path), shell=True, 
+                            stdout=PIPE)
+        # Pipe the result of the export into gzip.
+        out = check_output("gzip", shell=True, stdin=export_proc.stdout)
         url = "{}/import-path".format(self._endpoint)
-        response = requests.post(url, data=out)
+        headers = {"Content-Type": "application/x-gzip"}
+        response = requests.post(url, data=out, headers=headers)
         # Check the response code.
         response.raise_for_status()
         # Register that the store path has been sent.
@@ -142,6 +149,19 @@ class StoreObjectSender(object):
             for path in paths:
                 self.send_object(path)
 
+    def sync_store(self):
+        """Syncronize the local nix store to the endpoint.
+
+        Reads all of the known paths in the nix SQLite database, and
+        passes them into :py:meth:`send_objects`.
+        """
+        nix_state_path = find_nix_paths()["nix_state_path"]
+        db_path = os.path.join(nix_state_path, "nix", "db", "db.sqlite")
+        with sqlite3.connect(db_path) as con:
+            query = con.execute("SELECT path FROM ValidPaths")
+            paths = [res[0] for res in query.fetchall()]
+        self.send_objects(paths)
+
 
 def _get_args():
     """Parse command-line arguments."""
@@ -151,12 +171,17 @@ def _get_args():
                         help="Endpoint of nix server to send to.")
     parser.add_argument("--dry-run", action="store_true", default=False,
                         help="If true, reports which paths would be sent.")
-    parser.add_argument("paths", nargs="+", help="Store paths to send.")
     parser.add_argument("--log-level", help="Log messages level.",
                         default="INFO", choices=("CRITICAL", "ERROR", "INFO",
                                                  "WARNING", "DEBUG"))
+    subparsers = parser.add_subparsers(title="Command", dest="command")
+    subparsers.required = True
+    # 'send' command used for sending particular paths.
+    send = subparsers.add_parser("send", help="Send specific store objects.")
+    send.add_argument("paths", nargs="+", help="Store paths to send.")
+    # 'sync' command used for syncronizing an entire nix store.
+    sync = subparsers.add_parser("sync", help="Send all store objects.")
     return parser.parse_args()
-
 
 def main():
     """Main entry point."""
@@ -166,4 +191,9 @@ def main():
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(message)s")
     sender = StoreObjectSender(endpoint=args.endpoint, dry_run=args.dry_run)
-    sender.send_objects(args.paths)
+    if args.command == "send":
+        sender.send_objects(args.paths)
+    elif args.command == "sync":
+        sender.sync_store()
+    else:
+        exit("Unknown command '{}'".format(args.command))
