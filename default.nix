@@ -1,10 +1,11 @@
 {
   pkgsPath ? <nixpkgs>,
-  pkgs ? (import <nsnix> {}).external.pkgs
+  pkgs ? import pkgsPath {}
 }:
 
 let
-  nix = (import <nsnix> {}).external.pkgs.nix.out;
+  # Use .out so we have the binaries callable
+  nix = pkgs.nix.out;
   inherit (pkgs) lib coreutils sqlite;
   pythonPackages = pkgs.python3Packages;
 in
@@ -20,6 +21,7 @@ pythonPackages.buildPythonPackage rec {
     nix
     pythonPackages.ipdb
     pythonPackages.flask
+    pythonPackages.requests2
     pythonPackages.six
     sqlite
   ];
