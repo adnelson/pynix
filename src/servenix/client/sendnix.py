@@ -8,7 +8,7 @@ from subprocess import Popen, PIPE, check_output
 import requests
 import six
 
-from servenix.utils import strip_output
+from servenix.common.utils import strip_output
 
 class StoreObjectSender(object):
     """Wraps some state for sending store objects."""

@@ -11,10 +11,10 @@ from threading import Thread
 from flask import Flask, make_response, send_file, request, jsonify
 import six
 
-from servenix.utils import decode_str, strip_output
-from servenix.exceptions import (NoSuchObject, NoNarGenerated,
-                                 BaseHTTPError, NixImportFailed,
-                                 CouldNotUpdateHash, ClientError)
+from servenix.common.utils import decode_str, strip_output
+from servenix.common.exceptions import (NoSuchObject, NoNarGenerated,
+                                        BaseHTTPError, NixImportFailed,
+                                        CouldNotUpdateHash, ClientError)
 
 _HASH_REGEX=re.compile(r"[a-z0-9]{32}")
 _PATH_REGEX=re.compile(r"([a-z0-9]{32})-[^' \n/]*$")
