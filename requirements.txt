@@ -1,2 +1,3 @@
 flask
 six
+requests>=2
