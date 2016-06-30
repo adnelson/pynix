@@ -307,6 +307,7 @@ class NixServer(Flask):
             """
             content_type = request.headers.get("content-type")
             def decompress(program):
+                """Decompresses the request data by via the given program."""
                 proc = Popen(program, stdin=PIPE, stdout=PIPE, shell=True)
                 out = proc.communicate(input=request.data)[0]
                 if proc.wait() != 0:
@@ -320,8 +321,6 @@ class NixServer(Flask):
             else:
                 msg = "Unsupported content type '{}'".format(content_type)
                 raise ClientError(msg)
-
-            # TODO: compressed exports?
             proc = Popen([join(self._nix_bin_path, "nix-store"), "--import"],
                          stdin=PIPE, stderr=PIPE, stdout=PIPE)
             # Get the request data and send it to the subprocess.
