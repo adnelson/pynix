@@ -14,7 +14,8 @@ import six
 from servenix.common.utils import decode_str, strip_output, find_nix_paths
 from servenix.common.exceptions import (NoSuchObject, NoNarGenerated,
                                         BaseHTTPError, NixImportFailed,
-                                        CouldNotUpdateHash, ClientError)
+                                        CouldNotUpdateHash, ClientError,
+                                        ServerError)
 
 _HASH_REGEX=re.compile(r"[a-z0-9]{32}")
 _PATH_REGEX=re.compile(r"([a-z0-9]{32})-[^' \n/]*$")

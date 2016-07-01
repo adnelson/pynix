@@ -1,8 +1,13 @@
 """Module for sending store objects to a running servenix instance."""
 import argparse
+import concurrent
+from concurrent.futures import ThreadPoolExecutor
+from copy import copy
+import getpass
 import gzip
 import json
 import logging
+from multiprocessing import cpu_count
 import os
 from os.path import join, isdir, isfile, expanduser, basename
 import re
@@ -18,6 +23,7 @@ except ImportError as err:
              "running this command.")
     else:
         raise
+from threading import BoundedSemaphore
 
 import requests
 import six
@@ -27,7 +33,8 @@ from servenix.common.utils import strip_output, find_nix_paths
 class StoreObjectSender(object):
     """Wraps some state for sending store objects."""
     def __init__(self, endpoint, dry_run=False, username=None,
-                 password=None, cache_location=None, cache_enabled=True):
+                 password=None, cache_location=None, cache_enabled=True,
+                 max_jobs=cpu_count()):
         #: Server running servenix (string).
         self._endpoint = endpoint
         #: If true, no actual paths will be sent.
@@ -49,8 +56,8 @@ class StoreObjectSender(object):
         self._path_references = self._load_cache("path_references", {})
         #: Set of paths known to exist on the server already (set of strings).
         self._objects_on_server = set()
-        #: When sending objects, this can be used to count remaining.
-        self._remaining_objects = None
+        #: Semaphore limiting numbers of concurrent sends.
+        self._connection_semaphore = BoundedSemaphore(max_jobs)
 
     @staticmethod
     def default_cache():
@@ -219,13 +226,13 @@ class StoreObjectSender(object):
         self._auth = requests.auth.HTTPBasicAuth(self._username, password)
         return self._auth
 
-    def send_object(self, path, remaining_objects=None):
+    def _send_object(self, path, remaining):
         """Send a store object to a nix server.
 
         :param path: The path to the store object to send.
         :type path: ``str``
-        :param remaining_objects: Set of remaining objects to send.
-        :type remaining: ``NoneType`` or ``set`` of ``str``
+        :param remaining: Set of remaining objects to send.
+        :type remaining: ``set`` of ``str``
 
         Side effects:
         * Adds 0 or 1 paths to `self._objects_on_server`.
@@ -234,41 +241,41 @@ class StoreObjectSender(object):
         if path in self._objects_on_server:
             logging.debug("{} is already on the server.".format(path))
             return
-        # First send all of the object's references. Skip self-references.
-        for ref in self.get_references(path):
-            self.send_object(ref, remaining_objects=remaining_objects)
-        msg = "Sending {}".format(basename(path))
-        if remaining_objects is not None:
-            msg += " ({} left)".format(len(remaining_objects))
-        logging.info(msg)
+        # Spawn threads to fetch parents, and then wait for those to finish.
+        threads = [Thread(target=self._send_object, args=(ref, remaining))
+                   for ref in self.get_references(path)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
         # Now we can send the object itself. Generate a dump of the
         # file and send it to the import url. For now we're not using
         # streaming because it's not entirely clear that this is
         # possible with current requests, or indeed possible in
         # general without knowing the file size.
-        export = check_output("nix-store --export {}".format(path), shell=True)
-        data = gzip.compress(export)
-        url = "{}/import-path".format(self._endpoint)
-        headers = {"Content-Type": "application/x-gzip"}
-        auth = self._get_auth()
-        try:
-            response = requests.post(url, data=data, headers=headers, auth=auth)
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as err:
-            _json = response.json()
-            if _json is not None and "message" in _json:
-                msg = _json["message"]
-            else:
+        with self._connection_semaphore:
+            msg = ("Sending {} ({} remaining)"
+                   .format(basename(path), len(remaining)))
+            logging.info(msg)
+            export = check_output("nix-store --export {}".format(path),
+                                  shell=True)
+            data = gzip.compress(export)
+            url = "{}/import-path".format(self._endpoint)
+            headers = {"Content-Type": "application/x-gzip"}
+            try:
+                response = requests.post(url, data=data, headers=headers,
+                                         auth=self._get_auth())
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as err:
                 msg = response.content
-            logging.error("{} returned error on path {}: {}"
-                          .format(self._endpoint, basename(path), msg))
-            raise
+                logging.error("{} returned error on path {}: {}"
+                              .format(self._endpoint, basename(path), msg))
+                raise
         # Check the response code.
         # Register that the store path has been sent.
         self._objects_on_server.add(path)
-        # Remove the path if it is still in the set.
-        if remaining_objects is not None and path in remaining_objects:
-            remaining_objects.remove(path)
+        if path in remaining:
+            remaining.remove(path)
 
     def send_objects(self, paths):
         """Checks for which paths need to be sent, and sends those.
@@ -277,6 +284,7 @@ class StoreObjectSender(object):
         :type paths: ``str``
         """
         to_send = self.query_store_paths(paths)
+        remaining = copy(to_send)
         num_to_send = len(to_send)
         if num_to_send == 1:
             logging.info("1 path will be sent to {}".format(self._endpoint))
@@ -288,8 +296,13 @@ class StoreObjectSender(object):
                          .format(self._endpoint))
         try:
             if self._dry_run is False:
-                while len(to_send) > 0:
-                    self.send_object(to_send.pop(), to_send)
+                threads = {}
+                for path in to_send:
+                    thread = Thread(target=self._send_object,
+                                    args=(path, remaining))
+                    thread.start()
+                for i, (path, thread) in enumerate(six.iteritems(threads)):
+                    thread.join()
                 logging.info("Sent {} paths to {}"
                              .format(num_to_send, self._endpoint))
         finally:
@@ -358,6 +371,14 @@ def _get_args():
         subparser.add_argument("--cache-location",
                                default=StoreObjectSender.default_cache(),
                                help="Location of cache.")
+        def pos_int(arg):
+            """Parse a postive integer (fail if it's 0 or negative)"""
+            i = int(arg)
+            if i <= 0:
+                sys.exit("Value can't be negative: {}".format(i))
+            return i
+        subparser.add_argument("--max-jobs", type=pos_int, default=cpu_count(),
+                               help="Maximum number of concurrent fetches.")
     return parser.parse_args()
 
 def main():
@@ -371,7 +392,7 @@ def main():
     for name in ("requests", "urllib", "urllib2", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
     sender = StoreObjectSender(endpoint=args.endpoint, dry_run=args.dry_run,
-                               username=args.username)
+                               username=args.username, max_jobs=args.max_jobs)
     if args.command == "send":
         sender.send_objects(args.paths)
     elif args.command == "sync":
