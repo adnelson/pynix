@@ -1,7 +1,5 @@
 """Module for sending store objects to a running servenix instance."""
 import argparse
-import concurrent
-from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 import getpass
 import gzip
@@ -23,12 +21,12 @@ except ImportError as err:
              "running this command.")
     else:
         raise
-from threading import BoundedSemaphore
+from threading import Thread, BoundedSemaphore, Lock
 
 import requests
 import six
 
-from servenix.common.utils import strip_output, find_nix_paths
+from servenix.common.utils import strip_output, find_nix_paths, decode_str
 
 class StoreObjectSender(object):
     """Wraps some state for sending store objects."""
@@ -58,6 +56,12 @@ class StoreObjectSender(object):
         self._objects_on_server = set()
         #: Semaphore limiting numbers of concurrent sends.
         self._connection_semaphore = BoundedSemaphore(max_jobs)
+        #: A set containing paths being sent.
+        self._processed_paths = set()
+        #: Lock controlling access to thread resources.
+        self._path_lock = Lock()
+        #: Keep track of paths that failed.
+        self._failed_paths = {}
 
     @staticmethod
     def default_cache():
@@ -95,9 +99,14 @@ class StoreObjectSender(object):
                 # Cache exists but file does not exist.
                 return default
             else:
-                # File exists in the cache. Parse it as JSON and return it.
-                with gzip.open(full_path, "rb") as f:
-                    return json.loads(f.read().decode("utf-8"))
+                try:
+                    # File exists in the cache. Parse it as JSON and return it.
+                    with gzip.open(full_path, "rb") as f:
+                        return json.loads(f.read().decode("utf-8"))
+                except (ValueError, OSError):
+                    logging.warn("Cache {} seems to be corrupt, ignoring."
+                                 .format(full_path))
+                    return default
         else:
             # Cache doesn't exist yet. Try to create it or bail.
             try:
@@ -226,6 +235,28 @@ class StoreObjectSender(object):
         self._auth = requests.auth.HTTPBasicAuth(self._username, password)
         return self._auth
 
+    def _acquire_path(self, path):
+        """Atomic access to a particular path.
+
+        To make sure we're not sending the same path multiple times, a
+        thread must "acquire" the path (stored in a syncronize
+        dictionary). Once acquired, the path will not be able to be
+        sent by a subsequent thread.
+
+        :param path: The path being acquired.
+        :type path: ``str``
+
+        :return: True if the path was acquired, and otherwise false.
+        :rtype: ``bool``
+        """
+        with self._path_lock:
+            if path in self._processed_paths:
+                return False
+            else:
+                self._processed_paths.add(path)
+                return True
+
+
     def _send_object(self, path, remaining):
         """Send a store object to a nix server.
 
@@ -241,13 +272,23 @@ class StoreObjectSender(object):
         if path in self._objects_on_server:
             logging.debug("{} is already on the server.".format(path))
             return
+        if self._acquire_path(path) is False:
+            logging.debug("{} is already being sent.".format(path))
+            return
         # Spawn threads to fetch parents, and then wait for those to finish.
-        threads = [Thread(target=self._send_object, args=(ref, remaining))
-                   for ref in self.get_references(path)]
-        for thread in threads:
+        # Create a mapping so that we can check the status of failures.
+        threads = {
+            ref: Thread(target=self._send_object, args=(ref, remaining))
+            for ref in self.get_references(path)
+        }
+        for thread in six.itervalues(threads):
             thread.start()
-        for thread in threads:
+        for parent_path, thread in six.iteritems(threads):
             thread.join()
+            if parent_path in self._failed_paths:
+                reason = self._failed_paths[parent_path]
+                self._failed_paths[path] = ("Referenced path {} failed: {}"
+                                            .format(path, reason))
         # Now we can send the object itself. Generate a dump of the
         # file and send it to the import url. For now we're not using
         # streaming because it's not entirely clear that this is
@@ -270,7 +311,8 @@ class StoreObjectSender(object):
                 msg = response.content
                 logging.error("{} returned error on path {}: {}"
                               .format(self._endpoint, basename(path), msg))
-                raise
+                self._failed_paths[path] = decode_str(err)
+                return
         # Check the response code.
         # Register that the store path has been sent.
         self._objects_on_server.add(path)
@@ -295,16 +337,22 @@ class StoreObjectSender(object):
             logging.info("No paths need to be sent. {} is up-to-date."
                          .format(self._endpoint))
         try:
-            if self._dry_run is False:
-                threads = {}
-                for path in to_send:
-                    thread = Thread(target=self._send_object,
-                                    args=(path, remaining))
-                    thread.start()
-                for i, (path, thread) in enumerate(six.iteritems(threads)):
-                    thread.join()
-                logging.info("Sent {} paths to {}"
-                             .format(num_to_send, self._endpoint))
+            if self._dry_run is True or len(to_send) == 0:
+                return
+            threads = {
+                path: Thread(target=self._send_object, args=(path, remaining))
+                for path in to_send
+            }
+            for thread in six.itervalues(threads):
+                thread.start()
+            for path, thread in six.iteritems(threads):
+                thread.join()
+                if path not in self._failed_paths:
+                    reason = self._failed_paths[path]
+                    self._failed_paths[path] = ("Path {} failed: {}"
+                                                .format(path, reason))
+            logging.info("Sent {} paths to {}"
+                         .format(num_to_send, self._endpoint))
         finally:
             self._update_caches()
 

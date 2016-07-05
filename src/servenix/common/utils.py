@@ -37,16 +37,31 @@ def strip_output(command, shell=True):
     """
     return decode_str(check_output(command, shell=shell)).strip()
 
+def replace_quotes(string):
+    """Replace unicode quotes with ASCII.
+
+    Errors reported by nix use unicode quotes to wrap paths. This
+    often results in escape sequences which are confusing to read.
+
+    :param string: The input string, possibly containing unicode quotes.
+    :type string: ``str`` or ``bytes``
+
+    :return: The string without the unicode quotes.
+    :rtype: ``str``
+    """
+    string = decode_str(string)
+    return string.replace("‘", "'").replace("’", "'")
+
 def find_nix_paths():
     """Load up the nix bin, store and state paths, from environment.
-    
+
     :return: A dictionary with three keys, each mapping to paths:
         * nix_bin_path: path to where nix binaries live
         * nix_store_path: path to where nix store objects live
         * nix_state_path: path to where nix state objects live
     :rtype: ``dict``
 
-    :raises: 
+    :raises:
     * ``KeyError`` if 'NIX_BIN_PATH' isn't in the environment.
     * ``AssertionError`` if any of these paths don't exist.
     """
@@ -67,7 +82,7 @@ def find_nix_paths():
     assert isdir(nix_state_path), \
         "Nix state directory {} doesn't exist".format(nix_state_path)
     return {
-        "nix_bin_path": nix_bin_path,        
-        "nix_store_path": nix_store_path,        
+        "nix_bin_path": nix_bin_path,
+        "nix_store_path": nix_store_path,
         "nix_state_path": nix_state_path,
     }
