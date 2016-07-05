@@ -137,7 +137,7 @@ class NixServer(Flask):
                 strip_output("nix-hash --type sha256 {}".format(store_path)))
             if correct_hash != _hash:
                 logging.warn("Incorrect hash {} stored for path {}. Updating."
-                             .format(registered_store_obj_hash, store_path))
+                             .format(_hash, store_path))
                 self._db.execute("UPDATE ValidPaths SET hash = '{}' "
                                  "WHERE path = '{}'"
                                  .format(correct_hash, store_path))
