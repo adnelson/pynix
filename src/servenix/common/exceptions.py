@@ -57,3 +57,14 @@ class NixImportFailed(BaseHTTPError):
     def __init__(self, err_message):
         message = "Couldn't perform the import: {}".format(err_message)
         BaseHTTPError.__init__(self, message=message)
+
+class CouldNotConnect(Exception):
+    def __init__(self, endpoint, status_code, content):
+        self._endpoint = endpoing
+        self._status_code = status_code
+        self._content = content
+        self._message = ("Could not connect to {} ({}): {}"
+                         .format(endpoint, status_code, content))
+
+    def __str__(self):
+        return self._message

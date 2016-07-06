@@ -1,5 +1,6 @@
 """Module for sending store objects to a running servenix instance."""
 import argparse
+import getpass
 import gzip
 import json
 import logging
@@ -23,6 +24,7 @@ import requests
 import six
 
 from servenix.common.utils import strip_output, find_nix_paths
+from servenix.common.exceptions import CouldNotConnect
 
 class StoreObjectSender(object):
     """Wraps some state for sending store objects."""
@@ -149,17 +151,18 @@ class StoreObjectSender(object):
         * Adds 0 or more paths to `self._objects_on_server`.
         """
         total = len(paths)
-        step = int(max(total / 1000, 1))
+        step = max(total // 10, 1)
         full_path_set = set()
         def recur(_paths, top_level=False):
             """Loop for DFS'ing through the paths to generate full closures."""
             for i, path in enumerate(_paths):
-                if top_level is True and i % step == 0:
-                    sys.stderr.write("\r{}/{} references calculated"
-                                     .format(i + 1, total))
                 if path not in full_path_set:
                     recur(self.get_references(path))
                     full_path_set.add(path)
+                if top_level is True and (i % step == 0 or i == total - 1) \
+                        and sys.stderr.isatty():
+                    sys.stderr.write("\r{}/{} references calculated"
+                                     .format(i + 1, total))
             if top_level is True and total > 0:
                 sys.stderr.write("\n")
         recur(paths, top_level=True)
@@ -204,20 +207,54 @@ class StoreObjectSender(object):
         :return: Either None or an Auth object.
         :rtype: ``NoneType`` or :py:class:`requests.auth.HTTPBasicAuth`
         """
-        if self._auth is not None or self._username is None:
+        if self._auth is not None:
             # Cache auth to avoid repeated prompts
             return self._auth
-        logging.info("Authenticating as user {}".format(self._username))
         if self._password is not None:
             password = self._password
         elif os.environ.get("NIX_BINARY_CACHE_PASSWORD", "") != "":
             logging.debug("Using value in NIX_BINARY_CACHE_PASSWORD variable")
             password = os.environ["NIX_BINARY_CACHE_PASSWORD"]
-        else:
-            prompt = "Please enter the password for {}:".format(self._username)
+        elif sys.stdin.isatty():
+            prompt = ("Please enter the password for {}: "
+                      .format(self._username))
             password = getpass.getpass(prompt)
-        self._auth = requests.auth.HTTPBasicAuth(self._username, password)
-        return self._auth
+        else:
+            logging.warn("Can't get password for user {}. Auth may fail."
+                         .format(self._username))
+        if self._username is not None:
+            logging.info("Connecting as user {}".format(self._username))
+        else:
+            logging.info("Connecting...")
+        if self._username is not None:
+            auth = requests.auth.HTTPBasicAuth(self._username, password)
+        else:
+            auth = None
+        url = "{}/nix-cache-info".format(self._endpoint)
+        resp = requests.get(url, auth=auth)
+        if resp.status_code == 200:
+            logging.info("Successfully connected to {}".format(self._endpoint))
+            self._password = password
+            os.environ["NIX_BINARY_CACHE_PASSWORD"] = password
+            self._auth = auth
+            return self._auth
+        elif resp.status_code == 401 and sys.stdin.isatty():
+            # Authorization failed. Give the user a chance to set new auth.
+            msg = ("Unauthorized for repo {}. Username"
+                   .format(self._endpoint))
+            if self._username is not None:
+                msg += " (default '{}'): ".format(self._username)
+            else:
+                msg += ": "
+            username = six.moves.input(msg)
+            if username != "":
+                self._username = username
+            os.environ.pop("NIX_BINARY_CACHE_PASSWORD", None)
+            self._password = None
+            return self._get_auth()
+        else:
+            raise CouldNotConnect(self._endpoint, resp.status_code,
+                                  resp.content)
 
     def send_object(self, path, remaining_objects=None):
         """Send a store object to a nix server.
@@ -237,28 +274,32 @@ class StoreObjectSender(object):
         # First send all of the object's references. Skip self-references.
         for ref in self.get_references(path):
             self.send_object(ref, remaining_objects=remaining_objects)
-        msg = "Sending {}".format(basename(path))
-        if remaining_objects is not None:
-            msg += " ({} left)".format(len(remaining_objects))
-        logging.info(msg)
         # Now we can send the object itself. Generate a dump of the
         # file and send it to the import url. For now we're not using
         # streaming because it's not entirely clear that this is
         # possible with current requests, or indeed possible in
         # general without knowing the file size.
+        auth = self._get_auth()
         export = check_output("nix-store --export {}".format(path), shell=True)
-        data = gzip.compress(export)
+        # For large files, show progress when compressing
+        if len(export) > 1000000:
+            logging.info("Compressing {}".format(basename(path)))
+            cmd = "pv -ptef -s {} | gzip".format(len(export))
+            proc = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE)
+            data = proc.communicate(input=export)[0]
+        else:
+            data = gzip.compress(export)
         url = "{}/import-path".format(self._endpoint)
         headers = {"Content-Type": "application/x-gzip"}
-        auth = self._get_auth()
         try:
+            logging.info("Sending {} ({} remaining)"
+                         .format(basename(path), len(remaining_objects)))
             response = requests.post(url, data=data, headers=headers, auth=auth)
             response.raise_for_status()
         except requests.exceptions.HTTPError as err:
-            _json = response.json()
-            if _json is not None and "message" in _json:
-                msg = _json["message"]
-            else:
+            try:
+                msg = json.loads(response.content)["message"]
+            except (ValueError, KeyError):
                 msg = response.content
             logging.error("{} returned error on path {}: {}"
                           .format(self._endpoint, basename(path), msg))
