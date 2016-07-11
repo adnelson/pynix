@@ -59,16 +59,16 @@ static assets server must be set up and configured by the
 administrator, and if binaries are built on one machine, they must be
 `rsync`'d or otherwise shared with the binary cache.
 
-2. Run a `nix-serve` process on a machine to host binaries that
-already exist in its nix store. The advantage here is that it's zero
-configuration: simply run `nix-serve` and you have a binary cache up
-and running. The primary downside is performance; compressed store
-objects are generated on-the-fly, so if the same object is requested
-100 times, it will be compressed 100 times. In addition only `bzip2`
-compression is supported, since `xz` compression is too
-costly. Furthermore, the server is unable to inform the client how
-large the compressed file will be, or what its hash is, which makes
-fetches less reliable.
+2. Run a [`nix-serve`](https://github.com/edolstra/nix-serve) process
+on a machine to host binaries that already exist in its nix store. The
+advantage here is that it's zero configuration: simply run `nix-serve`
+and you have a binary cache up and running. The primary downside is
+performance; compressed store objects are generated on-the-fly, so if
+the same object is requested 100 times, it will be compressed 100
+times. In addition only `bzip2` compression is supported, since `xz`
+compression is too costly. Furthermore, the server is unable to inform
+the client how large the compressed file will be, or what its hash is,
+which makes fetches less reliable.
 
 The goal of `servenix` is to be a compromise between the two:
 
