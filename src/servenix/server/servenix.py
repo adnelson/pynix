@@ -4,7 +4,7 @@ import logging
 import os
 from os.path import exists, isdir, join, basename, dirname
 import re
-from subprocess import check_output, Popen, PIPE
+from subprocess import check_output, Popen, PIPE, CalledProcessError
 from threading import Thread
 
 from flask import Flask, make_response, send_file, request, jsonify
@@ -34,6 +34,8 @@ class NixServer(Flask):
         self._compression_type = compression_type
         # Cache mapping object hashes to store paths.
         self._hashes_to_paths = {}
+        # Cache mapping object hashes to store paths which have been validated.
+        self._hashes_to_valid_paths = {}
         # Cache mapping store paths to object info.
         self._paths_to_info = {}
         # Set of known store paths.
@@ -82,16 +84,16 @@ class NixServer(Flask):
                 return path
             # Otherwise, remove it from the known hashes and raise an error.
             self._hashes_to_paths.pop(store_object_hash, None)
-            raise NoSuchObject("No object with hash {} was found."
+            raise NoSuchObject("No object with hash {} was found!"
                                .format(store_object_hash))
         # Get the list of store objects by listing the directory.
         # Iterate through them until a matching hash is found, or
         # we've exhausted all paths, in which case we error.
         for path in map(decode_str, os.listdir(self._nix_store_path)):
-            path = join(self._nix_store_path, path)
             match = _PATH_REGEX.match(path)
             if match is None:
                 continue
+            path = join(self._nix_store_path, path)
             prefix = match.group(1)
             # Add every path seen to the _hashes_to_paths cache.
             self._hashes_to_paths[prefix] = path
@@ -118,13 +120,13 @@ class NixServer(Flask):
         if store_path in self._known_store_paths:
             return True
         try:
-            self.nix_store_q(store_path, "--hash")
+            self.query_store(store_path, "--hash")
             self._known_store_paths.add(store_path)
             return True
         except CalledProcessError:
             return False
 
-    def nix_store_q(self, store_path, query):
+    def query_store(self, store_path, query):
         """Given a query (e.g. --hash or --size), perform the query.
 
         :param store_path: The store path to query.
@@ -136,7 +138,7 @@ class NixServer(Flask):
         :rtype: ``str``
         """
         nix_store = join(self._nix_bin_path, "nix-store")
-        return strip_output([nix_store, "-q", q, store_path], shell=False)
+        return strip_output([nix_store, "-q", query, store_path], shell=False)
 
     def get_object_info(self, store_path):
         """Given a store path, get some information about the path.
@@ -157,10 +159,10 @@ class NixServer(Flask):
         file_size = int(du.split()[0])
         file_hash = strip_output("nix-hash --type sha256 --base32 --flat {}"
                                  .format(nar_path))
-        nar_size = self.nix_store_q(store_path, "--size")
-        nar_hash = self.nix_store_q(store_path, "--hash")
-        references = self.nix_store_q(store_path, "--references").split()
-        deriver = nix_store_q(store_path, "--deriver")
+        nar_size = self.query_store(store_path, "--size")
+        nar_hash = self.query_store(store_path, "--hash")
+        references = self.query_store(store_path, "--references").split()
+        deriver = self.query_store(store_path, "--deriver")
         info = {
             "StorePath": store_path,
             "NarHash": nar_hash,
@@ -198,8 +200,9 @@ class NixServer(Flask):
         contents = map(decode_str, os.listdir(compressed_path))
         for filename in contents:
             if filename.endswith(self._nar_extension):
-                logging.info("Generated NAR: {}".format(compressed_path))
                 return join(compressed_path, filename)
+        # This might happen if we run out of disk space or something
+        # else terrible.
         raise NoNarGenerated(compressed_path, self._nar_extension)
 
     def make_app(self):
