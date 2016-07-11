@@ -27,12 +27,6 @@ Now you can use it on another machine:
 $ nix-build my_package --option binary-caches http://my_nix_server:5000
 ```
 
-Note that at present `servenix` directly accesses the nix SQLite
-database, so it must be run as a user with privileges on that
-database. This currently prevents it from running on a standard
-`nixos` installation without root privileges. Future work will
-hopefully remove this limitation.
-
 ## Serving Nix Objects
 
 Nix has a concept of *binary substitution*, where a pre-built package
@@ -106,7 +100,20 @@ subsequently sent to the repo so as to reduce duplicated work.
 
 `servenix` provides a python library for sending binaries to a running
 `servenix` instance, and a `sendnix` command which can be called from
-the command line.
+the command line. For example, to upload a single path to a `servenix`
+server, you can use
+
+```bash
+$ export NIX_REPO_HTTP=https://my.nix.server
+$ sendnix send /nix/store/my-store-object /nix/store/my-other-store-object
+```
+
+And to upload everything in your nix store to the server:
+
+```bash
+$ export NIX_REPO_HTTP=https://my.nix.server
+$ sendnix sync
+```
 
 ## License
 

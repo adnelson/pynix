@@ -23,6 +23,7 @@ except ImportError as err:
 import requests
 import six
 
+from servenix import __version__
 from servenix.common.utils import strip_output, find_nix_paths
 from servenix.common.exceptions import CouldNotConnect
 
@@ -355,7 +356,6 @@ class StoreObjectSender(object):
             query = con.execute("SELECT path FROM ValidPaths")
             for result in query.fetchall():
                 path = result[0]
-                include = True
                 if any(ig.match(path) for ig in ignore):
                     logging.info("Path {} matches an ignore regex, skipping"
                                  .format(path))
@@ -368,6 +368,7 @@ class StoreObjectSender(object):
 def _get_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(prog="sendnix")
+    parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(title="Command", dest="command")
     subparsers.required = True
     # 'send' command used for sending particular paths.

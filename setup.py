@@ -1,14 +1,14 @@
 import setuptools
 import os
 from subprocess import Popen, PIPE
+import sys
 
-# This will add the __version__ to the globals
-with open("src/servenix/__init__.py") as f:
-    exec(f.read())
+sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
+import servenix
 
 setuptools.setup(
     name="servenix",
-    version=__version__,
+    version=servenix.__version__,
     package_dir={"": "src"},
     packages=setuptools.find_packages("src"),
     provides=setuptools.find_packages("src"),
