@@ -10,6 +10,7 @@ from threading import Thread
 from flask import Flask, make_response, send_file, request, jsonify
 import six
 
+from servenix import __version__
 from servenix.common.utils import decode_str, strip_output, find_nix_paths
 from servenix.common.exceptions import (NoSuchObject, NoNarGenerated,
                                         BaseHTTPError, NixImportFailed,
@@ -378,6 +379,7 @@ class NixServer(Flask):
 def _get_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(prog="servenix")
+    parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--port", type=int, default=5000,
                         help="Port to listen on.")
     parser.add_argument("--host", default="localhost",
