@@ -5,8 +5,6 @@
 
 let
   # Use .out so we have the binaries callable
-  nix = pkgs.nix.out;
-  inherit (pkgs) lib coreutils sqlite gzip;
   inherit (builtins) replaceStrings readFile;
   pythonPackages = pkgs.python3Packages;
   version = replaceStrings ["\n"] [""] (readFile ./version.txt);
@@ -18,9 +16,10 @@ pythonPackages.buildPythonPackage rec {
     pythonPackages.ipython
   ];
   propagatedBuildInputs = [
-    coreutils
-    gzip
-    nix
+    pkgs.coreutils
+    pkgs.gzip
+    pkgs.nix.out
+    pkgs.pv
     pythonPackages.flask
     pythonPackages.ipdb
     pythonPackages.requests2
@@ -28,6 +27,6 @@ pythonPackages.buildPythonPackage rec {
   ];
   src = ./.;
   makeWrapperArgs = [
-    "--set NIX_BIN_PATH ${lib.makeBinPath [nix]}"
+    "--set NIX_BIN_PATH ${pkgs.lib.makeBinPath [pkgs.nix.out]}"
   ];
 }

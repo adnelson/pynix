@@ -299,7 +299,7 @@ class StoreObjectSender(object):
             response.raise_for_status()
         except requests.exceptions.HTTPError as err:
             try:
-                msg = json.loads(response.content)["message"]
+                msg = json.loads(decode_str(response.content))["message"]
             except (ValueError, KeyError):
                 msg = response.content
             logging.error("{} returned error on path {}: {}"
