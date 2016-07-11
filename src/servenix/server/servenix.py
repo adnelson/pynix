@@ -5,7 +5,6 @@ import os
 from os.path import exists, isdir, join, basename, dirname
 import re
 from subprocess import check_output, Popen, PIPE
-import sqlite3
 from threading import Thread
 
 from flask import Flask, make_response, send_file, request, jsonify
@@ -29,9 +28,6 @@ class NixServer(Flask):
         self._nix_state_path = nix_state_path
         # Path to the folder containing nix binaries.
         self._nix_bin_path = nix_bin_path
-        # Connection to the local nix SQLite database.
-        self._db = sqlite3.connect(
-            join(self._nix_state_path, "nix", "db", "db.sqlite"))
         # Matches valid nix store paths (local to this store)
         self._full_store_path_regex = re.compile(
             join(self._nix_store_path, _PATH_REGEX.pattern))
@@ -72,19 +68,42 @@ class NixServer(Flask):
 
         :raises: :py:class:`NoSuchObject` if the object isn't in the store.
         """
-        if store_object_hash in self._hashes_to_paths:
-            return self._hashes_to_paths[store_object_hash]
-        with self._db:
-            query = ("SELECT path FROM ValidPaths WHERE path LIKE '{}%'"
-                     .format(join(self._nix_store_path, store_object_hash)))
-            full_path = self._db.execute(query).fetchone()
-            if full_path is None:
-                raise NoSuchObject("No object with hash {} was found."
-                                   .format(store_object_hash))
-            # fetchone returns a tuple, so grab its first element.
-            full_path = full_path[0]
-            self._hashes_to_paths[store_object_hash] = full_path
-            return full_path
+        if store_object_hash in self._hashes_to_valid_paths:
+            # Case: the hash maps to a path which has been validated
+            # to exist in the nix store and in the database.
+            return self._hashes_to_valid_paths[store_object_hash]
+        elif store_object_hash in self._hashes_to_paths:
+            # Case: the hash maps to a path which is known to exist in
+            # the nix-store, but hasn't been checked for existence in
+            # the database. Check that it's in the DB before returning.
+            path = self._hashes_to_paths[store_object_hash]
+            if self.check_in_store(path):
+                self._hashes_to_valid_paths[store_object_hash] = path
+                return path
+            # Otherwise, remove it from the known hashes and raise an error.
+            self._hashes_to_paths.pop(store_object_hash, None)
+            raise NoSuchObject("No object with hash {} was found."
+                               .format(store_object_hash))
+        # Get the list of store objects by listing the directory.
+        # Iterate through them until a matching hash is found, or
+        # we've exhausted all paths, in which case we error.
+        for path in map(decode_str, os.listdir(self._nix_store_path)):
+            path = join(self._nix_store_path, path)
+            match = _PATH_REGEX.match(path)
+            if match is None:
+                continue
+            prefix = match.group(1)
+            # Add every path seen to the _hashes_to_paths cache.
+            self._hashes_to_paths[prefix] = path
+            if prefix == store_object_hash:
+                # The path exists in the store. Ensure it's also a
+                # valid path according to nix-store.
+                if not self.check_in_store(path):
+                    break
+                self._hashes_to_valid_paths[store_object_hash] = path
+                return path
+        raise NoSuchObject("No object with hash {} was found."
+                           .format(store_object_hash))
 
     def check_in_store(self, store_path):
         """Check that a store path exists in the nix store.
@@ -93,17 +112,31 @@ class NixServer(Flask):
             to match the full path regex.
         :type store_path: ``str``
 
-        :raises: :py:class:`NoSuchObject` if the object isn't in the store.
+        :return: True if it's in the store, and False otherwise.
+        :rtype: ``bool``
         """
         if store_path in self._known_store_paths:
-            return
-        with self._db:
-            query = ("SELECT path FROM ValidPaths WHERE path = '{}'"
-                     .format(store_path))
-            if self._db.execute(query).fetchone() is None:
-                raise NoSuchObject("No object with path {} was found."
-                                   .format(store_path))
+            return True
+        try:
+            self.nix_store_q(store_path, "--hash")
             self._known_store_paths.add(store_path)
+            return True
+        except CalledProcessError:
+            return False
+
+    def nix_store_q(self, store_path, query):
+        """Given a query (e.g. --hash or --size), perform the query.
+
+        :param store_path: The store path to query.
+        :type store_path: ``str``
+        :param query: The query to perform. Must be a valid nix-store query.
+        :type query: ``str``
+
+        :return: The result of the query.
+        :rtype: ``str``
+        """
+        nix_store = join(self._nix_bin_path, "nix-store")
+        return strip_output([nix_store, "-q", q, store_path], shell=False)
 
     def get_object_info(self, store_path):
         """Given a store path, get some information about the path.
@@ -124,48 +157,30 @@ class NixServer(Flask):
         file_size = int(du.split()[0])
         file_hash = strip_output("nix-hash --type sha256 --base32 --flat {}"
                                  .format(nar_path))
-        with self._db:
-            basic_query = ("SELECT id, hash, deriver, narSize FROM ValidPaths "
-                           "WHERE path = '{}'".format(store_path))
-            _id, _hash, deriver, nar_size = \
-                self._db.execute(basic_query).fetchone()
-            # Some paths have corrupt hashes stored in the sqlite
-            # database. I'm not sure why this happens, but we check the
-            # actual hash using nix-hash and if it doesn't match what
-            # is stored in the database, we update the database.
-            correct_hash = "sha256:{}".format(
-                strip_output("nix-hash --type sha256 {}".format(store_path)))
-            if correct_hash != _hash:
-                logging.warn("Incorrect hash {} stored for path {}. Updating."
-                             .format(_hash, store_path))
-                self._db.execute("UPDATE ValidPaths SET hash = '{}' "
-                                 "WHERE path = '{}'"
-                                 .format(correct_hash, store_path))
-            references_query = ("SELECT path FROM Refs JOIN ValidPaths "
-                                "ON reference = id WHERE referrer = {}"
-                                .format(_id))
-            references = self._db.execute(references_query).fetchall()
+        nar_size = self.nix_store_q(store_path, "--size")
+        nar_hash = self.nix_store_q(store_path, "--hash")
+        references = self.nix_store_q(store_path, "--references").split()
+        deriver = nix_store_q(store_path, "--deriver")
         info = {
             "StorePath": store_path,
-            "NarHash": correct_hash,
+            "NarHash": nar_hash,
             "NarSize": nar_size,
             "FileSize": str(file_size),
             "FileHash": "sha256:{}".format(file_hash)
         }
         if references != []:
-            info["References"] = " ".join(basename(ref[0])
-                                          for ref in references)
-        if deriver is not None and deriver != "":
+            info["References"] = " ".join(basename(ref) for ref in references)
+        if deriver != "unknown-deriver":
             info["Deriver"] = basename(deriver)
         self._paths_to_info[store_path] = info
         return info
 
     def build_nar(self, store_path):
         """Build a nix archive (nar) and return the resulting path."""
-        # Construct a nix expression which will produce a nar.
         if isinstance(store_path, tuple):
             store_path = store_path[0]
 
+        # Construct a nix expression which will produce a nar.
         nar_expr = "".join([
             "(import <nix/nar.nix> {",
             'storePath = "{}";'.format(store_path),

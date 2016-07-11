@@ -355,7 +355,6 @@ class StoreObjectSender(object):
             query = con.execute("SELECT path FROM ValidPaths")
             for result in query.fetchall():
                 path = result[0]
-                include = True
                 if any(ig.match(path) for ig in ignore):
                     logging.info("Path {} matches an ignore regex, skipping"
                                  .format(path))
