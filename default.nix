@@ -1,12 +1,14 @@
 {
   pkgsPath ? <nixpkgs>,
-  pkgs ? import pkgsPath {}
+  pkgs ? import pkgsPath {},
+  python3 ? true,
 }:
 
 let
   # Use .out so we have the binaries callable
   inherit (builtins) replaceStrings readFile;
-  pythonPackages = pkgs.python3Packages;
+  pythonPackages = if python3 then pkgs.python3Packages
+                   else pkgs.python2Packages;
   version = replaceStrings ["\n"] [""] (readFile ./version.txt);
 in
 
