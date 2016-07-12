@@ -115,6 +115,14 @@ $ export NIX_REPO_HTTP=https://my.nix.server
 $ sendnix sync
 ```
 
+Finally, `sendnix` can be run in a `daemon` mode which watches the
+local nix store for changes and automatically syncronizes to the
+server whenever they happen:
+
+```bash
+$ sendnix daemon
+```
+
 ## License
 
 MIT
