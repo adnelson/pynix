@@ -1,11 +1,12 @@
 """Module for sending store objects to a running servenix instance."""
 import argparse
+from datetime import datetime
 import getpass
 import gzip
 import json
 import logging
 import os
-from os.path import join, isdir, isfile, expanduser, basename
+from os.path import join, isdir, isfile, expanduser, basename, getmtime
 import re
 from subprocess import Popen, PIPE, check_output
 import sys
@@ -19,6 +20,7 @@ except ImportError as err:
              "running this command.")
     else:
         raise
+import time
 
 import requests
 import six
@@ -27,10 +29,13 @@ from servenix import __version__
 from servenix.common.utils import strip_output, find_nix_paths
 from servenix.common.exceptions import CouldNotConnect
 
+ENDPOINT_REGEX = re.compile(r"https?://([\w_-]+)(\.[\w_-]+)*(:\d+)?$")
+
 class StoreObjectSender(object):
     """Wraps some state for sending store objects."""
     def __init__(self, endpoint, dry_run=False, username=None,
-                 password=None, cache_location=None, cache_enabled=True):
+                 password=None, cache_location=None, cache_enabled=True,
+                 nix_bin_path=None, nix_state_path=None, nix_store_path=None):
         #: Server running servenix (string).
         self._endpoint = endpoint
         #: If true, no actual paths will be sent.
@@ -54,6 +59,13 @@ class StoreObjectSender(object):
         self._objects_on_server = set()
         #: When sending objects, this can be used to count remaining.
         self._remaining_objects = None
+        #: Paths of crucial nix locations.
+        self._nix_bin_path = nix_bin_path if nix_bin_path is not None \
+                             else find_nix_paths()["nix_bin_path"]
+        self._nix_state_path = nix_state_path if nix_state_path is not None \
+                               else find_nix_paths()["nix_state_path"]
+        self._nix_store_path = nix_store_path if nix_store_path is not None \
+                               else find_nix_paths()["nix_store_path"]
 
     @staticmethod
     def default_cache():
@@ -77,23 +89,27 @@ class StoreObjectSender(object):
         :return: The contents of the cache parsed as JSON, or the default.
         :rtype: ``object``
         """
-        full_path = join(self._cache_location, cache_file)
         if self._cache_location is None:
             return default
         elif isdir(self._cache_location):
+            full_path = join(self._cache_location, cache_file)
             if not os.access(self._cache_location, os.W_OK):
                 # Can't access cache. Disable it.
                 logging.warn("Couldn't access cache location {}."
                              .format(self._cache_location))
                 self._cache_location = None
                 return default
-            elif not isfile(join(self._cache_location, cache_file)):
+            elif not isfile(full_path):
                 # Cache exists but file does not exist.
                 return default
             else:
-                # File exists in the cache. Parse it as JSON and return it.
-                with gzip.open(full_path, "rb") as f:
-                    return json.loads(f.read().decode("utf-8"))
+                try:
+                    # File exists in the cache. Parse it as JSON and return it.
+                    with gzip.open(full_path, "rb") as f:
+                        return json.loads(f.read().decode("utf-8"))
+                except Exception:
+                    # Couldn't parse the cache.
+                    return default
         else:
             # Cache doesn't exist yet. Try to create it or bail.
             try:
@@ -180,8 +196,8 @@ class StoreObjectSender(object):
             return set()
         for p in full_path_set:
             logging.debug("Querying path {}".format(p))
-        logging.info("Asking the nix server about {} paths."
-                     .format(len(full_path_set)))
+        logging.debug("Asking the nix server about {} paths."
+                      .format(len(full_path_set)))
         auth = self._get_auth()
         response = requests.get(url, headers=headers, data=data, auth=auth)
         response.raise_for_status()
@@ -332,10 +348,43 @@ class StoreObjectSender(object):
             if self._dry_run is False:
                 while len(to_send) > 0:
                     self.send_object(to_send.pop(), to_send)
-                logging.info("Sent {} paths to {}"
-                             .format(num_to_send, self._endpoint))
+                if num_to_send > 0:
+                    logging.info("Sent {} paths to {}"
+                                 .format(num_to_send, self._endpoint))
         finally:
             self._update_caches()
+
+    def watch_store(self, ignore):
+        """Watch the nix store's timestamp and sync whenever it changes.
+
+        :param ignore: A list of regexes of objects to ignore when syncing.
+        :type ignore: ``list`` of (``str`` or ``regex``)
+        """
+        prev_stamp = self._load_cache("nix_store_timestamp", None)
+        num_syncs = 0
+        try:
+            while True:
+                # Parse the timestamp of the nix store into a datetime
+                stamp = datetime.fromtimestamp(getmtime(self._nix_store_path))
+                # If it's changed since last time, run a sync.
+                if stamp == prev_stamp:
+                    logging.debug("Store hasn't updated since last check ({})"
+                                  .format(stamp.strftime("%H:%M:%S")))
+                    time.sleep(1)
+                    continue
+                else:
+                    logging.info("Store was modified at {}, syncing"
+                                 .format(stamp.strftime("%H:%M:%S")))
+                try:
+                    self.sync_store(ignore)
+                    prev_stamp = stamp
+                    num_syncs += 1
+                except requests.exceptions.HTTPError as err:
+                    # Don't fail the daemon due to a failed sync.
+                    pass
+        except KeyboardInterrupt:
+            exit("Successfully syncronized with {} {} times."
+                 .format(self._endpoint, num_syncs))
 
 
     def sync_store(self, ignore):
@@ -348,8 +397,7 @@ class StoreObjectSender(object):
         :param ignore: A list of regexes of objects to ignore.
         :type ignore: ``list`` of (``str`` or ``regex``)
         """
-        nix_state_path = find_nix_paths()["nix_state_path"]
-        db_path = os.path.join(nix_state_path, "nix", "db", "db.sqlite")
+        db_path = os.path.join(self._nix_state_path, "nix", "db", "db.sqlite")
         ignore = [re.compile(r) for r in ignore]
         paths = []
         with sqlite3.connect(db_path) as con:
@@ -357,8 +405,8 @@ class StoreObjectSender(object):
             for result in query.fetchall():
                 path = result[0]
                 if any(ig.match(path) for ig in ignore):
-                    logging.info("Path {} matches an ignore regex, skipping"
-                                 .format(path))
+                    logging.debug("Path {} matches an ignore regex, skipping"
+                                  .format(path))
                     continue
                 paths.append(path)
         logging.info("Found {} paths in the store.".format(len(paths)))
@@ -376,30 +424,42 @@ def _get_args():
     send.add_argument("paths", nargs="+", help="Store paths to send.")
     # 'sync' command used for syncronizing an entire nix store.
     sync = subparsers.add_parser("sync", help="Send all store objects.")
-    sync.add_argument("--ignore", nargs="*", default=[],
-                      help="List of regexes of store paths to ignore.")
-    for subparser in (send, sync):
+    daemon = subparsers.add_parser("daemon",
+                                   help="Run as daemon, periodically "
+                                        "syncing store.")
+    for subparser in (send, sync, daemon):
         subparser.add_argument("-e", "--endpoint",
                                default=os.environ.get("NIX_REPO_HTTP"),
                                help="Endpoint of nix server to send to.")
+        subparser.add_argument("--log-level", help="Log messages level.",
+                               default="INFO", choices=("CRITICAL", "ERROR",
+                                                        "WARNING", "INFO",
+                                                        "DEBUG"))
+        subparser.add_argument("-u", "--username",
+            default=os.environ.get("NIX_BINARY_CACHE_USERNAME"),
+            help="User to authenticate to the cache as.")
+        subparser.add_argument("--nix-state-path",
+                               help="Location of nix state directory.")
+        subparser.add_argument("--nix-store-path",
+                               help="Location of nix store directory.")
+        subparser.add_argument("--nix-bin-path",
+                               help="Location of nix binary directory.")
         subparser.add_argument("-D", "--dry-run", action="store_true",
                                default=False,
                                help="If true, reports which paths would "
                                     "be sent.")
-        subparser.add_argument("--log-level", help="Log messages level.",
-                            default="INFO", choices=("CRITICAL", "ERROR",
-                                                     "WARNING", "INFO",
-                                                     "DEBUG"))
-        subparser.add_argument("-u", "--username",
-                               default=os.environ.get(
-                                   "NIX_BINARY_CACHE_USERNAME"),
-                               help="User to authenticate to the cache as.")
         subparser.add_argument("--no-cache", action="store_false",
                                dest="cache_enabled",
                                help="Disable caching of known paths.")
         subparser.add_argument("--cache-location",
                                default=StoreObjectSender.default_cache(),
                                help="Location of cache.")
+        subparser.set_defaults(cache_enabled=True)
+    for subparser in (sync, daemon):
+        subparser.add_argument("--ignore", nargs="*", default=[],
+                               help="Regexes of store paths to ignore.")
+        # It doesn't make sense to have the daemon run in dry-run mode.
+        subparser.set_defaults(dry_run=False)
     return parser.parse_args()
 
 def main():
@@ -407,16 +467,24 @@ def main():
     args = _get_args()
     if args.endpoint is None:
         exit("Endpoint is required. Use --endpoint or set NIX_REPO_HTTP.")
+    elif ENDPOINT_REGEX.match(args.endpoint) is None:
+        exit("Invalid endpoint: '{}' does not match '{}'."
+             .format(args.endpoint, ENDPOINT_REGEX.pattern))
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(message)s")
     # Hide noisy logging of some external libs
     for name in ("requests", "urllib", "urllib2", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
-    sender = StoreObjectSender(endpoint=args.endpoint, dry_run=args.dry_run,
-                               username=args.username)
+    sender = StoreObjectSender(
+        nix_bin_path=args.nix_bin_path, nix_state_path=args.nix_state_path,
+        nix_store_path=args.nix_store_path,
+        endpoint=args.endpoint, dry_run=args.dry_run, username=args.username,
+        cache_location=args.cache_location, cache_enabled=args.cache_enabled)
     if args.command == "send":
         sender.send_objects(args.paths)
     elif args.command == "sync":
         sender.sync_store(args.ignore)
+    elif args.command == "daemon":
+        sender.watch_store(args.ignore)
     else:
         exit("Unknown command '{}'".format(args.command))
