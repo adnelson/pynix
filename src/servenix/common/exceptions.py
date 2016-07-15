@@ -60,7 +60,7 @@ class NixImportFailed(BaseHTTPError):
 
 class CouldNotConnect(Exception):
     def __init__(self, endpoint, status_code, content):
-        self._endpoint = endpoing
+        self._endpoint = endpoint
         self._status_code = status_code
         self._content = content
         self._message = ("Could not connect to {} ({}): {}"

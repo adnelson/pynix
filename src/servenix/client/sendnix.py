@@ -41,7 +41,12 @@ class StoreObjectSender(object):
         #: If true, no actual paths will be sent.
         self._dry_run = dry_run
         #: If not none, will use to authenticate with the repo.
-        self._username = username
+        if username is not None:
+            self._username = username
+        elif os.environ.get("NIX_BINARY_CACHE_USERNAME", "") != "":
+            self._username = os.environ["NIX_BINARY_CACHE_USERNAME"]
+        else:
+            self._username = None
         #: Ignored if username is None.
         self._password = password
         #: Set the cache location.
@@ -214,21 +219,32 @@ class StoreObjectSender(object):
                 to_send.add(path)
         return to_send
 
-    def _get_auth(self):
+    def _get_auth(self, first_time=True):
         """Return HTTP basic auth, if username is set (else None).
 
         If password isn't set, reads the NIX_BINARY_CACHE_PASSWORD
         variable for the password. If it is not set, the user will
         be prompted.
 
+        :param first_time: Whether this is the first time it's being
+            called, so that we can tailor the error messaging.
+        :type first_time: ``bool``
+
         :return: Either None or an Auth object.
         :rtype: ``NoneType`` or :py:class:`requests.auth.HTTPBasicAuth`
+
+        :raises: :py:class:`CouldNotConnect` if authentication fails.
+
+        Side effects:
+        * Will set the NIX_BINARY_CACHE_{USERNAME,PASSWORD} variables.
         """
         if self._auth is not None:
             # Cache auth to avoid repeated prompts
             return self._auth
         if self._password is not None:
             password = self._password
+        elif self._username is None:
+            password = None
         elif os.environ.get("NIX_BINARY_CACHE_PASSWORD", "") != "":
             logging.debug("Using value in NIX_BINARY_CACHE_PASSWORD variable")
             password = os.environ["NIX_BINARY_CACHE_PASSWORD"]
@@ -247,6 +263,7 @@ class StoreObjectSender(object):
             auth = requests.auth.HTTPBasicAuth(self._username, password)
         else:
             auth = None
+        # Perform the actual request. See if we get a 200 back.
         url = "{}/nix-cache-info".format(self._endpoint)
         resp = requests.get(url, auth=auth)
         if resp.status_code == 200:
@@ -257,8 +274,9 @@ class StoreObjectSender(object):
             return self._auth
         elif resp.status_code == 401 and sys.stdin.isatty():
             # Authorization failed. Give the user a chance to set new auth.
-            msg = ("Unauthorized for repo {}. Username"
-                   .format(self._endpoint))
+            msg = "Authorization failed!\n" if not first_time else ""
+            msg += "Please enter username"
+            msg += " for {}".format(self._endpoint) if first_time else ""
             if self._username is not None:
                 msg += " (default '{}'): ".format(self._username)
             else:
@@ -268,7 +286,7 @@ class StoreObjectSender(object):
                 self._username = username
             os.environ.pop("NIX_BINARY_CACHE_PASSWORD", None)
             self._password = None
-            return self._get_auth()
+            return self._get_auth(first_time=False)
         else:
             raise CouldNotConnect(self._endpoint, resp.status_code,
                                   resp.content)
