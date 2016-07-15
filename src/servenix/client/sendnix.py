@@ -109,10 +109,14 @@ class StoreObjectSender(object):
                 return default
             else:
                 try:
+
                     # File exists in the cache. Parse it as JSON and return it.
-                    with gzip.open(full_path, "rb") as f:
-                        return json.loads(f.read().decode("utf-8"))
-                except Exception:
+                    return json.loads(strip_output("cat {} | gzip -d"
+                                                   .format(full_path)))
+                except Exception as err:
+                    logging.exception(err)
+                    logging.warn("Couldn't parse the cache file {}."
+                                 .format(full_path))
                     # Couldn't parse the cache.
                     return default
         else:
@@ -134,9 +138,11 @@ class StoreObjectSender(object):
         """
         if self._cache_location is None:
             return
+        _json = json.dumps(self._path_references)
+        data = gzip.compress(_json.encode("utf-8"))
+        logging.debug("Writing path_references cache file")
         with open(join(self._cache_location, "path_references"), "wb") as f:
-            _json = json.dumps(self._path_references)
-            f.write(gzip.compress(_json.encode("utf-8")))
+            f.write(data)
 
     def get_references(self, path):
         """Get a path's direct references.
@@ -199,8 +205,6 @@ class StoreObjectSender(object):
         if len(full_path_set) == 0:
             # No point in making a request if we don't have any paths.
             return set()
-        for p in full_path_set:
-            logging.debug("Querying path {}".format(p))
         logging.debug("Asking the nix server about {} paths."
                       .format(len(full_path_set)))
         auth = self._get_auth()
@@ -304,7 +308,6 @@ class StoreObjectSender(object):
         """
         # Check if the object is already on the server; if so we can stop.
         if path in self._objects_on_server:
-            logging.debug("{} is already on the server.".format(path))
             return
         # First send all of the object's references. Skip self-references.
         for ref in self.get_references(path):
