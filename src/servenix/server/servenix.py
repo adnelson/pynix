@@ -121,25 +121,29 @@ class NixServer(Flask):
         if store_path in self._known_store_paths:
             return True
         try:
-            self.query_store(store_path, "--hash")
+            self.query_store(store_path, "--hash", hide_stderr=True)
             self._known_store_paths.add(store_path)
             return True
         except CalledProcessError:
             return False
 
-    def query_store(self, store_path, query):
+    def query_store(self, store_path, query, hide_stderr=False):
         """Given a query (e.g. --hash or --size), perform the query.
 
         :param store_path: The store path to query.
         :type store_path: ``str``
         :param query: The query to perform. Must be a valid nix-store query.
         :type query: ``str``
+        :param hide_stderr: If true, stderr will be hidden.
+        :type hide_stderr: ``bool``
 
         :return: The result of the query.
         :rtype: ``str``
         """
         nix_store = join(self._nix_bin_path, "nix-store")
-        return strip_output([nix_store, "-q", query, store_path], shell=False)
+        command = [nix_store, "-q", query, store_path]
+        result = strip_output(command, shell=False, hide_stderr=hide_stderr)
+        return result
 
     def get_object_info(self, store_path):
         """Given a store path, get some information about the path.
@@ -294,11 +298,10 @@ class NixServer(Flask):
                         "Encountered invalid store path '{}': does not match "
                         "pattern '{}'"
                         .format(path, self._full_store_path_regex.pattern))
-                try:
-                    self.check_in_store(path)
+                if self.check_in_store(path):
                     path_results[path] = True
                     found += 1
-                except NoSuchObject:
+                else:
                     path_results[path] = False
                     not_found += 1
             logging.debug("{} of these paths were found, and {} were not."

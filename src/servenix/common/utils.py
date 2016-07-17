@@ -1,7 +1,7 @@
 """Some utility functions to support store operations."""
 import os
 from os.path import exists, join, dirname, isdir
-from subprocess import check_output
+from subprocess import check_output, PIPE
 
 def decode_str(string):
     """Convert a bytestring to a string. Is a no-op for strings.
@@ -24,18 +24,24 @@ def decode_str(string):
     else:
         return string
 
-def strip_output(command, shell=True):
+def strip_output(command, shell=True, hide_stderr=False):
     """Execute a bash command, and return its stripped output.
 
     :param command: A command, either a string or list.
     :type command: ``str`` or ``list`` of ``str``
     :param shell: Execute the command as a shell command.
     :type shell: ``bool``
+    :param hide_stderr: If true, stderr will be hidden.
+    :type hide_stderr: ``bool``
 
     :return: The resulting stdout, stripped of trailing whitespace.
     :rtype: ``str``
     """
-    return decode_str(check_output(command, shell=shell)).strip()
+    if hide_stderr is True:
+        output = check_output(command, shell=shell, stderr=PIPE)
+    else:
+        output = check_output(command, shell=shell)
+    return decode_str(output).strip()
 
 def find_nix_paths():
     """Load up the nix bin, store and state paths, from environment.
