@@ -120,7 +120,14 @@ class NixServer(Flask):
         """
         if store_path in self._known_store_paths:
             return True
+        elif not exists(store_path):
+            # If the path isn't in the filesystem, it definitely is
+            # not a valid path.
+            return False
         try:
+            # If it is on the filesystem, it doesn't necessarily mean
+            # that it's a registered path in the store. Check that
+            # here.
             self.query_store(store_path, "--hash", hide_stderr=True)
             self._known_store_paths.add(store_path)
             return True
