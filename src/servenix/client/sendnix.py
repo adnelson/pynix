@@ -8,8 +8,10 @@ import logging
 import os
 from os.path import join, isdir, isfile, expanduser, basename, getmtime
 import re
+import shutil
 from subprocess import Popen, PIPE, check_output
 import sys
+import tempfile
 # Special-case here to address a runtime bug I've encountered
 try:
     import sqlite3
@@ -141,8 +143,17 @@ class StoreObjectSender(object):
         _json = json.dumps(self._path_references)
         data = gzip.compress(_json.encode("utf-8"))
         logging.debug("Writing path_references cache file")
-        with open(join(self._cache_location, "path_references"), "wb") as f:
-            f.write(data)
+        # Write to a temp file so that we prevent partial writes to
+        # the cache (e.g. in the case of a keyboard interrupt while
+        # data is being written).
+        tempdir = tempfile.mkdtemp()
+        try:
+            with open(join(tempdir, "path_references"), "wb") as f:
+                f.write(data)
+                shutil.move(join(tempdir, "path_references"),
+                            join(self._cache_location, "path_references"))
+        finally:
+            shutil.rmtree(tempdir)
 
     def get_references(self, path):
         """Get a path's direct references.
