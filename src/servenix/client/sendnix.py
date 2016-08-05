@@ -28,7 +28,7 @@ import requests
 import six
 
 from servenix import __version__
-from servenix.common.utils import strip_output, find_nix_paths
+from servenix.common.utils import strip_output, find_nix_paths, decode_str
 from servenix.common.exceptions import CouldNotConnect
 
 ENDPOINT_REGEX = re.compile(r"https?://([\w_-]+)(\.[\w_-]+)*(:\d+)?$")
