@@ -6,7 +6,12 @@ from os.path import exists, isdir, join, basename, dirname
 import re
 from subprocess import check_output, Popen, PIPE, CalledProcessError
 from threading import Thread
-# Special-case here to address a runtime bug I've encountered
+# Special-case here to address a runtime bug I've encountered.
+# Essentially having python libraries other than those
+# specifically built for this library in a PYTHONPATH can cause a
+# sqlite3 import to fail when it tries to load them (esp. if they are
+# python2 and this is python3, or vice-versa). This seems to be due to
+# the compiled C extensions that the sqlite3 library uses.
 try:
     import sqlite3
 except ImportError as err:
@@ -115,10 +120,10 @@ class NixServer(Flask):
         if self._db_con is not None:
             # If we have a direct database connection, use this to check
             # path existence.
-            query = ("select path from ValidPaths where path like '{}%'"
-                     .format(join(self._nix_store_path, store_object_hash)))
+            query = "select path from ValidPaths where path like ?"
+            path_prefix = join(self._nix_store_path, store_object_hash) + "%"
             with self._db_con:
-                paths = self._db_con.execute(query).fetchall()
+                paths = self._db_con.execute(query, (path_prefix,)).fetchall()
             if len(paths) > 0:
                 path = paths[0][0]
                 self._hashes_to_valid_paths[store_object_hash] = path
@@ -168,10 +173,9 @@ class NixServer(Flask):
         # If we have a connection to the database, all we have to
         # do is look in the database.
         if self._db_con is not None:
-            query = ("select path from ValidPaths where path = '{}'"
-                     .format(store_path))
+            query = "select path from ValidPaths where path = ?"
             with self._db_con:
-                results = self._db_con.execute(query).fetchall()
+                results = self._db_con.execute(query, (store_path,)).fetchall()
             if len(results) > 0:
                 self._known_store_paths.add(store_path)
                 return True
