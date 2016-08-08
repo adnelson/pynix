@@ -6,6 +6,16 @@ from os.path import exists, isdir, join, basename, dirname
 import re
 from subprocess import check_output, Popen, PIPE, CalledProcessError
 from threading import Thread
+# Special-case here to address a runtime bug I've encountered
+try:
+    import sqlite3
+except ImportError as err:
+    if "does not define init" in str(err):
+        exit("Could not import sqlite3. This is probably due to PYTHONPATH "
+             "corruption: make sure your PYTHONPATH is empty prior to "
+             "running this command.")
+    else:
+        raise
 
 from flask import Flask, make_response, send_file, request, jsonify
 import six
@@ -55,6 +65,21 @@ class NixServer(Flask):
             self._nar_extension = ".nar.xz"
         # Enable interactive debugging on unknown errors.
         self._debug = debug
+        # Test connect to the nix database; if successful, then we
+        # will use a direct connection to the database rather than
+        # using nix-store. This is much faster, but is unavailable on
+        # some systems.
+        try:
+            db_path = join(nix_state_path, "nix", "db", "db.sqlite")
+            query = "select * from ValidPaths limit 1"
+            db_con = sqlite3.connect(db_path)
+            db_con.execute(query).fetchall()
+            # If this succeeds, assign the db_con attribute.
+            self._db_con = db_con
+        except Exception as err:
+            logging.warn("Couldn't connect to the database ({}). Can't "
+                         "operate in direct-database mode :(".format(err))
+            self._db_con = None
 
     def store_path_from_hash(self, store_object_hash):
         """Look up a store path using its hash.
@@ -87,24 +112,37 @@ class NixServer(Flask):
             self._hashes_to_paths.pop(store_object_hash, None)
             raise NoSuchObject("No object with hash {} was found!"
                                .format(store_object_hash))
-        # Get the list of store objects by listing the directory.
-        # Iterate through them until a matching hash is found, or
-        # we've exhausted all paths, in which case we error.
-        for path in map(decode_str, os.listdir(self._nix_store_path)):
-            match = _PATH_REGEX.match(path)
-            if match is None:
-                continue
-            path = join(self._nix_store_path, path)
-            prefix = match.group(1)
-            # Add every path seen to the _hashes_to_paths cache.
-            self._hashes_to_paths[prefix] = path
-            if prefix == store_object_hash:
-                # The path exists in the store. Ensure it's also a
-                # valid path according to nix-store.
-                if not self.check_in_store(path):
-                    break
+        if self._db_con is not None:
+            # If we have a direct database connection, use this to check
+            # path existence.
+            query = ("select path from ValidPaths where path like '{}%'"
+                     .format(join(self._nix_store_path, store_object_hash)))
+            with self._db_con:
+                paths = self._db_con.execute(query).fetchall()
+            if len(paths) > 0:
+                path = paths[0][0]
                 self._hashes_to_valid_paths[store_object_hash] = path
                 return path
+        else:
+            # Get the list of store objects by listing the directory.
+            # Iterate through them until a matching hash is found, or
+            # we've exhausted all paths, in which case we error.
+            for path in map(decode_str, os.listdir(self._nix_store_path)):
+                match = _PATH_REGEX.match(path)
+                if match is None:
+                    continue
+                path = join(self._nix_store_path, path)
+                prefix = match.group(1)
+                # Add every path seen to the _hashes_to_paths cache.
+                self._hashes_to_paths[prefix] = path
+                if prefix == store_object_hash:
+                    # The path exists in the store. Ensure it's also a
+                    # valid path according to nix-store.
+                    if not self.check_in_store(path):
+                        break
+                    self._hashes_to_valid_paths[store_object_hash] = path
+                    return path
+        # If we've gotten here, then the hash doesn't match any path.
         raise NoSuchObject("No object with hash {} was found."
                            .format(store_object_hash))
 
@@ -124,15 +162,29 @@ class NixServer(Flask):
             # If the path isn't in the filesystem, it definitely is
             # not a valid path.
             return False
-        try:
-            # If it is on the filesystem, it doesn't necessarily mean
-            # that it's a registered path in the store. Check that
-            # here.
-            self.query_store(store_path, "--hash", hide_stderr=True)
-            self._known_store_paths.add(store_path)
-            return True
-        except CalledProcessError:
-            return False
+        # If it is on the filesystem, it doesn't necessarily mean
+        # that it's a registered path in the store. Check that
+        # here.
+        # If we have a connection to the database, all we have to
+        # do is look in the database.
+        if self._db_con is not None:
+            query = ("select path from ValidPaths where path = '{}'"
+                     .format(store_path))
+            with self._db_con:
+                results = self._db_con.execute(query).fetchall()
+            if len(results) > 0:
+                self._known_store_paths.add(store_path)
+                return True
+            else:
+                return False
+        else:
+            # Otherwise we have to use the slower method :(
+            try:
+                self.query_store(store_path, "--hash", hide_stderr=True)
+                self._known_store_paths.add(store_path)
+                return True
+            except CalledProcessError:
+                return False
 
     def query_store(self, store_path, query, hide_stderr=False):
         """Given a query (e.g. --hash or --size), perform the query.
