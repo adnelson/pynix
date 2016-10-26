@@ -63,10 +63,8 @@ class NixServer(Flask):
             "Priority: 30"
         ]) + "\n"
         if self._compression_type == "bzip2":
-            self._content_type = "application/x-bzip2"
             self._nar_extension = ".nar.bz2"
         else:
-            self._content_type = "application/x-xz"
             self._nar_extension = ".nar.xz"
         # Enable interactive debugging on unknown errors.
         self._debug = debug
@@ -284,7 +282,9 @@ class NixServer(Flask):
         @app.route("/nix-cache-info")
         def nix_cache_info():
             """Return information about the binary cache."""
-            return self._cache_info
+            info_string = self._cache_info
+            return make_response((info_string, 200,
+                                 {"Content-Type": "application/octet-stream"}))
 
         @app.route("/<obj_hash>.narinfo")
         def get_narinfo(obj_hash):
@@ -311,7 +311,7 @@ class NixServer(Flask):
             info_string = "\n".join("{}: {}".format(k, v)
                              for k, v in store_info.items()) + "\n"
             return make_response((info_string, 200,
-                                 {"Content-Type": "text/x-nix-narinfo"}))
+                                 {"Content-Type": "application/octet-stream"}))
 
         @app.route("/nar/<obj_hash>{}".format(self._nar_extension))
         def serve_nar(obj_hash):
@@ -324,7 +324,7 @@ class NixServer(Flask):
             """
             store_path = self.store_path_from_hash(obj_hash)
             nar_path = self.build_nar(store_path)
-            return send_file(nar_path, mimetype=self._content_type)
+            return send_file(nar_path, mimetype="application/octet-stream")
 
         @app.route("/query-paths")
         def query_paths():
