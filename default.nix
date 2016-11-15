@@ -22,6 +22,7 @@ pythonPackages.buildPythonPackage rec {
     pkgs.gzip
     pkgs.nix.out
     pkgs.pv
+    pkgs.which
     pythonPackages.flask
     pythonPackages.ipdb
     pythonPackages.requests2

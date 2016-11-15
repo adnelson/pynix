@@ -31,6 +31,8 @@ from servenix import __version__
 from servenix.common.utils import strip_output, find_nix_paths, decode_str
 from servenix.common.exceptions import CouldNotConnect
 
+NIX_PATH_CACHE = os.environ.get("NIX_PATH_CACHE",
+                                expanduser("~/.nix-path-cache"))
 ENDPOINT_REGEX = re.compile(r"https?://([\w_-]+)(\.[\w_-]+)*(:\d+)?$")
 
 class StoreObjectSender(object):
@@ -51,17 +53,8 @@ class StoreObjectSender(object):
             self._username = None
         #: Ignored if username is None.
         self._password = password
-        #: Set the cache location.
-        if cache_enabled is False:
-            self._cache_location = None
-        elif cache_location is not None:
-            self._cache_location = cache_location
-        else:
-            self._cache_location = self.default_cache()
         #: Set at a later point, if username is not None.
         self._auth = None
-        #: Cache of direct path references (string -> strings).
-        self._path_references = self._load_cache("path_references", {})
         #: Set of paths known to exist on the server already (set of strings).
         self._objects_on_server = set()
         #: When sending objects, this can be used to count remaining.
@@ -73,87 +66,59 @@ class StoreObjectSender(object):
                                else find_nix_paths()["nix_state_path"]
         self._nix_store_path = nix_store_path if nix_store_path is not None \
                                else find_nix_paths()["nix_store_path"]
+        #: Cache of direct path references (string -> strings).
+        self._path_references = self._load_path_cache()
 
-    @staticmethod
-    def default_cache():
-        """Default location of the cache."""
-        if os.environ.get("SENDNIX_CACHE", "") != "":
-            return os.environ["SENDNIX_CACHE"]
-        else:
-            return expanduser("~/.sendnix")
+    def _load_path_cache(self):
+        """Load the store reference path cache.
 
-    def _load_cache(self, cache_file, default):
-        """Retrieve a file from the cache (in JSON) if it exists.
-
-        Return a default if the cache is disabled or not readable.
-
-        :param cache_file: File within the folder to load as JSON.
-        :type cache_file: ``str``
-        :param default: If the file doesn't exist, is not writable, or
-            caching is disabled, return this instead.
-        :type default: ``object``
-
-        :return: The contents of the cache parsed as JSON, or the default.
-        :rtype: ``object``
+        :return: A mapping from store paths to their references.
+        :rtype: ``dict`` of ``str`` to ``str``
         """
-        if self._cache_location is None:
-            return default
-        elif isdir(self._cache_location):
-            full_path = join(self._cache_location, cache_file)
-            if not os.access(self._cache_location, os.W_OK):
-                # Can't access cache. Disable it.
-                logging.warn("Couldn't access cache location {}."
-                             .format(self._cache_location))
-                self._cache_location = None
-                return default
-            elif not isfile(full_path):
-                # Cache exists but file does not exist.
-                return default
-            else:
-                try:
+        if not isdir(NIX_PATH_CACHE):
+            return {}
+        store = self._nix_store_path
+        path_cache = {}
+        for store_path in os.listdir(NIX_PATH_CACHE):
+            refs_dir = join(NIX_PATH_CACHE, store_path)
+            refs = [join(store, path) for path in os.listdir(refs_dir)
+                    if path != store_path]
+            path_cache[join(store, store_path)] = refs
+        return path_cache
 
-                    # File exists in the cache. Parse it as JSON and return it.
-                    return json.loads(strip_output("cat {} | gzip -d"
-                                                   .format(full_path)))
-                except Exception as err:
-                    logging.exception(err)
-                    logging.warn("Couldn't parse the cache file {}."
-                                 .format(full_path))
-                    # Couldn't parse the cache.
-                    return default
-        else:
-            # Cache doesn't exist yet. Try to create it or bail.
-            try:
-                os.makedirs(self._cache_location)
-                return default
-            except PermissionError:
-                logging.warn("Couldn't create cache {}. Skipping cache."
-                             .format(self._cache_location))
-                self._cache_location = None
-                return default
+    def _write_path_references(self, store_path, references):
+        """Given a store path and its references, write them to a cache.
 
-    def _update_caches(self):
-        """Update the various caches.
+        Creates a directory for the base path of the store path, and
+        touches files corresponding to paths of its dependencies.
+        So for example, if /nix/store/xyz-foo depends on /nix/store/{a,b,c},
+        then we will create
+          NIX_PATH_CACHE/xyz-foo/a
+          NIX_PATH_CACHE/xyz-foo/b
+          NIX_PATH_CACHE/xyz-foo/c
 
-        This function must be called after caches have been initialized.
-        However since that happens in __init__, we should be OK.
+        :param store_path: A nix store path.
+        :type store_path: ``str``
+        :param references: A list of that path's references.
+        :type references: ``list`` of ``str``
         """
-        if self._cache_location is None:
+        if not isdir(NIX_PATH_CACHE):
+            os.makedirs(NIX_PATH_CACHE)
+        ref_dir = join(NIX_PATH_CACHE, basename(store_path))
+        if isdir(ref_dir):
+            # The cache already has this path; nothing to do.
             return
-        _json = json.dumps(self._path_references)
-        data = gzip.compress(_json.encode("utf-8"))
-        logging.debug("Writing path_references cache file")
-        # Write to a temp file so that we prevent partial writes to
-        # the cache (e.g. in the case of a keyboard interrupt while
-        # data is being written).
+        # Create path directory in a tempdir to avoid inconsistent state.
         tempdir = tempfile.mkdtemp()
-        try:
-            with open(join(tempdir, "path_references"), "wb") as f:
-                f.write(data)
-                shutil.move(join(tempdir, "path_references"),
-                            join(self._cache_location, "path_references"))
-        finally:
-            shutil.rmtree(tempdir)
+        for ref in references:
+            # Create an empty file with the name of the reference.
+            fname = join(tempdir, basename(ref))
+            with open(fname, 'a'):
+                os.utime(fname, (0, 0))
+        # Remove the directory just in case, and then move the tempdir
+        # to the target location.
+        shutil.rmtree(ref_dir, ignore_errors=True)
+        shutil.move(tempdir, ref_dir)
 
     def get_references(self, path):
         """Get a path's direct references.
@@ -170,8 +135,9 @@ class StoreObjectSender(object):
         if path not in self._path_references:
             refs = strip_output("nix-store --query --references {}"
                                 .format(path))
-            refs = refs.split()
-            self._path_references[path] = [r for r in refs if r != path]
+            refs = [r for r in refs.split() if r != path]
+            self._path_references[path] = refs
+            self._write_path_references(path, refs)
         return self._path_references[path]
 
     def query_store_paths(self, paths):
@@ -264,7 +230,7 @@ class StoreObjectSender(object):
             logging.debug("Using value in NIX_BINARY_CACHE_PASSWORD variable")
             password = os.environ["NIX_BINARY_CACHE_PASSWORD"]
         elif sys.stdin.isatty():
-            prompt = ("Please enter the password for {}: "
+            prompt = ("Please enter the \033[1mpassword\033[0m for {}: "
                       .format(self._username))
             password = getpass.getpass(prompt)
         else:
@@ -289,18 +255,23 @@ class StoreObjectSender(object):
             return self._auth
         elif resp.status_code == 401 and sys.stdin.isatty():
             # Authorization failed. Give the user a chance to set new auth.
-            msg = "Authorization failed!\n" if not first_time else ""
-            msg += "Please enter username"
+            msg = "\033[31mAuthorization failed!\033[0m\n" \
+                  if not first_time else ""
+            msg += "Please enter \033[1musername\033[0m"
             msg += " for {}".format(self._endpoint) if first_time else ""
             if self._username is not None:
                 msg += " (default '{}'): ".format(self._username)
             else:
                 msg += ": "
-            username = six.moves.input(msg)
-            if username != "":
-                self._username = username
-            os.environ.pop("NIX_BINARY_CACHE_PASSWORD", None)
-            self._password = None
+            try:
+                username = six.moves.input(msg)
+                if username != "":
+                    self._username = username
+                os.environ.pop("NIX_BINARY_CACHE_PASSWORD", None)
+                self._password = None
+            except (KeyboardInterrupt, EOFError):
+                print("\nBye!")
+                sys.exit()
             return self._get_auth(first_time=False)
         else:
             raise CouldNotConnect(self._endpoint, resp.status_code,
@@ -376,15 +347,12 @@ class StoreObjectSender(object):
         else:
             logging.info("No paths need to be sent. {} is up-to-date."
                          .format(self._endpoint))
-        try:
-            if self._dry_run is False:
-                while len(to_send) > 0:
-                    self.send_object(to_send.pop(), to_send)
-                if num_to_send > 0:
-                    logging.info("Sent {} paths to {}"
-                                 .format(num_to_send, self._endpoint))
-        finally:
-            self._update_caches()
+        if self._dry_run is False:
+            while len(to_send) > 0:
+                self.send_object(to_send.pop(), to_send)
+            if num_to_send > 0:
+                logging.info("Sent {} paths to {}"
+                             .format(num_to_send, self._endpoint))
 
     def watch_store(self, ignore):
         """Watch the nix store's timestamp and sync whenever it changes.
@@ -392,7 +360,7 @@ class StoreObjectSender(object):
         :param ignore: A list of regexes of objects to ignore when syncing.
         :type ignore: ``list`` of (``str`` or ``regex``)
         """
-        prev_stamp = self._load_cache("nix_store_timestamp", None)
+        prev_stamp = None
         num_syncs = 0
         try:
             while True:
@@ -480,13 +448,6 @@ def _get_args():
                                default=False,
                                help="If true, reports which paths would "
                                     "be sent.")
-        subparser.add_argument("--no-cache", action="store_false",
-                               dest="cache_enabled",
-                               help="Disable caching of known paths.")
-        subparser.add_argument("--cache-location",
-                               default=StoreObjectSender.default_cache(),
-                               help="Location of cache.")
-        subparser.set_defaults(cache_enabled=True)
     for subparser in (sync, daemon):
         subparser.add_argument("--ignore", nargs="*", default=[],
                                help="Regexes of store paths to ignore.")
@@ -510,8 +471,7 @@ def main():
     sender = StoreObjectSender(
         nix_bin_path=args.nix_bin_path, nix_state_path=args.nix_state_path,
         nix_store_path=args.nix_store_path,
-        endpoint=args.endpoint, dry_run=args.dry_run, username=args.username,
-        cache_location=args.cache_location, cache_enabled=args.cache_enabled)
+        endpoint=args.endpoint, dry_run=args.dry_run, username=args.username)
     if args.command == "send":
         sender.send_objects(args.paths)
     elif args.command == "sync":

@@ -45,18 +45,22 @@ def strip_output(command, shell=True, hide_stderr=False):
 
 def find_nix_paths():
     """Load up the nix bin, store and state paths, from environment.
-    
+
     :return: A dictionary with three keys, each mapping to paths:
         * nix_bin_path: path to where nix binaries live
         * nix_store_path: path to where nix store objects live
         * nix_state_path: path to where nix state objects live
     :rtype: ``dict``
 
-    :raises: 
+    :raises:
     * ``KeyError`` if 'NIX_BIN_PATH' isn't in the environment.
     * ``AssertionError`` if any of these paths don't exist.
     """
-    nix_bin_path = os.environ["NIX_BIN_PATH"]
+    if "NIX_BIN_PATH" in os.environ:
+        nix_bin_path = os.environ["NIX_BIN_PATH"]
+    else:
+        nix_env = check_output("which nix-env", shell=True).strip()
+        nix_bin_path = dirname(decode_str(nix_env))
     assert exists(join(nix_bin_path, "nix-build"))
     # The store path can be given explicitly, or else it will be
     # inferred to be 2 levels up from the bin path. E.g., if the
@@ -73,7 +77,7 @@ def find_nix_paths():
     assert isdir(nix_state_path), \
         "Nix state directory {} doesn't exist".format(nix_state_path)
     return {
-        "nix_bin_path": nix_bin_path,        
-        "nix_store_path": nix_store_path,        
+        "nix_bin_path": nix_bin_path,
+        "nix_store_path": nix_store_path,
         "nix_state_path": nix_state_path,
     }
