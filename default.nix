@@ -1,22 +1,18 @@
 {
   pkgsPath ? <nixpkgs>,
   pkgs ? import pkgsPath {},
-  python3 ? true,
+  pythonPackages ? pkgs.python3Packages,
 }:
 
 let
   # Use .out so we have the binaries callable
   inherit (builtins) replaceStrings readFile;
-  pythonPackages = if python3 then pkgs.python3Packages
-                   else pkgs.python2Packages;
   version = replaceStrings ["\n"] [""] (readFile ./version.txt);
 in
 
 pythonPackages.buildPythonPackage rec {
   name = "servenix-${version}";
-  buildInputs = [
-    pythonPackages.ipython
-  ];
+  buildInputs = [pythonPackages.ipython];
   propagatedBuildInputs = [
     pkgs.coreutils
     pkgs.gzip
@@ -24,8 +20,8 @@ pythonPackages.buildPythonPackage rec {
     pkgs.pv
     pkgs.which
     pythonPackages.flask
-    pythonPackages.ipdb
     pythonPackages.requests2
+    pythonPackages.ipdb
     pythonPackages.six
   ];
   src = ./.;
