@@ -399,7 +399,7 @@ class NixServer(Flask):
                     raise ServerError("Decompression with '{}' failed"
                                       .format(program))
                 return out
-            if content_type is None or content_type == "":
+            if content_type in (None, "", "application/octet-stream"):
                 data = request.data
             elif content_type == "application/x-gzip":
                 data = decompress("gzip -d")
