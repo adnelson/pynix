@@ -155,6 +155,13 @@ class StoreObjectSender(object):
         Side effects:
         * Adds 0 or more paths to `self._objects_on_server`.
         """
+        paths_ = []
+        for path in paths:
+            if os.path.isabs(path):
+                paths_.append(path)
+            else:
+                paths_.append(os.path.join(self._nix_store_path, path))
+        paths = paths_
         total = len(paths)
         step = max(total // 10, 1)
         full_path_set = set()
@@ -250,7 +257,8 @@ class StoreObjectSender(object):
         if resp.status_code == 200:
             logging.info("Successfully connected to {}".format(self._endpoint))
             self._password = password
-            os.environ["NIX_BINARY_CACHE_PASSWORD"] = password
+            if password is not None:
+                os.environ["NIX_BINARY_CACHE_PASSWORD"] = password
             self._auth = auth
             return self._auth
         elif resp.status_code == 401 and sys.stdin.isatty():
