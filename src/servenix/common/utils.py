@@ -1,7 +1,7 @@
 """Some utility functions to support store operations."""
 import os
 from os.path import exists, join, dirname, isdir
-from subprocess import check_output, PIPE
+from subprocess import check_output, PIPE, Popen
 
 def decode_str(string):
     """Convert a bytestring to a string. Is a no-op for strings.
@@ -85,3 +85,12 @@ def find_nix_paths():
         "nix_store_path": nix_store_path,
         "nix_state_path": nix_state_path,
     }
+
+def decompress(program, data):
+    """Decompresses the given data by via the given program."""
+    proc = Popen(program, stdin=PIPE, stdout=PIPE, shell=True)
+    out = proc.communicate(input=data)[0]
+    if proc.wait() != 0:
+        raise ServerError("Decompression with '{}' failed"
+                          .format(program))
+    return out

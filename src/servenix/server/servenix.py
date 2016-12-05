@@ -26,7 +26,8 @@ from flask import Flask, make_response, send_file, request, jsonify
 import six
 
 from servenix import __version__
-from servenix.common.utils import decode_str, strip_output, find_nix_paths
+from servenix.common.utils import (decode_str, strip_output,
+                                   find_nix_paths, decompress)
 from servenix.common.exceptions import (NoSuchObject, NoNarGenerated,
                                         BaseHTTPError, NixImportFailed,
                                         CouldNotUpdateHash, ClientError)
@@ -392,18 +393,10 @@ class NixServer(Flask):
             NAR will be created automatically.
             """
             content_type = request.headers.get("content-type")
-            def decompress(program):
-                """Decompresses the request data by via the given program."""
-                proc = Popen(program, stdin=PIPE, stdout=PIPE, shell=True)
-                out = proc.communicate(input=request.data)[0]
-                if proc.wait() != 0:
-                    raise ServerError("Decompression with '{}' failed"
-                                      .format(program))
-                return out
             if content_type in (None, "", "application/octet-stream"):
                 data = request.data
             elif content_type == "application/x-gzip":
-                data = decompress("gzip -d")
+                data = decompress("gzip -d", request.data)
             else:
                 msg = "Unsupported content type '{}'".format(content_type)
                 raise ClientError(msg)

@@ -10,6 +10,12 @@ class BaseHTTPError(Exception):
         elif not hasattr(self, "status_code"):
             self.status_code = 500
 
+    def __repr__(self):
+        return "{}: {}".format(type(self).__name__, self.message)
+
+    def __str__(self):
+        return repr(self)
+
     def to_dict(self):
         """Render error as a dictionary."""
         return {"message": self.message}

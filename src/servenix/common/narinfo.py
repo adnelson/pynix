@@ -103,6 +103,8 @@ class NarInfo(object):
                 raise ValueError("Dictionary must have key {}".format(key))
             val = dictionary.get(key, default)
             return val if parser is None else parser(val)
+        def split_refs(refs):
+            return refs.split() if isinstance(refs, str) else refs
         return cls(
             url= get("url"),
             store_path=get("storepath"),
@@ -111,8 +113,7 @@ class NarInfo(object):
             nar_hash=get("narhash"),
             file_size=get("filesize", parser=int),
             file_hash=get("filehash"),
-            references=get("references", default=[],
-                             parser=lambda r: r.split()),
+            references=get("references", default=[], parser=split_refs),
             deriver=get("deriver", optional=True)
         )
 

@@ -6,12 +6,15 @@ import gzip
 import json
 import logging
 import os
-from os.path import join, isdir, isfile, expanduser, basename, getmtime
+from os.path import (join, exists, isdir, isfile, expanduser, basename,
+                     getmtime)
 import re
 import shutil
 from subprocess import Popen, PIPE, check_output, CalledProcessError
 import sys
 import tempfile
+from six.moves.urllib_parse import urlparse
+
 # Special-case here to address a runtime bug I've encountered
 try:
     import sqlite3
@@ -28,12 +31,15 @@ import requests
 import six
 
 from servenix import __version__
-from servenix.common.utils import strip_output, find_nix_paths, decode_str
-from servenix.common.exceptions import CouldNotConnect
+from servenix.common.utils import (strip_output, find_nix_paths, decode_str,
+                                   decompress)
+from servenix.common.exceptions import CouldNotConnect, NixImportFailed
 from servenix.common.narinfo import NarInfo
 
 NIX_PATH_CACHE = os.environ.get("NIX_PATH_CACHE",
                                 expanduser("~/.nix-path-cache"))
+NIX_NARINFO_CACHE = os.environ.get("NIX_NARINFO_CACHE",
+                                   expanduser("~/.nix-narinfo-cache"))
 ENDPOINT_REGEX = re.compile(r"https?://([\w_-]+)(\.[\w_-]+)*(:\d+)?$")
 
 class StoreObjectSender(object):
@@ -43,6 +49,8 @@ class StoreObjectSender(object):
                  nix_bin_path=None, nix_state_path=None, nix_store_path=None):
         #: Server running servenix (string).
         self._endpoint = endpoint
+        #: Base name of server (for caching).
+        self._endpoint_server = urlparse(endpoint).netloc
         #: If true, no actual paths will be sent.
         self._dry_run = dry_run
         #: If not none, will use to authenticate with the repo.
@@ -67,27 +75,39 @@ class StoreObjectSender(object):
                                else find_nix_paths()["nix_state_path"]
         self._nix_store_path = nix_store_path if nix_store_path is not None \
                                else find_nix_paths()["nix_store_path"]
-        #: Cache of direct path references (string -> strings).
-        self._path_references = self._load_path_cache()
+        #: Cache of direct path references (string -> strings). This
+        # is lazily loaded from an on-disk cache located in
+        # NIX_PATH_CACHE.
+        self._path_references = {}
+        #: Cache of narinfo objects requested from the server.
+        self._narinfo_cache = {}
+        self._paths_fetched = set()
 
-    def _load_path_cache(self):
-        """Load the store reference path cache.
+    def _update_narinfo_cache(self, narinfo, write_to_disk):
+        """Write a narinfo entry to the cache.
 
-        :return: A mapping from store paths to their references.
-        :rtype: ``dict`` of ``str`` to ``str``
+        :param narinfo: Information about a nix archive.
+        :type narinfo: :py:class:`NarInfo`
+        :param write_to_disk: Write to the on-disk cache.
+        :type write_to_disk: ``bool``
         """
-        if not isdir(NIX_PATH_CACHE):
-            return {}
-        store = self._nix_store_path
-        path_cache = {}
-        for store_path in os.listdir(NIX_PATH_CACHE):
-            refs_dir = join(NIX_PATH_CACHE, store_path)
-            refs = [join(store, path) for path in os.listdir(refs_dir)
-                    if path != store_path]
-            path_cache[join(store, store_path)] = refs
-        return path_cache
+        path = narinfo.store_path
+        self._narinfo_cache[path] = narinfo
+        if write_to_disk is False:
+            return
+        # The narinfo cache is indexed by the server name of the endpoint.
+        server_cache = join(NIX_NARINFO_CACHE, self._endpoint_server)
+        narinfo_path = join(server_cache, basename(path))
+        if not isdir(server_cache):
+            os.makedirs(server_cache)
+        if isfile(narinfo_path):
+            return
+        tempfile_path = tempfile.mkstemp()[1]
+        with open(tempfile_path, "w") as f:
+            f.write(json.dumps(narinfo.as_dict()))
+        shutil.move(tempfile_path, narinfo_path)
 
-    def _write_path_references(self, store_path, references):
+    def _update_reference_cache(self, store_path, references, write_to_disk):
         """Given a store path and its references, write them to a cache.
 
         Creates a directory for the base path of the store path, and
@@ -102,7 +122,12 @@ class StoreObjectSender(object):
         :type store_path: ``str``
         :param references: A list of that path's references.
         :type references: ``list`` of ``str``
+        :param write_to_disk: If true, write the entry to disk.
+        :type write_to_disk: ``bool``
         """
+        self._path_references[store_path] = references
+        if write_to_disk is False:
+            return
         if not isdir(NIX_PATH_CACHE):
             os.makedirs(NIX_PATH_CACHE)
         ref_dir = join(NIX_PATH_CACHE, basename(store_path))
@@ -121,6 +146,35 @@ class StoreObjectSender(object):
         shutil.rmtree(ref_dir, ignore_errors=True)
         shutil.move(tempdir, ref_dir)
 
+    def get_narinfo(self, path):
+        """Request narinfo from a server. These are cached in memory.
+
+        :param path: Store path that we want info on.
+        :type path: ``str``
+
+        :return: Information on the archived path.
+        :rtype: :py:class:`NarInfo`
+        """
+        if path not in self._narinfo_cache:
+            write_to_disk = True
+            cache_path = join(NIX_NARINFO_CACHE, self._endpoint_server,
+                              basename(path))
+            if isfile(cache_path):
+                write_to_disk = False
+                with open(cache_path) as f:
+                    narinfo = NarInfo.from_dict(json.load(f))
+            else:
+                prefix = basename(path).split("-")[0]
+                url = "{}/{}.narinfo".format(self._endpoint, prefix)
+                auth = self._get_auth()
+                print("hitting url {}...".format(url), end="")
+                response = requests.get(url, auth=auth)
+                print("ok")
+                response.raise_for_status()
+                narinfo = NarInfo.from_string(response.content)
+            self._update_narinfo_cache(narinfo, write_to_disk)
+        return self._narinfo_cache[path]
+
     def get_references(self, path, query_server=False):
         """Get a path's direct references.
 
@@ -131,29 +185,33 @@ class StoreObjectSender(object):
                              used when fetching a path.
         :type query_server: ``bool``
 
-        :return: A list of paths that the path refers to directly.
+        :return: A list of absolute paths that the path refers to directly.
         :rtype: ``list`` of ``str``
 
         Side effects:
         * Caches reference lists in `self._path_references`.
         """
         if path not in self._path_references:
+            write_to_disk = True
+            # First see if it's in the on-disk cache.
+            if isdir(join(NIX_PATH_CACHE, basename(path))):
+                write_to_disk = False # Not necessary, already there.
+                refs_dir = join(NIX_PATH_CACHE, basename(path))
+                refs = [join(store, path) for path in os.listdir(refs_dir)
+                        if path != basename(path)]
+            # If it's not in the cache, try asking nix-store for it.
             try:
                 refs = strip_output("nix-store --query --references {}"
                                     .format(path), hide_stderr=query_server)
                 refs = [r for r in refs.split() if r != path]
-            except CalledProcessError as err:
+            # If nix-store gives an error and server querying is
+            # enabled, query the binary cache.
+            except CalledProcessError:
                 if query_server is False:
                     raise
-                prefix = basename(path).split("-")[0]
-                url = "{}/{}.narinfo".format(self._endpoint, prefix)
-                auth = self._get_auth()
-                response = requests.get(url, auth=auth)
-                response.raise_for_status()
-                narinfo = NarInfo.from_string(response.content)
+                narinfo = self.get_narinfo(path)
                 refs = narinfo.fullpath_references()
-            self._path_references[path] = refs
-            self._write_path_references(path, refs)
+            self._update_reference_cache(path, refs, write_to_disk)
         return self._path_references[path]
 
     def query_paths(self, paths):
@@ -403,6 +461,86 @@ class StoreObjectSender(object):
             if num_to_send > 0:
                 logging.info("Sent {} paths to {}"
                              .format(num_to_send, self._endpoint))
+
+    def have_fetched(self, path):
+        """Checks if we've fetched a given path, or if it exists on disk.
+
+        :param path: The path to the store object to check.
+        :type path: ``str``
+
+        :return: Whether we've fetched the path.
+        :rtype: ``bool``
+        """
+        if path in self._paths_fetched:
+            return True
+        elif exists(path):
+            self._paths_fetched.add(path)
+            return True
+        else:
+            return False
+
+    def fetch_object(self, path):
+        """Fetch a store object from a nix server.
+
+        This is obviously the inverse of a send, and quite a similar
+        algorithm (first fetch parents, and then fetch the
+        object). But it's a little different because although with a
+        send you already know (or can derive) the references of the
+        object, with fetching you need to ask the server for the
+        references.
+
+        :param path: The path to the store object to fetch.
+        :type path: ``str``
+
+        Side effects:
+        * Adds 0 or 1 paths to `self._paths_fetched`.
+
+        Note: This function is not thread safe. When performing a
+        nix-store --restore, the store path is required to not
+        exist. However there is a delay between when we check if we
+        have already fetched the path, and when the restore
+        happens. Proper locking is required to make the operation
+        atomic.
+        """
+        # Check if the object has already been fetched; if so we can stop.
+        if self.have_fetched(path):
+            logging.info("{} has already been fetched.".format(path))
+            return
+        # First fetch all of the object's references.
+        for ref in self.get_references(path, query_server=True):
+            self.fetch_object(ref)
+        # Now we can fetch the object itself. Get its info first.
+        narinfo = self.get_narinfo(path)
+
+        # Use the URL in the narinfo to fetch the object.
+        url = "{}/{}".format(self._endpoint, narinfo.url)
+
+        response = requests.get(url, auth=self._get_auth())
+        response.raise_for_status()
+
+        # Figure out how to extract the content.
+        if narinfo.compression.lower() in ("xz", "xzip"):
+            data = decompress("xz -d", response.content)
+        elif narinfo.compression.lower() in ("bz2", "bzip2"):
+            data = decompress("bzip2 -d", response.content)
+        elif narinfo.compression.lower() in ("gzip", "gz"):
+            data = decompress("gzip -d", response.content)
+        else:
+            raise ValueError("Unsupported narinfo compression type {}"
+                             .format(narinfo.compression))
+        # Once extracted, feed it into the nix-store --restore
+        # command. Note that the --restore command is lower level than
+        # the --import command; it doesn't carry as much metadata. We
+        # rely on our code logic to make sure we are doing things
+        # correctly.
+        proc = Popen([join(self._nix_bin_path, "nix-store"),
+                      "--restore", path],
+                     stdin=PIPE, stderr=PIPE, stdout=PIPE)
+        out, err = proc.communicate(input=data)
+        if proc.wait() != 0:
+            raise NixImportFailed(err)
+        logging.info("Successfully imported path {}".format(path))
+        self._paths_fetched.add(path)
 
     def watch_store(self, ignore):
         """Watch the nix store's timestamp and sync whenever it changes.
