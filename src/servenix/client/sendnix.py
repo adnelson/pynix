@@ -168,16 +168,15 @@ class StoreObjectSender(object):
                 raise
             logging.warn("Endpoint {} does not support the /query-paths "
                          "route. Querying paths individually."
-                         .format(binary_cache))
-            result = {p: False for p in paths}
-            for path in paths_to_ask:
-                logging.info("Querying for path {}".format(path))
+                         .format(self._endpoint))
+            result = {}
+            for path in paths:
+                logging.debug("Querying for path {}".format(path))
                 prefix = path.split("-")[0]
-                url = "{}/{}.narinfo".format(binary_cache, prefix)
+                url = "{}/{}.narinfo".format(self._endpoint, prefix)
                 resp = requests.get(url, auth=auth)
-                if resp.status_code == 200:
-                    result[path] = True
-                return result
+                result[path] = resp.status_code == 200
+            return result
 
     def query_path_closures(self, paths):
         """Given a list of paths, compute their whole closure and ask
