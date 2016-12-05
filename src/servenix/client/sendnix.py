@@ -120,11 +120,15 @@ class StoreObjectSender(object):
         shutil.rmtree(ref_dir, ignore_errors=True)
         shutil.move(tempdir, ref_dir)
 
-    def get_references(self, path):
+    def get_references(self, path, query_server=True):
         """Get a path's direct references.
 
         :param path: A nix store path. It must exist in the store.
         :type path: ``str``
+        :param query_server: If true, will attempt to query the server
+                             for the paths if not on disk. This is
+                             used when fetching a path.
+        :type query_server: ``bool``
 
         :return: A list of paths that the path refers to directly.
         :rtype: ``list`` of ``str``
@@ -133,8 +137,15 @@ class StoreObjectSender(object):
         * Caches reference lists in `self._path_references`.
         """
         if path not in self._path_references:
-            refs = strip_output("nix-store --query --references {}"
-                                .format(path))
+            try:
+                refs = strip_output("nix-store --query --references {}"
+                                    .format(path), hide_stderr=query_server)
+            except CalledProcessError as err:
+                prefix = basename(path).split("-")[0]
+                url = "{}/{}.narinfo".format(prefix)
+                auth = self._get_auth()
+                response = requests.get(url, auth=auth)
+                import pdb; pdb.set_trace()
             refs = [r for r in refs.split() if r != path]
             self._path_references[path] = refs
             self._write_path_references(path, refs)
