@@ -140,11 +140,48 @@ class StoreObjectSender(object):
             self._write_path_references(path, refs)
         return self._path_references[path]
 
-    def query_store_paths(self, paths):
-        """Send a list of store paths to the server to see what it has already.
+    def query_paths(self, paths):
+        """Given a list of paths, see which the server has.
 
-        Includes all paths listed as well as their closures (referenced paths),
-        to try to get as much information as possible.
+        :param paths: A list of nix store paths.
+        :type paths: ``str``
+
+        :return: A dictionary mapping store paths to booleans (True if
+                 on the server, False otherwise).
+        :rtype: ``dict`` of ``str`` to ``bool``
+        """
+        paths = list(set(paths))
+        if len(paths) == 0:
+            # No point in making a request if we don't have any paths.
+            return {}
+        url = "{}/query-paths".format(self._endpoint)
+        data = json.dumps(paths)
+        headers = {"Content-Type": "application/json"}
+        logging.debug("Asking the server about {} paths.".format(len(paths)))
+        auth = self._get_auth()
+        try:
+            response = requests.get(url, headers=headers, data=data, auth=auth)
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as err:
+            if err.response.status_code != 404:
+                raise
+            logging.warn("Endpoint {} does not support the /query-paths "
+                         "route. Querying paths individually."
+                         .format(binary_cache))
+            result = {p: False for p in paths}
+            for path in paths_to_ask:
+                logging.info("Querying for path {}".format(path))
+                prefix = path.split("-")[0]
+                url = "{}/{}.narinfo".format(binary_cache, prefix)
+                resp = requests.get(url, auth=auth)
+                if resp.status_code == 200:
+                    result[path] = True
+                return result
+
+    def query_path_closures(self, paths):
+        """Given a list of paths, compute their whole closure and ask
+        the server which of those paths it has.
 
         :param paths: A list of store paths.
         :type paths: ``list`` of ``str``
@@ -183,24 +220,14 @@ class StoreObjectSender(object):
 
         # Now that we have the full list built up, send it to the
         # server to see which paths are already there.
-        url = "{}/query-paths".format(self._endpoint)
-        data = json.dumps(list(full_path_set))
-        headers = {"Content-Type": "application/json"}
-        if len(full_path_set) == 0:
-            # No point in making a request if we don't have any paths.
-            return set()
-        logging.debug("Asking the nix server about {} paths."
-                      .format(len(full_path_set)))
-        auth = self._get_auth()
-        response = requests.get(url, headers=headers, data=data, auth=auth)
-        response.raise_for_status()
+        on_server = self.query_paths(full_path_set)
 
         # The set of paths that will be sent.
         to_send = set()
 
         # Store all of the paths which are listed as `True` (exist on
         # the server) in our cache.
-        for path, is_on_server in six.iteritems(response.json()):
+        for path, is_on_server in six.iteritems(on_server):
             if is_on_server is True:
                 self._objects_on_server.add(path)
             else:
@@ -345,7 +372,7 @@ class StoreObjectSender(object):
         :param paths: Store paths to be sent.
         :type paths: ``str``
         """
-        to_send = self.query_store_paths(paths)
+        to_send = self.query_path_closures(paths)
         num_to_send = len(to_send)
         if num_to_send == 1:
             logging.info("1 path will be sent to {}".format(self._endpoint))
