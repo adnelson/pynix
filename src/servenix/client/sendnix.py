@@ -166,13 +166,13 @@ class StoreObjectSender(object):
         except requests.HTTPError as err:
             if err.response.status_code != 404:
                 raise
-            logging.warn("Endpoint {} does not support the /query-paths "
-                         "route. Querying paths individually."
-                         .format(self._endpoint))
+            logging.debug("Endpoint {} does not support the /query-paths "
+                          "route. Querying paths individually."
+                          .format(self._endpoint))
             result = {}
             for path in paths:
                 logging.debug("Querying for path {}".format(path))
-                prefix = path.split("-")[0]
+                prefix = basename(path).split("-")[0]
                 url = "{}/{}.narinfo".format(self._endpoint, prefix)
                 resp = requests.get(url, auth=auth)
                 result[path] = resp.status_code == 200
