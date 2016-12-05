@@ -9,7 +9,7 @@ import os
 from os.path import join, isdir, isfile, expanduser, basename, getmtime
 import re
 import shutil
-from subprocess import Popen, PIPE, check_output
+from subprocess import Popen, PIPE, check_output, CalledProcessError
 import sys
 import tempfile
 # Special-case here to address a runtime bug I've encountered
@@ -30,6 +30,7 @@ import six
 from servenix import __version__
 from servenix.common.utils import strip_output, find_nix_paths, decode_str
 from servenix.common.exceptions import CouldNotConnect
+from servenix.common.narinfo import NarInfo
 
 NIX_PATH_CACHE = os.environ.get("NIX_PATH_CACHE",
                                 expanduser("~/.nix-path-cache"))
@@ -120,7 +121,7 @@ class StoreObjectSender(object):
         shutil.rmtree(ref_dir, ignore_errors=True)
         shutil.move(tempdir, ref_dir)
 
-    def get_references(self, path, query_server=True):
+    def get_references(self, path, query_server=False):
         """Get a path's direct references.
 
         :param path: A nix store path. It must exist in the store.
@@ -140,13 +141,17 @@ class StoreObjectSender(object):
             try:
                 refs = strip_output("nix-store --query --references {}"
                                     .format(path), hide_stderr=query_server)
+                refs = [r for r in refs.split() if r != path]
             except CalledProcessError as err:
+                if query_server is False:
+                    raise
                 prefix = basename(path).split("-")[0]
-                url = "{}/{}.narinfo".format(prefix)
+                url = "{}/{}.narinfo".format(self._endpoint, prefix)
                 auth = self._get_auth()
                 response = requests.get(url, auth=auth)
-                import pdb; pdb.set_trace()
-            refs = [r for r in refs.split() if r != path]
+                response.raise_for_status()
+                narinfo = NarInfo.from_string(response.content)
+                refs = narinfo.fullpath_references()
             self._path_references[path] = refs
             self._write_path_references(path, refs)
         return self._path_references[path]

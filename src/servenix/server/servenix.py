@@ -302,6 +302,7 @@ class NixServer(Flask):
                 raise ClientError("Hash {} must match {}"
                                   .format(obj_hash, _HASH_REGEX.pattern), 400)
             store_path = self.store_path_from_hash(obj_hash)
+            # TODO: use NarInfo class here
             store_info = self.get_object_info(store_path)
             # Add a few more keys to the store object, specific to the
             # compression type we're serving.
