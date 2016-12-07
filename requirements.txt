@@ -1,3 +1,5 @@
 flask
 six
 requests>=2
+rtyaml
+datadiff
