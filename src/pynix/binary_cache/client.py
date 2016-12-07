@@ -1,4 +1,4 @@
-"""Module for sending store objects to a running servenix instance."""
+"""Module for interacting with a running servenix instance."""
 import argparse
 from datetime import datetime
 import getpass
@@ -13,6 +13,7 @@ import shutil
 from subprocess import Popen, PIPE, check_output, CalledProcessError
 import sys
 import tempfile
+from threading import Thread
 from six.moves.urllib_parse import urlparse
 
 # Special-case here to address a runtime bug I've encountered
@@ -30,11 +31,11 @@ import time
 import requests
 import six
 
-from servenix import __version__
-from servenix.common.utils import (strip_output, find_nix_paths, decode_str,
-                                   decompress)
-from servenix.common.exceptions import CouldNotConnect, NixImportFailed
-from servenix.common.narinfo import NarInfo
+from pynix import __version__
+from pynix.utils import (strip_output, find_nix_paths, decode_str,
+                                decompress)
+from pynix.exceptions import CouldNotConnect, NixImportFailed
+from pynix.narinfo import NarInfo
 
 NIX_PATH_CACHE = os.environ.get("NIX_PATH_CACHE",
                                 expanduser("~/.nix-path-cache"))
@@ -42,7 +43,10 @@ NIX_NARINFO_CACHE = os.environ.get("NIX_NARINFO_CACHE",
                                    expanduser("~/.nix-narinfo-cache"))
 ENDPOINT_REGEX = re.compile(r"https?://([\w_-]+)(\.[\w_-]+)*(:\d+)?$")
 
-class StoreObjectSender(object):
+# Limit of how many paths to show, so the screen doesn't flood.
+SHOW_PATHS_LIMIT = int(os.environ.get("SHOW_PATHS_LIMIT", 25))
+
+class NixCacheClient(object):
     """Wraps some state for sending store objects."""
     def __init__(self, endpoint, dry_run=False, username=None,
                  password=None, cache_location=None, cache_enabled=True,
@@ -76,12 +80,35 @@ class StoreObjectSender(object):
         self._nix_store_path = nix_store_path if nix_store_path is not None \
                                else find_nix_paths()["nix_store_path"]
         #: Cache of direct path references (string -> strings). This
-        # is lazily loaded from an on-disk cache located in
+        # is loaded asyncronously from an on-disk cache located in
         # NIX_PATH_CACHE.
         self._path_references = {}
+        # Start the cache loading thread but don't block on it; this
+        # prevents slow startup time due to the loading of a large
+        # cache.
+        self._cache_thread = Thread(target=self._load_path_cache)
+        self._cache_thread.start()
         #: Cache of narinfo objects requested from the server.
         self._narinfo_cache = {}
         self._paths_fetched = set()
+
+    def _load_path_cache(self):
+        """Load the store reference path cache.
+        :return: A mapping from store paths to their references.
+        :rtype: ``dict`` of ``str`` to ``str``
+        """
+        if not isdir(NIX_PATH_CACHE):
+            return {}
+        logging.debug("Loading path cache...", file=sys.stderr)
+        store = self._nix_store_path
+        # path_cache = {}
+        for store_path in os.listdir(NIX_PATH_CACHE):
+            refs_dir = join(NIX_PATH_CACHE, store_path)
+            refs = [join(store, path) for path in os.listdir(refs_dir)
+                    if path != store_path]
+            self._path_references[join(store, store_path)] = refs
+        # logging.debug("Loaded references of {} paths".format(len(path_cache)))
+        # return path_cache
 
     def _update_narinfo_cache(self, narinfo, write_to_disk):
         """Write a narinfo entry to the cache.
@@ -265,31 +292,26 @@ class StoreObjectSender(object):
         Side effects:
         * Adds 0 or more paths to `self._objects_on_server`.
         """
-        paths_ = []
-        for path in paths:
-            if os.path.isabs(path):
-                paths_.append(path)
-            else:
-                paths_.append(os.path.join(self._nix_store_path, path))
-        paths = paths_
+        paths = [os.path.join(self._nix_store_path, p) for p in paths]
         total = len(paths)
         step = max(total // 10, 1)
         full_path_set = set()
-        def recur(_paths, top_level=False):
+        counts = [0]
+        def recur(_paths):
             """Loop for DFS'ing through the paths to generate full closures."""
-            for i, path in enumerate(_paths):
+            for path in _paths:
                 if path not in full_path_set:
+                    counts[0] += 1
                     recur(self.get_references(path))
                     full_path_set.add(path)
-                if top_level is True and (i % step == 0 or i == total - 1) \
-                        and sys.stderr.isatty():
-                    sys.stderr.write("\r{}/{} references calculated"
-                                     .format(i + 1, total))
-            if top_level is True and total > 0:
-                sys.stderr.write("\n")
-        recur(paths, top_level=True)
-        logging.info("The full closure contains {} paths."
-                     .format(len(full_path_set)))
+        logging.info("Computing path closure...")
+        recur(paths)
+        if len(full_path_set) > total:
+            logging.info("{} {} given as input, but the full "
+                         "dependency closure contains {} paths."
+                         .format(total,
+                                 "path was" if total == 1 else "paths were",
+                                 len(full_path_set)))
 
         # Now that we have the full list built up, send it to the
         # server to see which paths are already there.
@@ -461,6 +483,9 @@ class StoreObjectSender(object):
             if num_to_send > 0:
                 logging.info("Sent {} paths to {}"
                              .format(num_to_send, self._endpoint))
+        elif num_to_send <= SHOW_PATHS_LIMIT:
+            for path in to_send:
+                logging.info(basename(path))
 
     def have_fetched(self, path):
         """Checks if we've fetched a given path, or if it exists on disk.
@@ -652,15 +677,15 @@ def main():
     # Hide noisy logging of some external libs
     for name in ("requests", "urllib", "urllib2", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
-    sender = StoreObjectSender(
+    client = NixCacheClient(
         nix_bin_path=args.nix_bin_path, nix_state_path=args.nix_state_path,
         nix_store_path=args.nix_store_path,
         endpoint=args.endpoint, dry_run=args.dry_run, username=args.username)
     if args.command == "send":
-        sender.send_objects(args.paths)
+        client.send_objects(args.paths)
     elif args.command == "sync":
-        sender.sync_store(args.ignore)
+        client.sync_store(args.ignore)
     elif args.command == "daemon":
-        sender.watch_store(args.ignore)
+        client.watch_store(args.ignore)
     else:
         exit("Unknown command '{}'".format(args.command))

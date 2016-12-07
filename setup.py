@@ -4,19 +4,20 @@ from subprocess import Popen, PIPE
 import sys
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
-import servenix
+import pynix
 
 setuptools.setup(
-    name="servenix",
-    version=servenix.__version__,
+    name="pynix",
+    version=pynix.__version__,
     package_dir={"": "src"},
     packages=setuptools.find_packages("src"),
     provides=setuptools.find_packages("src"),
     install_requires=open("requirements.txt").readlines(),
     entry_points={
         "console_scripts": [
-            "servenix = servenix.server.servenix:main",
-            "sendnix = servenix.client.sendnix:main"
+            "servenix = pynix.binary_cache.server:main",
+            "sendnix = pynix.binary_cache.client:main",
+            "derivtool = pynix.derivtool:main"
         ]
     }
 )

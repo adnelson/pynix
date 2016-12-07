@@ -25,12 +25,11 @@ except ImportError as err:
 from flask import Flask, make_response, send_file, request, jsonify
 import six
 
-from servenix import __version__
-from servenix.common.utils import (decode_str, strip_output,
-                                   find_nix_paths, decompress)
-from servenix.common.exceptions import (NoSuchObject, NoNarGenerated,
-                                        BaseHTTPError, NixImportFailed,
-                                        CouldNotUpdateHash, ClientError)
+from pynix import __version__
+from pynix.utils import decode_str, strip_output, find_nix_paths, decompress
+from pynix.exceptions import (NoSuchObject, NoNarGenerated,
+                              BaseHTTPError, NixImportFailed,
+                              CouldNotUpdateHash, ClientError)
 
 _HASH_REGEX=re.compile(r"[a-z0-9]{32}")
 _PATH_REGEX=re.compile(r"([a-z0-9]{32})-[^' \n/]*$")

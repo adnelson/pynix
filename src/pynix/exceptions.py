@@ -1,4 +1,4 @@
-"""Exceptions specific to the servenix module."""
+"""Exceptions specific to pynix."""
 
 class BaseHTTPError(Exception):
     """Base class for all HTTP errors."""
