@@ -1,7 +1,7 @@
 """Some utility functions to support store operations."""
 import os
 from os.path import exists, join, dirname, isdir
-from subprocess import check_output, PIPE
+from subprocess import check_output, PIPE, Popen
 
 def decode_str(string):
     """Convert a bytestring to a string. Is a no-op for strings.
@@ -24,23 +24,27 @@ def decode_str(string):
     else:
         return string
 
-def strip_output(command, shell=True, hide_stderr=False):
+def strip_output(command, shell=True, input=None, hide_stderr=False):
     """Execute a bash command, and return its stripped output.
 
     :param command: A command, either a string or list.
     :type command: ``str`` or ``list`` of ``str``
     :param shell: Execute the command as a shell command.
     :type shell: ``bool``
+    :param input: If specified, text to send to the process stdin.
+    :type input: ``str`` or ``NoneType``
     :param hide_stderr: If true, stderr will be hidden.
     :type hide_stderr: ``bool``
 
     :return: The resulting stdout, stripped of trailing whitespace.
     :rtype: ``str``
     """
+    kwargs = {"shell": shell}
     if hide_stderr is True:
-        output = check_output(command, shell=shell, stderr=PIPE)
-    else:
-        output = check_output(command, shell=shell)
+        kwargs["stderr"] = PIPE
+    if input is not None:
+        kwargs["input"] = input
+    output = check_output(command, **kwargs)
     return decode_str(output).strip()
 
 def find_nix_paths():
@@ -81,3 +85,12 @@ def find_nix_paths():
         "nix_store_path": nix_store_path,
         "nix_state_path": nix_state_path,
     }
+
+def decompress(program, data):
+    """Decompresses the given data by via the given program."""
+    proc = Popen(program, stdin=PIPE, stdout=PIPE, shell=True)
+    out = proc.communicate(input=data)[0]
+    if proc.wait() != 0:
+        raise ServerError("Decompression with '{}' failed"
+                          .format(program))
+    return out
