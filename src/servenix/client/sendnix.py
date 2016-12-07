@@ -210,7 +210,7 @@ class StoreObjectSender(object):
                 if query_server is False:
                     raise
                 narinfo = self.get_narinfo(path)
-                refs = narinfo.fullpath_references()
+                refs = [r for r in narinfo.abs_references if r != path]
             self._update_reference_cache(path, refs, write_to_disk)
         return self._path_references[path]
 
@@ -470,6 +470,9 @@ class StoreObjectSender(object):
 
         :return: Whether we've fetched the path.
         :rtype: ``bool``
+
+        Side effects:
+        * Adds 0 or 1 paths to `self._paths_fetched`.
         """
         if path in self._paths_fetched:
             return True
@@ -495,12 +498,8 @@ class StoreObjectSender(object):
         Side effects:
         * Adds 0 or 1 paths to `self._paths_fetched`.
 
-        Note: This function is not thread safe. When performing a
-        nix-store --restore, the store path is required to not
-        exist. However there is a delay between when we check if we
-        have already fetched the path, and when the restore
-        happens. Proper locking is required to make the operation
-        atomic.
+        This function should be thread safe, since a nix-store import
+        is idempotent.
         """
         # Check if the object has already been fetched; if so we can stop.
         if self.have_fetched(path):
@@ -528,18 +527,15 @@ class StoreObjectSender(object):
         else:
             raise ValueError("Unsupported narinfo compression type {}"
                              .format(narinfo.compression))
-        # Once extracted, feed it into the nix-store --restore
-        # command. Note that the --restore command is lower level than
-        # the --import command; it doesn't carry as much metadata. We
-        # rely on our code logic to make sure we are doing things
-        # correctly.
-        proc = Popen([join(self._nix_bin_path, "nix-store"),
-                      "--restore", path],
+        # Once extracted, convert it into a nix export object and pass
+        # it into the nix-store --import command.
+        proc = Popen([join(self._nix_bin_path, "nix-store"), "--import"],
                      stdin=PIPE, stderr=PIPE, stdout=PIPE)
-        out, err = proc.communicate(input=data)
+        export = narinfo.nar_to_export(data)
+        out, err = proc.communicate(input=export.to_bytes())
         if proc.wait() != 0:
-            raise NixImportFailed(err)
-        logging.info("Successfully imported path {}".format(path))
+            raise NixImportFailed(decode_str(err))
+        logging.info("Imported path {}".format(out.decode("utf-8")))
         self._paths_fetched.add(path)
 
     def watch_store(self, ignore):
