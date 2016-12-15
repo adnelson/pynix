@@ -3,8 +3,10 @@ import os
 from io import BytesIO
 import yaml
 
+from pynix.utils import call_nix_store
+
 # Magic 8-byte number that comes at the beginning of the export's bytes.
-EXPORT_INITIAL_MAGIC = b"\x01" + (b"\x00" * 7)
+EXPORT_INITIAL_MAGIC = b"\x01\x00\x00\x00\x00\x00\x00\x00"
 # Magic 8-byte number that comes after the NAR, before export metadata.
 EXPORT_METADATA_MAGIC = b"NIXE\x00\x00\x00\x00"
 # A bytestring of 8 zeros, used below.
@@ -124,6 +126,30 @@ class NarInfo(object):
         return NarExport(self.store_path, nar_bytes=nar_bytes,
                          references=self.abs_references,
                          deriver=self.abs_deriver)
+    @classmethod
+    def from_row(cls, store_dir, row):
+        """Parse a narinfo from a row in a sqlite table.
+
+        Nix caches NarInfo's in this way, so it's useful to parse it.
+
+        :param store_dir: Path to the nix store, since this
+                          information isn't stored in the row.
+        :type store_dir: ``str``
+        :param row: A tuple of 12 elements, which is the info nix stores.
+        :type row: ``tuple``
+
+        :return: A ``NarInfo`` object.
+        :rtype: :py:class:`NarInfo`
+        """
+        if len(row) != 12:
+            raise ValueError("Expected a tuple of 12 elements, got {}"
+                             .format(len(row)))
+        (_, store_path, url, compression, file_hash,
+         file_size, nar_hash, nar_size, refs, deriver, _, _) = row
+        return cls(store_path=os.path.join(store_dir, store_path),
+                   url=url, compression=compression, file_hash=file_hash,
+                   file_size=file_size, nar_hash=nar_hash, nar_size=nar_size,
+                   references=refs.split(), deriver=(deriver or None))
 
     @classmethod
     def from_dict(cls, dictionary):
@@ -187,7 +213,12 @@ class NarExport(object):
         """
         self.store_path = store_path
         self.nar_bytes = nar_bytes
-        self.references = references
+        # Convert references to absolute paths, to be sure.
+        for ref_path in references:
+            if not os.path.isabs(ref_path):
+                raise TypeError("Reference path {} must be absolute."
+                                .format(ref_path))
+        self.references = list(sorted(references))
         self.deriver = deriver
 
         _paths = [store_path] + references
@@ -197,13 +228,23 @@ class NarExport(object):
             if not os.path.isabs(path):
                 raise ValueError("Paths must be absolute ({}).".format(path))
 
+    @classmethod
+    def load(cls, path):
+        """Load a store path into a nar export."""
+        nar = call_nix_store("--dump", path, decode=False)
+        references = call_nix_store("--query", "--references", path).split()
+        deriver = call_nix_store("--query", "--deriver", path)
+        if deriver == "unknown-deriver":
+            deriver = None
+        return NarExport(store_path=path, nar_bytes=nar, references=references,
+                         deriver=deriver)
+
+
     def to_bytes(self):
         """Convert a nar export into bytes.
 
-        Nix exports are a binary format. The input to this function is
-        a bytestring intended to have been created from a call to
-        `nix-store --dump`, or equivalently, as returned by a nix
-        binary cache. The logic of this function adds a few things:
+        Nix exports are a binary format. The logic of this function
+        serializes the NarExport, including:
 
         * An 8-byte magic header, which nix-store reads when it imports.
         * The bytes of the NAR itself.

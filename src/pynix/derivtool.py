@@ -1,11 +1,17 @@
 """CLI providing some useful derivation-related utilities."""
 
 import argparse
+import logging
 import os
 import sys
 
 from pynix.derivation import Derivation
-from pynix.build import print_preview
+from pynix.build import print_preview, prefetch
+
+if os.environ.get("LOG_LEVEL", "INFO") != "":
+    logging.basicConfig(
+        level=getattr(logging, os.environ["LOG_LEVEL"].upper()),
+        format="%(message)s")
 
 def get_args():
     """Parse command-line arguments."""
@@ -38,7 +44,7 @@ def get_args():
     p_preview = subparsers.add_parser("preview",
         help="Show paths needed to build a derivation.")
     p_preview.add_argument("derivation_paths", nargs="*",
-                          help="Paths to derivations.")
+                           help="Paths to derivations.")
     p_preview.add_argument("-c", "--binary-cache",
                            default=os.environ.get("NIX_REPO_HTTP"),
                            help="URL of a binary cache to query for paths.")
@@ -50,6 +56,16 @@ def get_args():
                                 "rather than paths.")
     p_preview.add_argument("--count", action="store_true", default=False,
                            help="Only show path count, don't print paths")
+
+    # 'prefetch' command
+    p_prefetch = subparsers.add_parser("prefetch",
+        help="Prefetch a derivation from a repo.")
+    p_prefetch.add_argument("derivation_paths", nargs="*",
+                            help="Paths to derivations.")
+    p_prefetch.add_argument("-c", "--binary-cache",
+                            default=os.environ.get("NIX_REPO_HTTP"),
+                            help="URL of a binary cache to query for paths.")
+
     return p_root.parse_args()
 
 
@@ -82,6 +98,14 @@ def main():
                       show_existing=args.show_existing,
                       show_outputs=args.show_outputs,
                       numbers_only=args.count)
+    elif args.command == "prefetch":
+        if len(args.derivation_paths) > 0:
+            paths = args.derivation_paths
+        elif not sys.stdin.isatty():
+            paths = (p.strip() for p in sys.stdin)
+        else:
+            sys.exit("No path arguments given")
+        prefetch(paths, binary_cache=args.binary_cache)
     else:
         sys.exit("Command {} not implemented".format(repr(args.command)))
 

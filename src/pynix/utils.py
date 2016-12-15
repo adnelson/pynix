@@ -24,7 +24,8 @@ def decode_str(string):
     else:
         return string
 
-def strip_output(command, shell=True, input=None, hide_stderr=False):
+def strip_output(command, shell=True, input=None, hide_stderr=False,
+                 decode=True):
     """Execute a bash command, and return its stripped output.
 
     :param command: A command, either a string or list.
@@ -35,9 +36,11 @@ def strip_output(command, shell=True, input=None, hide_stderr=False):
     :type input: ``str`` or ``NoneType``
     :param hide_stderr: If true, stderr will be hidden.
     :type hide_stderr: ``bool``
+    :param decode: Decode the output as utf-8.
+    :type decode: ``bool``
 
     :return: The resulting stdout, stripped of trailing whitespace.
-    :rtype: ``str``
+    :rtype: ``str`` or ``bytes``
     """
     kwargs = {"shell": shell}
     if hide_stderr is True:
@@ -45,7 +48,9 @@ def strip_output(command, shell=True, input=None, hide_stderr=False):
     if input is not None:
         kwargs["input"] = input
     output = check_output(command, **kwargs)
-    return decode_str(output).strip()
+    if decode is True:
+        output = decode_str(output)
+    return output.strip()
 
 def find_nix_paths():
     """Load up the nix bin, store and state paths, from environment.
@@ -70,7 +75,7 @@ def find_nix_paths():
     # inferred to be 2 levels up from the bin path. E.g., if the
     # bin path is /foo/bar/123-nix/bin, the store directory will
     # be /foo/bar.
-    nix_store_path = os.environ.get("NIX_STORE_PATH",
+    nix_store_path = os.environ.get("NIX_STORE",
                                     dirname(dirname(nix_bin_path)))
     assert isdir(nix_store_path), \
         "Nix store directory {} doesn't exist".format(nix_store_path)
@@ -85,6 +90,12 @@ def find_nix_paths():
         "nix_store_path": nix_store_path,
         "nix_state_path": nix_state_path,
     }
+
+def call_nix_store(*args, decode=True):
+    """Call the nix-store command with some arguments."""
+    nix_paths = find_nix_paths()
+    nix_store = join(nix_paths["nix_bin_path"], "nix-store")
+    return strip_output([nix_store] + list(args), shell=False, decode=decode)
 
 def decompress(program, data):
     """Decompresses the given data by via the given program."""

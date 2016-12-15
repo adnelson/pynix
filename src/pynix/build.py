@@ -4,6 +4,7 @@ import sys
 from os.path import exists, basename
 
 import requests
+from six import iteritems
 from pynix.binary_cache.client import NixCacheClient
 from pynix.derivation import Derivation
 
@@ -136,7 +137,7 @@ def parse_deriv_paths(paths):
     return result
 
 
-def preview_build(paths, binary_cache=None):
+def preview_build(paths, binary_cache=None, cache_client=None):
     """Given some derivation paths, generate three sets:
 
     * Set of derivations which need to be built from scratch
@@ -151,7 +152,8 @@ def preview_build(paths, binary_cache=None):
     needed, need_fetch = needed_to_build_multi(derivs_outs, existing=existing)
     if len(needed) > 0 and binary_cache is not None:
         on_server = {}
-        client = NixCacheClient(endpoint=binary_cache)
+        if cache_client is None:
+            cache_client = NixCacheClient(endpoint=binary_cache)
         # Query the server for missing paths. Start by trying a
         # multi-query because it's faster; if the server doesn't
         # implement that behavior then try individual queries.
@@ -164,7 +166,7 @@ def preview_build(paths, binary_cache=None):
                 path = deriv.output_mapping[out]
                 paths_to_ask.append(path)
                 path_mapping[path] = (deriv, out)
-        query_result = client.query_paths(paths_to_ask)
+        query_result = cache_client.query_paths(paths_to_ask)
         for path, is_on_server in query_result.items():
             if is_on_server is False:
                 continue
@@ -185,6 +187,25 @@ def preview_build(paths, binary_cache=None):
                                                        on_server=on_server,
                                                        existing=existing)
     return needed, need_fetch
+
+def prefetch(paths, binary_cache):
+    """Given derivation paths, fetch as many of their dependencies
+    from the binary cache as possible.
+
+    :param paths: A list of paths, optionally with output names.
+    :type paths: ``list`` of ``str``
+    :param binary_cache: URL of a binary cache server.
+    :type binary_cache: ``str``
+    """
+    if binary_cache is None:
+        raise ValueError("You must specify a binary cache.")
+    cache_client = NixCacheClient(endpoint=binary_cache)
+    needed, need_fetch = preview_build(paths, binary_cache=binary_cache,
+                                       cache_client=cache_client)
+    for deriv, outputs in iteritems(need_fetch):
+        for out in outputs:
+            path = deriv.output_mapping[out]
+            cache_client.fetch_object(path)
 
 
 def print_preview(paths, binary_cache, show_existing, show_outputs,

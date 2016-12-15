@@ -14,6 +14,7 @@ from subprocess import Popen, PIPE, check_output, CalledProcessError
 import sys
 import tempfile
 from threading import Thread
+from six import iteritems
 from six.moves.urllib_parse import urlparse
 
 # Special-case here to address a runtime bug I've encountered
@@ -45,6 +46,18 @@ ENDPOINT_REGEX = re.compile(r"https?://([\w_-]+)(\.[\w_-]+)*(:\d+)?$")
 
 # Limit of how many paths to show, so the screen doesn't flood.
 SHOW_PATHS_LIMIT = int(os.environ.get("SHOW_PATHS_LIMIT", 25))
+
+# SQLite queries
+INSERT_NARINFO_QUERY = """
+insert or replace into NARs (cache, storePath, url, compression, fileHash,
+                             fileSize, narHash, narSize, refs, deriver,
+                             signedBy, timestamp)
+values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', strftime('%s', 'now'))
+"""
+
+LOOKUP_NARINFO_QUERY = """
+select * from NARs where storePath = ?
+"""
 
 class NixCacheClient(object):
     """Wraps some state for sending store objects."""
@@ -92,6 +105,14 @@ class NixCacheClient(object):
         self._narinfo_cache = {}
         self._paths_fetched = set()
 
+        bin_cache_db_path = os.path.join(self._nix_state_path, "nix",
+                                         "binary-cache-v3.sqlite")
+        # See if the DB is writable; if so make a connection.
+        if os.access(bin_cache_db_path, os.W_OK):
+            self._bin_cache_db_con = sqlite3.connect(bin_cache_db_path)
+        else:
+            self._bin_cache_db_con = None
+
     def _load_path_cache(self):
         """Load the store reference path cache.
         :return: A mapping from store paths to their references.
@@ -99,7 +120,7 @@ class NixCacheClient(object):
         """
         if not isdir(NIX_PATH_CACHE):
             return {}
-        logging.debug("Loading path cache...", file=sys.stderr)
+        logging.debug("Loading path cache...")
         store = self._nix_store_path
         # path_cache = {}
         for store_path in os.listdir(NIX_PATH_CACHE):
@@ -107,16 +128,16 @@ class NixCacheClient(object):
             refs = [join(store, path) for path in os.listdir(refs_dir)
                     if path != store_path]
             self._path_references[join(store, store_path)] = refs
-        # logging.debug("Loaded references of {} paths".format(len(path_cache)))
-        # return path_cache
 
-    def _update_narinfo_cache(self, narinfo, write_to_disk):
+    def _update_narinfo_cache(self, narinfo, write_to_disk, write_to_db):
         """Write a narinfo entry to the cache.
 
         :param narinfo: Information about a nix archive.
         :type narinfo: :py:class:`NarInfo`
         :param write_to_disk: Write to the on-disk cache.
         :type write_to_disk: ``bool``
+        :param write_to_db: Write to the database.
+        :type write_to_db: ``bool``
         """
         path = narinfo.store_path
         self._narinfo_cache[path] = narinfo
@@ -133,6 +154,57 @@ class NixCacheClient(object):
         with open(tempfile_path, "w") as f:
             f.write(json.dumps(narinfo.as_dict()))
         shutil.move(tempfile_path, narinfo_path)
+        if write_to_db is True:
+            self._update_narinfo_sqlite_cache(narinfo)
+
+    def _get_cache_db_id(self):
+        """Look in the nix binary cache SQLite database for the cache ID.
+
+        If it doesn't exist, create an entry.
+
+        :return: The row ID for the binary cache, or None if we can't connect.
+        :rtype: ``int``
+        """
+        with self._bin_cache_db_con as con:
+            cache_id_query = con.execute(
+                "select id from BinaryCaches "
+                "where url = ?", (self._endpoint,))
+            query_res = cache_id_query.fetchone()
+            if query_res is not None:
+                cache_id = query_res[0]
+            else:
+                # No entry for this binary cache. Create one!
+                new_cache_query = (
+                    "insert into BinaryCaches "
+                    "(url, storeDir, wantMassQuery, priority, timestamp) "
+                    "values (?, ?, 1, 30, strftime('%s', 'now'))"
+                )
+                values = (self._endpoint, self._nix_store_path)
+                res = con.execute(new_cache_query, values)
+                cache_id = res.lastrowid
+            return cache_id
+
+    def _update_narinfo_sqlite_cache(self, narinfo):
+        """Update the narinfo existence cache.
+
+        Nix maintains a cache of NarInfos in the same SQLite database
+        as its path existence cache.
+
+        :param narinfo: A NarInfo object to store.
+        :type NarInfo: :py:class:`NarInfo`
+        """
+        if self._bin_cache_db_con is None:
+            return
+        cache_id = self._get_cache_db_id()
+        print('hey there')
+        with self._bin_cache_db_con as con:
+            values = (cache_id, basename(narinfo.store_path),
+                      narinfo.url, narinfo.compression,
+                      narinfo.file_hash, narinfo.file_size,
+                      narinfo.nar_hash, narinfo.nar_size,
+                      " ".join(sorted(narinfo.references)),
+                      narinfo.deriver or "")
+            con.execute(INSERT_NARINFO_QUERY, values)
 
     def _update_reference_cache(self, store_path, references, write_to_disk):
         """Given a store path and its references, write them to a cache.
@@ -173,6 +245,15 @@ class NixCacheClient(object):
         shutil.rmtree(ref_dir, ignore_errors=True)
         shutil.move(tempdir, ref_dir)
 
+    def _read_narinfo_sqlite_cache(self, path):
+        """Read the narinfo sqlite cache for info on a path."""
+        if self._bin_cache_db_con is None:
+            return None
+        print('yoyo')
+        with self._bin_cache_db_con as con:
+            res = con.execute(LOOKUP_NARINFO_QUERY, (basename(path),))
+            return res.fetchone()
+
     def get_narinfo(self, path):
         """Request narinfo from a server. These are cached in memory.
 
@@ -183,23 +264,26 @@ class NixCacheClient(object):
         :rtype: :py:class:`NarInfo`
         """
         if path not in self._narinfo_cache:
-            write_to_disk = True
+            write_to_disk, write_to_db = False, True
             cache_path = join(NIX_NARINFO_CACHE, self._endpoint_server,
                               basename(path))
-            if isfile(cache_path):
-                write_to_disk = False
+            if False: # isfile(cache_path):
                 with open(cache_path) as f:
                     narinfo = NarInfo.from_dict(json.load(f))
+                write_to_disk = False
             else:
-                prefix = basename(path).split("-")[0]
-                url = "{}/{}.narinfo".format(self._endpoint, prefix)
-                auth = self._get_auth()
-                print("hitting url {}...".format(url), end="")
-                response = requests.get(url, auth=auth)
-                print("ok")
-                response.raise_for_status()
-                narinfo = NarInfo.from_string(response.content)
-            self._update_narinfo_cache(narinfo, write_to_disk)
+                row = self._read_narinfo_sqlite_cache(path)
+                if row is not None:
+                    narinfo = NarInfo.from_row(self._nix_store_path, row)
+                    write_to_db = False
+                else:
+                    prefix = basename(path).split("-")[0]
+                    url = "{}/{}.narinfo".format(self._endpoint, prefix)
+                    auth = self._get_auth()
+                    response = requests.get(url, auth=auth)
+                    response.raise_for_status()
+                    narinfo = NarInfo.from_string(response.content)
+            self._update_narinfo_cache(narinfo, write_to_disk, write_to_db)
         return self._narinfo_cache[path]
 
     def get_references(self, path, query_server=False):
@@ -241,43 +325,109 @@ class NixCacheClient(object):
             self._update_reference_cache(path, refs, write_to_disk)
         return self._path_references[path]
 
+    def filter_query_paths(self, paths):
+        """Given a list of store paths, see if we already know they're
+        on the server.
+
+
+        We  will  use the  nix  binary  cache database  to  accomplish
+        this. Nix  maintains a  cache on disk  which stores whether a
+        particular binary cache has a  particular path or not. We will
+        use this cache but only record  "yes" answers -- if the nix DB
+        says the repo does  not have the path, we will  treat it as an
+        unknown (because that information might be stale).
+
+        :param paths: A list of store paths.
+        :type paths: ``list`` of ``str``
+
+        :return: Paths that are already known to be in the repo, and
+                 paths whose existence is known.
+        :rtype: (``set`` of ``str``, ``set`` of ``str``)
+        """
+        on_server, unknown = set(), set()
+        if self._bin_cache_db_con is None:
+            return on_server, unknown
+        ask_about_path = ('select * from NARExistence where storePath = ? '
+                          'and cache = ? and exist = 1')
+        cache_id = self._get_cache_db_id()
+        with self._bin_cache_db_con as con:
+            for path in paths:
+                res = con.execute(ask_about_path, (basename(path), cache_id))
+                if res.fetchone() is None:
+                    unknown.add(path)
+                else:
+                    on_server.add(path)
+        return on_server, unknown
+
+    def update_path_existence_cache(self, path_results):
+        """Update the path existence cache.
+
+        Using the results of a query_paths call, updates the nix
+        binary cache db.
+
+        :param path_results: A dictionary mapping store paths to
+                             booleans which indicate whether or not
+                             they are in the repo.
+        :type path_results: ``dict`` of ``str`` to ``bool``
+        """
+        if self._bin_cache_db_con is None:
+            return
+        cache_id = self._get_cache_db_id()
+        with self._bin_cache_db_con as con:
+            insert_path_query = (
+                "insert or replace into NARExistence "
+                "(cache, storePath, exist, timestamp) "
+                "values (?, ?, 1, strftime('%s', 'now'))"
+            )
+            # Insert each path that the server reported it had.
+            to_insert = ((cache_id, basename(p))
+                         for p, is_on_server in iteritems(path_results)
+                         if is_on_server is True)
+            con.executemany(insert_path_query, to_insert)
+
     def query_paths(self, paths):
         """Given a list of paths, see which the server has.
 
         :param paths: A list of nix store paths.
-        :type paths: ``str``
+        :type paths: ``list`` of ``str``
 
         :return: A dictionary mapping store paths to booleans (True if
                  on the server, False otherwise).
         :rtype: ``dict`` of ``str`` to ``bool``
         """
-        paths = list(set(paths))
+        result, paths = {}, set(paths)
+        # Check the nix binary cache database first.
+        on_server, unknown = self.filter_query_paths(paths)
+        logging.debug("According to the cache, {} paths are already "
+                      "on the server.".format(len(on_server)))
+        paths = list(unknown)
+        result = {p: True for p in on_server}
         if len(paths) == 0:
             # No point in making a request if we don't have any paths.
-            return {}
+            return result
         url = "{}/query-paths".format(self._endpoint)
-        data = json.dumps(paths)
+        data = json.dumps(list(paths))
         headers = {"Content-Type": "application/json"}
         logging.debug("Asking the server about {} paths.".format(len(paths)))
         auth = self._get_auth()
         try:
             response = requests.get(url, headers=headers, data=data, auth=auth)
             response.raise_for_status()
-            return response.json()
+            result.update(response.json())
         except requests.HTTPError as err:
             if err.response.status_code != 404:
                 raise
             logging.debug("Endpoint {} does not support the /query-paths "
                           "route. Querying paths individually."
                           .format(self._endpoint))
-            result = {}
             for path in paths:
                 logging.debug("Querying for path {}".format(path))
                 prefix = basename(path).split("-")[0]
                 url = "{}/{}.narinfo".format(self._endpoint, prefix)
                 resp = requests.get(url, auth=auth)
                 result[path] = resp.status_code == 200
-            return result
+        self.update_path_existence_cache(result)
+        return result
 
     def query_path_closures(self, paths):
         """Given a list of paths, compute their whole closure and ask
@@ -528,7 +678,7 @@ class NixCacheClient(object):
         """
         # Check if the object has already been fetched; if so we can stop.
         if self.have_fetched(path):
-            logging.info("{} has already been fetched.".format(path))
+            logging.debug("{} has already been fetched.".format(path))
             return
         # First fetch all of the object's references.
         for ref in self.get_references(path, query_server=True):
@@ -538,7 +688,7 @@ class NixCacheClient(object):
 
         # Use the URL in the narinfo to fetch the object.
         url = "{}/{}".format(self._endpoint, narinfo.url)
-
+        logging.info("Requesting nix archive at {}...".format(url))
         response = requests.get(url, auth=self._get_auth())
         response.raise_for_status()
 
@@ -557,9 +707,12 @@ class NixCacheClient(object):
         proc = Popen([join(self._nix_bin_path, "nix-store"), "--import"],
                      stdin=PIPE, stderr=PIPE, stdout=PIPE)
         export = narinfo.nar_to_export(data)
+        logging.info("Importing path {} into nix store...".format(path))
         out, err = proc.communicate(input=export.to_bytes())
         if proc.wait() != 0:
-            raise NixImportFailed(decode_str(err))
+            msg = ("When importing export of path {}: {}"
+                   .format(path, decode_str(err)))
+            raise NixImportFailed(msg)
         logging.info("Imported path {}".format(out.decode("utf-8")))
         self._paths_fetched.add(path)
 
