@@ -33,6 +33,10 @@ def get_args():
     p_diff = subparsers.add_parser("diff", help="Diff two derivations.")
     p_diff.add_argument("first", help="Path to the first derivation.")
     p_diff.add_argument("second", help="Path to the second derivation.")
+    p_diff.add_argument("--env", action="store_true", default=False,
+                        help="Just diff the environment.")
+    p_diff.add_argument("--inputs", action="store_true", default=False,
+                        help="Just diff the inputs.")
 
     # 'preview' command
     p_preview = subparsers.add_parser("preview",
@@ -70,7 +74,12 @@ def main():
     elif args.command == "diff":
         first = Derivation.parse_derivation_file(args.first)
         second = Derivation.parse_derivation_file(args.second)
-        print(first.diff(second))
+        if args.env is True:
+            print(first.diff_env(second))
+        elif args.inputs is True:
+            print(first.diff_inputs(second))
+        else:
+            print(first.diff(second))
     elif args.command == "preview":
         if len(args.derivation_paths) > 0:
             paths = args.derivation_paths

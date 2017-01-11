@@ -175,6 +175,14 @@ class Derivation(object):
         otherdict["outputs"] = list(sorted(otherdict["outputs"].keys()))
         return datadiff.diff(selfdict, otherdict)
 
+    def diff_env(self, other):
+        """Diff the environments of two derivations."""
+        return datadiff.diff(self.environment, other.environment)
+
+    def diff_inputs(self, other):
+        """Diff the inputs of two derivations."""
+        return datadiff.diff(self.input_paths, other.input_paths)
+
     def display(self, attribute=None, env_var=None, output=None,
                 format="json", pretty=False):
         """Return a string representation in the given format.
@@ -276,7 +284,8 @@ class Derivation(object):
         :return: The parsed Derivation object.
         :rtype: :py:class:`Derivation`
         """
-        if not os.path.isabs(derivation_path) and "NIX_STORE" in os.environ:
+        if not os.path.exists(derivation_path) and \
+           not os.path.isabs(derivation_path) and "NIX_STORE" in os.environ:
             derivation_path = os.path.join(os.environ["NIX_STORE"],
                                            derivation_path)
         if derivation_path in Derivation.CACHE:
