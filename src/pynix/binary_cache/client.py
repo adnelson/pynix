@@ -636,7 +636,10 @@ def _get_args():
     daemon = subparsers.add_parser("daemon",
                                    help="Run as daemon, periodically "
                                         "syncing store.")
-    for subparser in (send, sync, daemon):
+    fetch = subparsers.add_parser("fetch",
+                                   help="Fetch objects from a nix server.")
+    fetch.add_argument("paths", nargs="+", help="Paths to fetch.")
+    for subparser in (send, sync, daemon, fetch):
         subparser.add_argument("-e", "--endpoint",
                                default=os.environ.get("NIX_REPO_HTTP"),
                                help="Endpoint of nix server to send to.")
@@ -687,5 +690,8 @@ def main():
         client.sync_store(args.ignore)
     elif args.command == "daemon":
         client.watch_store(args.ignore)
+    elif args.command == "fetch":
+        for path in args.paths:
+            client.fetch_object(path)
     else:
         exit("Unknown command '{}'".format(args.command))
