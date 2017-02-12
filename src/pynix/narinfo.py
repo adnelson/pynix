@@ -1,7 +1,12 @@
 """A python embedding of a NarInfo object."""
-import os
 from io import BytesIO
+import os
+from os.path import join, basename, dirname
 import yaml
+from subprocess import check_output
+
+from pynix.utils import decode_str, strip_output, find_nix_paths, query_store
+from pynix.exceptions import NoNarGenerated
 
 # Magic 8-byte number that comes at the beginning of the export's bytes.
 EXPORT_INITIAL_MAGIC = b"\x01" + (b"\x00" * 7)
@@ -11,6 +16,15 @@ EXPORT_METADATA_MAGIC = b"NIXE\x00\x00\x00\x00"
 EIGHT_ZEROS = bytes(8)
 
 class NarInfo(object):
+    # Cache of narinfo's that have been parsed, to avoid duplicate work.
+    NARINFO_CACHE = {"xz": {}, "bzip2": {}}
+
+    # Cache of nar paths, indexed by compression type.
+    NAR_CACHE = {"xz": {}, "bzip2": {}}
+
+    # Load up nix paths. These can be overwritten if they're wrong.
+    NIX_PATHS = find_nix_paths()
+
     def __init__(self, store_path, url, compression,
                  nar_size, nar_hash, file_size, file_hash,
                  references, deriver):
@@ -43,8 +57,8 @@ class NarInfo(object):
         self.nar_hash = nar_hash
         self.file_size = file_size
         self.file_hash = file_hash
-        self.references = references
-        self.deriver = deriver
+        self.references = [basename(r) for r in references]
+        self.deriver = deriver if deriver is None else basename(deriver)
 
     def __repr__(self):
         return "NarInfo({})".format(self.store_path)
@@ -125,6 +139,24 @@ class NarInfo(object):
                          references=self.abs_references,
                          deriver=self.abs_deriver)
 
+    def signature(self):
+        """Compute a signature for a store path.
+
+        Start by computing a fingerprint containing the store path, the base-32
+        SHA256 hash of the contents of the path, and the references.
+
+        :return: A string which can be put in a narinfo signature.
+        :rtype: ``str``
+        """
+        # Hash must be a sha256 hash, encoded in base-32.
+        if not self.nar_hash.startswith("sha256:"):
+            raise ValueError("Hash must be sha256 to compute a signature.")
+        elif len(nar_hash) != 59:
+            raise ValueError("Hash must be encoded in base-32 (length 59)")
+        fingerprint = ";".join([self.store_path, self.nar_hash, self.nar_size,
+                                ",".join(self.abs_references)])
+
+
     @classmethod
     def from_dict(cls, dictionary):
         """Given a dictionary representation, convert it to a NarInfo.
@@ -163,6 +195,82 @@ class NarInfo(object):
     def from_string(cls, string):
         """Parse a string into a NarInfo."""
         return cls.from_dict(yaml.load(string))
+
+    @classmethod
+    def build_nar(cls, store_path, compression_type="xz"):
+        """Build a nix archive (nar) and return the resulting path."""
+        if compression_type not in ("xz", "bzip2"):
+            raise ValueError("Unsupported compression type: {}"
+                             .format(compression_type))
+        if store_path in cls.NAR_CACHE[compression_type]:
+            return cls.NAR_CACHE[compression_type][store_path]
+
+        # Construct a nix expression which will produce a nar.
+        nar_expr = "".join([
+            "(import <nix/nar.nix> {",
+            'storePath = "{}";'.format(store_path),
+            'hashAlgo = "sha256";',
+            'compressionType = "{}";'.format(compression_type),
+            "})"])
+
+        # Nix-build this expression, resulting in a store object.
+        compressed_path = strip_output([
+            join(cls.NIX_PATHS["nix_bin_path"], "nix-build"),
+            "--expr", nar_expr, "--no-out-link"
+        ], shell=False)
+
+        # This path will contain a compressed file; return its path.
+        extension = ".nar." + ("bz2" if compression_type == "bzip2" else "xz")
+        contents = map(decode_str, os.listdir(compressed_path))
+        for filename in contents:
+            if filename.endswith(extension):
+                path = join(compressed_path, filename)
+                cls.NAR_CACHE[compression_type][store_path] = path
+                return path
+        # This might happen if we run out of disk space or something
+        # else terrible.
+        raise NoNarGenerated(compressed_path, nar_extension)
+
+    @classmethod
+    def from_store_path(cls, store_path, compression_type="xz"):
+        """Load a narinfo from a store path.
+
+        :param store_path: Path in the nix store to load info on.
+        :type store_path: ``str``
+        :param compression_type: What type of compression to use on the NAR.
+
+        :return: A NarInfo for the path.
+        :rtype: :py:class:`NarInfo`
+        """
+        if store_path in cls.NARINFO_CACHE[compression_type]:
+            return cls.NARINFO_CACHE[compression_type][store_path]
+
+        # Build the compressed version. Compute its hash and size.
+        nar_path = cls.build_nar(store_path, compression_type=compression_type)
+        du = strip_output("du -sb {}".format(nar_path))
+        file_size = int(du.split()[0])
+        file_hash = strip_output("nix-hash --type sha256 --base32 --flat {}"
+                                 .format(nar_path))
+        nar_size = query_store(store_path, "--size")
+        nar_hash = query_store(store_path, "--hash")
+        references = query_store(store_path, "--references").split()
+        deriver = query_store(store_path, "--deriver")
+        extension = ".nar." + ("bz2" if compression_type == "bzip2" else "xz")
+        narinfo = cls(
+            url="nar/{}{}".format(basename(store_path)[:32], extension),
+            compression=compression_type,
+            store_path=store_path,
+            nar_hash=nar_hash,
+            nar_size=nar_size,
+            file_size=str(file_size),
+            file_hash="sha256:{}".format(file_hash),
+            references=references,
+            deriver=None if deriver == "unknown-deriver" else deriver
+        )
+        cls.NARINFO_CACHE[compression_type][store_path] = narinfo
+        return narinfo
+
+
 
 class NarExport(object):
     """A nix archive augmented with some metadata.

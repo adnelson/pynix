@@ -13,6 +13,20 @@ let
     };
     propagatedBuildInputs = [pythonPackages.pyyaml];
   };
+  pysodium = pythonPackages.buildPythonPackage rec {
+    name = "pysodium-${version}";
+    version = "0.6.9.1";
+    src = pkgs.fetchurl {
+      url = "https://pypi.python.org/packages/1c/7b/140b954748b466564e7e4d6728cf02109d52999a15f7f6cdce4532542440/pysodium-${version}.tar.gz";
+      sha256 = "00xswqhacgkrswpp56xsa070r83h7jwz9szapd95mykdqg3zaa86";
+    };
+    libsodiumPath = "${pkgs.libsodium}/lib/libsodium.so";
+    # Patch in the abspath to libsodium because it is looked up dynamically.
+    patchPhase = ''
+      sed -i "s,ctypes.util.find_library('sodium'),'$libsodiumPath'," pysodium/__init__.py
+    '';
+    propagatedBuildInputs = [pkgs.libsodium];
+  };
   # Use .out so we have the binaries callable
   inherit (builtins) replaceStrings readFile;
   version = replaceStrings ["\n"] [""] (readFile ./version.txt);
@@ -33,7 +47,9 @@ pythonPackages.buildPythonPackage rec {
     pythonPackages.six
     pythonPackages.datadiff
     rtyaml
+    pysodium
   ];
+  passthru.fart = pysodium;
   src = ./.;
   makeWrapperArgs = [
     "--set NIX_BIN_PATH ${pkgs.lib.makeBinPath [pkgs.nix.out]}"

@@ -27,6 +27,7 @@ import six
 
 from pynix import __version__
 from pynix.utils import decode_str, strip_output, find_nix_paths, decompress
+from pynix.narinfo import NarInfo
 from pynix.exceptions import (NoSuchObject, NoNarGenerated,
                               BaseHTTPError, NixImportFailed,
                               CouldNotUpdateHash, ClientError)
@@ -206,71 +207,6 @@ class NixServer(Flask):
         result = strip_output(command, shell=False, hide_stderr=hide_stderr)
         return result
 
-    def get_object_info(self, store_path):
-        """Given a store path, get some information about the path.
-
-        :param store_path: Path to the object in the store. The path is assumed
-            to exist in the store and in the SQLite database. The path must
-            conform to the path regex.
-        :type store_path: ``str``
-
-        :return: A dictionary of store object information.
-        :rtype: ``dict``
-        """
-        if store_path in self._paths_to_info:
-            return self._paths_to_info[store_path]
-        # Build the compressed version. Compute its hash and size.
-        nar_path = self.build_nar(store_path)
-        du = strip_output("du -sb {}".format(nar_path))
-        file_size = int(du.split()[0])
-        file_hash = strip_output("nix-hash --type sha256 --base32 --flat {}"
-                                 .format(nar_path))
-        nar_size = self.query_store(store_path, "--size")
-        nar_hash = self.query_store(store_path, "--hash")
-        references = self.query_store(store_path, "--references").split()
-        deriver = self.query_store(store_path, "--deriver")
-        info = {
-            "StorePath": store_path,
-            "NarHash": nar_hash,
-            "NarSize": nar_size,
-            "FileSize": str(file_size),
-            "FileHash": "sha256:{}".format(file_hash)
-        }
-        if references != []:
-            info["References"] = " ".join(basename(ref) for ref in references)
-        if deriver != "unknown-deriver":
-            info["Deriver"] = basename(deriver)
-        self._paths_to_info[store_path] = info
-        return info
-
-    def build_nar(self, store_path):
-        """Build a nix archive (nar) and return the resulting path."""
-        if isinstance(store_path, tuple):
-            store_path = store_path[0]
-
-        # Construct a nix expression which will produce a nar.
-        nar_expr = "".join([
-            "(import <nix/nar.nix> {",
-            'storePath = "{}";'.format(store_path),
-            'hashAlgo = "sha256";',
-            'compressionType = "{}";'.format(self._compression_type),
-            "})"])
-
-        # Nix-build this expression, resulting in a store object.
-        compressed_path = strip_output([
-            join(self._nix_bin_path, "nix-build"),
-            "--expr", nar_expr, "--no-out-link"
-        ], shell=False)
-
-        # This path will contain a compressed file; return its path.
-        contents = map(decode_str, os.listdir(compressed_path))
-        for filename in contents:
-            if filename.endswith(self._nar_extension):
-                return join(compressed_path, filename)
-        # This might happen if we run out of disk space or something
-        # else terrible.
-        raise NoNarGenerated(compressed_path, self._nar_extension)
-
     def make_app(self):
         """Create a flask app and set up routes on it.
 
@@ -302,16 +238,8 @@ class NixServer(Flask):
                 raise ClientError("Hash {} must match {}"
                                   .format(obj_hash, _HASH_REGEX.pattern), 400)
             store_path = self.store_path_from_hash(obj_hash)
-            # TODO: use NarInfo class here
-            store_info = self.get_object_info(store_path)
-            # Add a few more keys to the store object, specific to the
-            # compression type we're serving.
-            store_info["URL"] = "nar/{}{}".format(obj_hash,
-                                                  self._nar_extension)
-            store_info["Compression"] = self._compression_type
-            info_string = "\n".join("{}: {}".format(k, v)
-                             for k, v in store_info.items()) + "\n"
-            return make_response((info_string, 200,
+            narinfo = NarInfo.from_store_path(store_path)
+            return make_response((narinfo.to_string(), 200,
                                  {"Content-Type": "application/octet-stream"}))
 
         @app.route("/nar/<obj_hash>{}".format(self._nar_extension))
@@ -324,7 +252,7 @@ class NixServer(Flask):
             :type obj_hash: ``str``
             """
             store_path = self.store_path_from_hash(obj_hash)
-            nar_path = self.build_nar(store_path)
+            nar_path = NarInfo.build_nar(store_path, self._compression_type)
             return send_file(nar_path, mimetype="application/octet-stream")
 
         @app.route("/query-paths")
@@ -409,7 +337,8 @@ class NixServer(Flask):
             result_path = decode_str(out).strip()
             # Spin off a thread to build a NAR of the path, to speed
             # up future fetches.
-            Thread(target=self.build_nar, args=(result_path,)).start()
+            Thread(target=NarInfo.build_nar,
+                   args=(result_path, self._compression_type)).start()
             # Return the path as an indicator of success.
             return (result_path, 200)
 

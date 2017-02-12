@@ -86,6 +86,27 @@ def find_nix_paths():
         "nix_state_path": nix_state_path,
     }
 
+def query_store(store_path, query, hide_stderr=False, nix_bin_path=None):
+    """Given a query (e.g. --hash or --size), perform the query.
+
+    :param store_path: The store path to query.
+    :type store_path: ``str``
+    :param query: The query to perform. Must be a valid nix-store query.
+    :type query: ``str``
+    :param hide_stderr: If true, stderr will be hidden.
+    :type hide_stderr: ``bool``
+    :param nix_bin_path: Path to nix binaries. Default uses find_nix_paths.
+    :type nix_bin_path: ``str`` or ``NoneType``
+
+    :return: The result of the query.
+    :rtype: ``str``
+    """
+    nix_bin_path = nix_bin_path or find_nix_paths()["nix_bin_path"]
+    nix_store = join(nix_bin_path, "nix-store")
+    command = [nix_store, "-q", query, store_path]
+    result = strip_output(command, shell=False, hide_stderr=hide_stderr)
+    return result
+
 def decompress(program, data):
     """Decompresses the given data by via the given program."""
     proc = Popen(program, stdin=PIPE, stdout=PIPE, shell=True)
