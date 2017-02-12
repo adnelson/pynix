@@ -5,6 +5,8 @@ from os.path import join, basename, dirname
 import yaml
 from subprocess import check_output
 
+from pysodium import (crypto_sign_SECRETKEYBYTES, crypto_sign_detached)
+
 from pynix.utils import decode_str, strip_output, find_nix_paths, query_store
 from pynix.exceptions import NoNarGenerated
 
@@ -139,7 +141,7 @@ class NarInfo(object):
                          references=self.abs_references,
                          deriver=self.abs_deriver)
 
-    def signature(self):
+    def signature(self, secret_key):
         """Compute a signature for a store path.
 
         Start by computing a fingerprint containing the store path, the base-32
@@ -153,9 +155,13 @@ class NarInfo(object):
             raise ValueError("Hash must be sha256 to compute a signature.")
         elif len(nar_hash) != 59:
             raise ValueError("Hash must be encoded in base-32 (length 59)")
+        elif len(secret_key) != crypto_sign_SECRETKEYBYTES:
+            raise ValueError("Secret key must be length {}"
+                             .format(crypto_sign_SECRETKEYBYTES))
         fingerprint = ";".join([self.store_path, self.nar_hash, self.nar_size,
                                 ",".join(self.abs_references)])
-
+        sig = crypto_sign_detached(fingerprint, secret_key)
+        return sig
 
     @classmethod
     def from_dict(cls, dictionary):
