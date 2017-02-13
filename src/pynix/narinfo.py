@@ -28,7 +28,7 @@ class NarInfo(object):
 
     def __init__(self, store_path, url, compression,
                  nar_size, nar_hash, file_size, file_hash,
-                 references, deriver,
+                 references, deriver, key_info=None,
                  secret_key_name=None,
                  secret_key=None):
         """Initializer.
@@ -75,18 +75,15 @@ class NarInfo(object):
         self.file_hash = file_hash
         self.references = list(sorted(basename(r) for r in references))
         self.deriver = deriver if deriver is None else basename(deriver)
-        self.secret_key_name = secret_key_name
-        self.secret_key = secret_key
+        self._key_info = key_info
 
-        # Compute signature if we have a secret key.
-        if secret_key is not None:
-            # Make sure there's a secret key name as well.
-            if secret_key_name is None:
-                raise ValueError("Must provide a secret key name.")
+        # Compute signature if we have a key.
+        if key_info is not None:
             fingerprint = ";".join(
                 [self.store_path, self.nar_hash, self.nar_size,
                  ",".join(self.abs_references)]).encode("utf-8")
-            self.signature = crypto_sign_detached(fingerprint, secret_key)
+            self.signature = crypto_sign_detached(fingerprint,
+                                                  key_info.secret_key)
         else:
             self.signature = None
 
@@ -112,9 +109,9 @@ class NarInfo(object):
         }
         if self.deriver is not None:
             result["Deriver"] = self.deriver
-        if self.secret_key_name is not None:
+        if self._key_info is not None:
             result["Sig"] = "{}:{}".format(
-                self.secret_key_name,
+                self._key_info.key_name,
                 base64.b64encode(self.signature).decode("utf-8"))
         return result
 

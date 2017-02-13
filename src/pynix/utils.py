@@ -5,7 +5,7 @@ from os import getenv
 from os.path import exists, join, dirname, isdir, realpath
 from subprocess import check_output, PIPE, Popen
 
-from pysodium import crypto_sign_SECRETKEYBYTES
+from pysodium import (crypto_sign_SECRETKEYBYTES, crypto_sign_PUBLICKEYBYTES)
 
 def decode_str(string):
     """Convert a bytestring to a string. Is a no-op for strings.
@@ -87,28 +87,60 @@ def query_store(store_path, query, hide_stderr=False):
     result = strip_output(command, shell=False, hide_stderr=hide_stderr)
     return result
 
-def parse_secret_key_file(path):
-    """Given path to a secret key file, return a key name and secret key.
+def parse_key_file(path):
+    """Given path to a key file, return a key name and key.
 
-    :param path: Path to a secret key file.
+    :param path: Path to a key file.
     :type path: ``str``
+    :param key_length: The expected length of the key.
+    :type key_length: ``int``
 
-    :return: A secret key name, and secret key contents.
+    :return: A key name, and key contents.
     :rtype: (``str``, ``bytes``)
     """
     with open(path, "rb") as f:
         contents_split = f.read().strip().split(b":")
     if len(contents_split) != 2:
-        raise ValueError("Secret key file {} has invalid contents. "
+        raise ValueError("Key file {} has invalid contents. "
                          "Should contain a key name and base64-"
-                         "encoded key separated by ':'")
-    secret_key_name, secret_key_b64 = contents_split
-    secret_key_name = secret_key_name.decode("utf-8")
-    secret_key = base64.b64decode(secret_key_b64)
-    if len(secret_key) != crypto_sign_SECRETKEYBYTES:
-        raise ValueError("Secret key at path {} must be length {}"
-                         .format(path, crypto_sign_SECRETKEYBYTES))
-    return secret_key_name, secret_key
+                         "encoded key separated by ':'".format(path))
+    key_name, key_b64 = contents_split
+    key_name = key_name.decode("utf-8")
+    key = base64.b64decode(key_b64)
+    return key_name, key
+
+class KeyInfo(object):
+    """Stores public and secret keys for the server."""
+    def __init__(self, key_name, public_key, secret_key):
+        self.key_name = key_name
+        self.public_key = public_key
+        if len(self.public_key) != crypto_sign_PUBLICKEYBYTES:
+            raise ValueError("Invalid public key: should be length {}"
+                             .format(crypto_sign_PUBLICKEYBYTES))
+        self.secret_key = secret_key
+        if len(self.secret_key) != crypto_sign_SECRETKEYBYTES:
+            raise ValueError("Invalid secret key: should be length {}"
+                             .format(crypto_sign_SECRETKEYBYTES))
+
+    @classmethod
+    def load(cls, public_key_file, secret_key_file):
+        """Load up public and secret key files.
+
+        :param public_key_file: Path to a file containing public key info.
+        :type public_key_file: ``str``
+        :param secret_key_file: Path to a file containing secret key info.
+        :type secret_key_file: ``str``
+
+        :return: The key information.
+        :rtype: :py:class:`KeyInfo`
+        """
+        s_key_name, s_key = parse_key_file(secret_key_file)
+        p_key_name, p_key = parse_key_file(public_key_file)
+        if s_key_name != p_key_name:
+            raise ValueError("Different key names: public key is named '{}' "
+                             "and secret key is named '{}'"
+                             .format(s_key_name, p_key_name))
+        return cls(key_name=s_key_name, public_key=p_key, secret_key=s_key)
 
 
 def decompress(program, data):

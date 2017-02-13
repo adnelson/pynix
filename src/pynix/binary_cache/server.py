@@ -1,5 +1,6 @@
 """Serve nix store objects over HTTP."""
 import argparse
+from base64 import b64encode
 import logging
 import os
 from os.path import exists, isdir, join, basename, dirname
@@ -27,8 +28,7 @@ from pysodium import crypto_sign_SECRETKEYBYTES
 import six
 
 from pynix import __version__
-from pynix.utils import (decode_str, decompress, GZIP,
-                         parse_secret_key_file, query_store,
+from pynix.utils import (decode_str, decompress, GZIP, KeyInfo, query_store,
                          NIX_STORE_PATH, NIX_STATE_PATH, NIX_BIN_PATH)
 from pynix.narinfo import NarInfo
 from pynix.exceptions import (NoSuchObject, NoNarGenerated,
@@ -47,8 +47,7 @@ class NixServer(Flask):
                  compression_type="xz",
                  debug=False,
                  direct_db=True,
-                 secret_key_name=None,
-                 secret_key=None):
+                 key_info=None):
         self._compression_type = compression_type
         # Cache mapping object hashes to store paths.
         self._hashes_to_paths = {}
@@ -56,35 +55,18 @@ class NixServer(Flask):
         self._hashes_to_valid_paths = {}
         # Set of known store paths.
         self._known_store_paths = set()
-        # A static string telling a nix client what this store serves.
-        self._cache_info = "\n".join([
-            "StoreDir: {}".format(NIX_STORE_PATH),
-            "WantMassQuery: 1",
-            "Priority: 30"
-        ]) + "\n"
         if self._compression_type == "bzip2":
             self._nar_extension = ".nar.bz2"
         else:
             self._nar_extension = ".nar.xz"
         # Enable interactive debugging on unknown errors.
         self._debug = debug
-        # Name of the secret key used to sign NAR information. Optional.
-        self._secret_key_name = secret_key_name
-        # Contents of the secret key to sign NAR information. Optional.
-        if secret_key is not None and \
-                len(secret_key) != crypto_sign_SECRETKEYBYTES:
-            raise ValueError("Secret key must be length {}"
-                             .format(crypto_sign_SECRETKEYBYTES))
-        self._secret_key = secret_key
-        if (secret_key is None) != (secret_key_name is None):
-            raise ValueError("Either both or neither of secret_key_name and "
-                             "secret_key must be supplied")
+        self._key_info = key_info
         logging.info("Nix store path: {}".format(NIX_STORE_PATH))
         logging.info("Nix state path: {}".format(NIX_STATE_PATH))
         logging.info("Nix bin path: {}".format(NIX_BIN_PATH))
-        if secret_key is not None:
-            logging.info("Using secret key '{}'".format(secret_key_name))
-
+        if self._key_info is not None:
+            logging.info("Using key '{}'".format(self._key_info.key_name))
 
         if direct_db is False:
             self._db_con = None
@@ -104,6 +86,22 @@ class NixServer(Flask):
                 logging.warn("Couldn't connect to the database ({}). Can't "
                              "operate in direct-database mode :(".format(err))
                 self._db_con = None
+
+    @property
+    def cache_info(self):
+        """String telling a nix client what this store serves."""
+        cache_info_lines = [
+            "StoreDir: {}".format(NIX_STORE_PATH),
+            "WantMassQuery: 1",
+            "Priority: 30"
+        ]
+        if self._key_info is not None:
+            cache_info_lines.append(
+                "PublicKey: {}:{}"
+                .format(self._key_info.key_name,
+                        b64encode(self._key_info.public_key).decode("utf-8")))
+        return "\n".join(cache_info_lines) + "\n"
+
 
     def store_path_from_hash(self, store_object_hash):
         """Look up a store path using its hash.
@@ -220,7 +218,7 @@ class NixServer(Flask):
         @app.route("/nix-cache-info")
         def nix_cache_info():
             """Return information about the binary cache."""
-            info_string = self._cache_info
+            info_string = self.cache_info
             return make_response((info_string, 200,
                                  {"Content-Type": "application/octet-stream"}))
 
@@ -390,6 +388,9 @@ def _get_args():
     parser.add_argument("--secret-key-file",
                         help="Path to file containing secret key information.",
                         default=os.getenv("NIX_SECRET_KEY_FILE"))
+    parser.add_argument("--public-key-file",
+                        help="Path to file containing public key information.",
+                        default=os.getenv("NIX_PUBLIC_KEY_FILE"))
     parser.add_argument("--no-db", action="store_false", dest="direct_db",
                         help="Disable direct-database mode.")
     parser.set_defaults(direct_db=os.getenv("NO_DIRECT_DB", "") == "")
@@ -401,15 +402,17 @@ def main():
     args = _get_args()
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(message)s")
-    if args.secret_key_file is not None:
-        key_name, key = parse_secret_key_file(args.secret_key_file)
+    if (args.secret_key_file is None) != (args.public_key_file is None):
+        raise ValueError("Must supply public key and secret key together.")
+    elif args.secret_key_file is not None and args.public_key_file is not None:
+        key_info = KeyInfo.load(
+            secret_key_file=args.secret_key_file,
+            public_key_file=args.public_key_file)
     else:
-        key_name, key = None, None
+        key_info = None
     nixserver = NixServer(compression_type=args.compression_type,
-                          debug=args.debug,
-                          direct_db=args.direct_db,
-                          secret_key_name=key_name,
-                          secret_key=key)
+                          debug=args.debug, direct_db=args.direct_db,
+                          key_info=key_info)
     app = nixserver.make_app()
     app.run(port=args.port, host=args.host)
 
