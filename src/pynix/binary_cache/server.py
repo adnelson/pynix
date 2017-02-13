@@ -389,11 +389,8 @@ def _get_args():
                                  "WARNING", "DEBUG"))
     parser.add_argument("--secret-key-file",
                         help="Path to file containing secret key information.",
-                        default=os.environ.get("NIX_SECRET_KEY_FILE"))
-    parser.add_argument("--direct-db", action="store_true",
-                        help="Connect directly to nix database, is faster.")
-    parser.add_argument("--no-direct-db", action="store_false",
-                        dest="direct_db",
+                        default=os.getenv("NIX_SECRET_KEY_FILE"))
+    parser.add_argument("--no-db", action="store_false", dest="direct_db",
                         help="Disable direct-database mode.")
     parser.set_defaults(direct_db=os.getenv("NO_DIRECT_DB", "") == "")
     return parser.parse_args()
