@@ -49,13 +49,13 @@ def strip_output(command, input=None, hide_stderr=False):
     output = check_output(command, **kwargs)
     return decode_str(output).strip()
 
+def _resolve_bin(bin_name):
+    return realpath(strip_output("type -p " + bin_name))
+
 # Load nix paths from environment
-if "NIX_BIN_PATH" in os.environ:
-    NIX_BIN_PATH = os.environ["NIX_BIN_PATH"]
-else:
-    NIX_BIN_PATH = dirname(realpath(strip_output("type -p nix-env")))
+NIX_BIN_PATH = dirname(_resolve_bin("nix-env"))
 assert exists(join(NIX_BIN_PATH, "nix-build")), \
-    "Couldn't determine a valid nix binary path. Set NIX_BIN_PATH"
+    "Couldn't determine a valid nix binary path."
 # The store path can be given explicitly, or else it will be
 # inferred to be 2 levels up from the bin path. E.g., if the
 # bin path is /foo/bar/123-nix/bin, the store directory will
@@ -71,11 +71,11 @@ assert isdir(NIX_STATE_PATH), \
 
 # Some paths to binaries that the library wants to call. If any of
 # these are not available, instantiation of this module will fail.
-GZIP = strip_output("type -p gzip")
-BZIP2 = strip_output("type -p bzip2")
-XZ = strip_output("type -p xz")
-PV = strip_output("type -p pv")
-DU = strip_output("type -p du")
+GZIP = _resolve_bin("gzip")
+BZIP2 = _resolve_bin("bzip2")
+XZ = _resolve_bin("xz")
+PV = _resolve_bin("pv")
+DU = _resolve_bin("du")
 NIX_STORE = join(NIX_BIN_PATH, "nix-store")
 NIX_BUILD = join(NIX_BIN_PATH, "nix-build")
 NIX_ENV = join(NIX_BIN_PATH, "nix-env")

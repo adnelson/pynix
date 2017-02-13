@@ -31,20 +31,6 @@ let
   # Use .out so we have the binaries callable
   inherit (builtins) replaceStrings readFile;
   version = replaceStrings ["\n"] [""] (readFile ./version.txt);
-  # Script to write all of the pythonpaths of this package to a file.
-  writePaths = pkgs.writeScript "write-servenix-pythonpaths" ''
-    #!${pythonPackages.python.interpreter}
-    import os, site, sys, json
-    # Invoke addsitedir on each path in sys.path.
-    for path in [p for p in sys.path if os.path.exists(p)]:
-        site.addsitedir(path)
-    # Write paths to $out/pythonpaths.
-    nix_store = os.environ["NIX_STORE"]
-    with open(os.path.join(os.environ["out"], "pythonpaths.ini"), "w") as f:
-        f.write("[uwsgi]\n")
-        f.write("\n".join("pythonpath = " + p for p in sys.path
-                          if p.startswith(nix_store + "/")))
-  '';
 in
 
 pythonPackages.buildPythonPackage {
@@ -65,21 +51,22 @@ pythonPackages.buildPythonPackage {
     pysodium
   ];
   src = ./.;
-  postInstall = writePaths;
   passthru = {inherit pythonPackages;} // passthru;
   # Hard-code a bunch of paths so that they can be called even when
   # the library is imported.
   patchPhase = let
     mkPath = deriv: bin: "${pkgs.lib.makeBinPath [deriv]}/${bin}";
     utils = "src/pynix/utils.py";
+    nixBin = pkgs.lib.makeBinPath [pkgs.nix];
     fixpath = deriv: bin: let bpath = mkPath deriv bin; in ''
       if ! [[ -x ${bpath} ]]; then
         echo "Invalid binary path for ${bin}: ${bpath}"
         exit 1
       fi
-      sed -i 's,strip_output("type -p ${bin}"),"${bpath}",' ${utils}
+      sed -i 's,_resolve_bin("${bin}"),"${bpath}",' ${utils}
     '';
   in ''
+    sed -i 's,dirname(_resolve_bin("nix-env")),"${nixBin}",' ${utils}
     ${fixpath pkgs.gzip "gzip"}
     ${fixpath pkgs.bzip2 "bzip2"}
     ${fixpath pkgs.xz "xz"}
