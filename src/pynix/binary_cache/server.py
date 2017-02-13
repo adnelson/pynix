@@ -4,7 +4,7 @@ import logging
 import os
 from os.path import exists, isdir, join, basename, dirname
 import re
-from subprocess import check_output, Popen, PIPE, CalledProcessError
+from subprocess import Popen, PIPE, CalledProcessError
 from threading import Thread
 # Special-case here to address a runtime bug I've encountered.
 # Essentially having python libraries other than those
@@ -23,6 +23,7 @@ except ImportError as err:
         raise
 
 from flask import Flask, make_response, send_file, request, jsonify
+from pysodium import crypto_sign_SECRETKEYBYTES
 import six
 
 from pynix import __version__
@@ -37,8 +38,14 @@ _PATH_REGEX=re.compile(r"([a-z0-9]{32})-[^' \n/]*$")
 
 class NixServer(Flask):
     """Serves nix packages."""
-    def __init__(self, nix_store_path, nix_bin_path, nix_state_path,
-                 compression_type, debug):
+    def __init__(self,
+                 nix_store_path=find_nix_paths()["nix_store_path"],
+                 nix_state_path=find_nix_paths()["nix_state_path"],
+                 nix_bin_path=find_nix_paths()["nix_bin_path"],
+                 compression_type="xz",
+                 debug=False,
+                 secret_key_name=None,
+                 secret_key=None):
         # Path to the local nix store.
         self._nix_store_path = nix_store_path
         # Path to the local nix state directory.
@@ -69,6 +76,19 @@ class NixServer(Flask):
             self._nar_extension = ".nar.xz"
         # Enable interactive debugging on unknown errors.
         self._debug = debug
+        # Name of the secret key used to sign NAR information. Optional.
+        self._secret_key_name = secret_key_name
+        # Contents of the secret key to sign NAR information. Optional.
+        if secret_key is not None and \
+                len(secret_key) != crypto_sign_SECRETKEYBYTES:
+            raise ValueError("Secret key must be length {}"
+                             .format(crypto_sign_SECRETKEYBYTES))
+        self._secret_key = secret_key
+        if (secret_key is None) != (secret_key_name is None):
+            raise ValueError("Either both or neither of secret_key_name and "
+                             "secret_key must be supplied")
+
+
         # Test connect to the nix database; if successful, then we
         # will use a direct connection to the database rather than
         # using nix-store. This is much faster, but is unavailable on
@@ -84,6 +104,22 @@ class NixServer(Flask):
             logging.warn("Couldn't connect to the database ({}). Can't "
                          "operate in direct-database mode :(".format(err))
             self._db_con = None
+
+    @classmethod
+    def from_secret_key_file(cls, secret_key_file_path, **kwargs):
+        """Given the path to a secret key file, read the file to set
+        secret key name and secret key.
+
+        :param secret_key_file_path: Path to a file containing secret key info.
+        :type secret_key_file_path: ``str``
+        :param kwargs: Arguments to be passed to the __init__ function.
+        :type kwargs: ``dict``
+
+        :return: A nix repo server object.
+        :rtype: :py:class:`NixServer`
+        """
+        key_name, key = parse_secret_key_file(secret_key_file_path)
+        return cls(secret_key_name=key_name, secret_key=key, **kwargs)
 
     def store_path_from_hash(self, store_object_hash):
         """Look up a store path using its hash.
@@ -238,7 +274,11 @@ class NixServer(Flask):
                 raise ClientError("Hash {} must match {}"
                                   .format(obj_hash, _HASH_REGEX.pattern), 400)
             store_path = self.store_path_from_hash(obj_hash)
-            narinfo = NarInfo.from_store_path(store_path)
+            narinfo = NarInfo.from_store_path(
+                store_path,
+                compression_type=self._compression_type,
+                secret_key_name=self._secret_key_name,
+                secret_key=self._secret_key)
             return make_response((narinfo.to_string(), 200,
                                  {"Content-Type": "application/octet-stream"}))
 

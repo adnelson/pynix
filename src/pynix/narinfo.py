@@ -1,11 +1,12 @@
 """A python embedding of a NarInfo object."""
+import base64
 from io import BytesIO
 import os
 from os.path import join, basename, dirname
 import yaml
 from subprocess import check_output
 
-from pysodium import (crypto_sign_SECRETKEYBYTES, crypto_sign_detached)
+from pysodium import crypto_sign_detached, crypto_sign_SECRETKEYBYTES
 
 from pynix.utils import decode_str, strip_output, find_nix_paths, query_store
 from pynix.exceptions import NoNarGenerated
@@ -29,7 +30,9 @@ class NarInfo(object):
 
     def __init__(self, store_path, url, compression,
                  nar_size, nar_hash, file_size, file_hash,
-                 references, deriver):
+                 references, deriver,
+                 secret_key_name=None,
+                 secret_key=None):
         """Initializer.
 
         :param url: The URL at which this NAR can be fetched.
@@ -51,6 +54,13 @@ class NarInfo(object):
         :type references: ``list`` of ``str``
         :param deriver: Path to the derivation used to build path (optional).
         :type deriver: ``str`` or ``NoneType``
+        :param secret_key_name: Name of a secret key to use to sign
+                                requests. Optional, but must be
+                                supplied if secret_key is supplied.
+        :type secret_key_name: ``str`` or ``NoneType``
+        :param secret_key: Secret key to use to sign requests. Optional, but
+                           must be supplied if secret_key_name is supplied.
+        :type secret_key: ``bytes`` or ``NoneType``
         """
         self.url = url
         self.store_path = store_path
@@ -59,8 +69,13 @@ class NarInfo(object):
         self.nar_hash = nar_hash
         self.file_size = file_size
         self.file_hash = file_hash
-        self.references = [basename(r) for r in references]
+        self.references = list(sorted(basename(r) for r in references))
         self.deriver = deriver if deriver is None else basename(deriver)
+        self.secret_key_name = secret_key_name
+        self.secret_key = secret_key
+        if (secret_key is None) != (secret_key_name is None):
+            raise ValueError("Either both or neither of secret_key_name and "
+                             "secret_key must be supplied")
 
     def __repr__(self):
         return "NarInfo({})".format(self.store_path)
@@ -81,18 +96,20 @@ class NarInfo(object):
             "FileSize": self.file_size,
             "FileHash": self.file_hash,
             "References": self.references,
-            "Deriver": self.deriver
         }
         if self.deriver is not None:
             result["Deriver"] = self.deriver
+        if self.secret_key_name is not None:
+            sig = self.signature()
+            result["Sig"] = "{}:{}".format(
+                self.secret_key_name,
+                base64.b64encode(sig).decode("utf-8"))
         return result
 
     def to_string(self):
         """Generate a string representation."""
         as_dict = self.as_dict()
         as_dict["References"] = " ".join(as_dict["References"])
-        if as_dict["Deriver"] is None:
-            del as_dict["Deriver"]
         return "\n".join("{}: {}".format(k, v) for k, v in as_dict.items())
 
     def abspath_of(self, path):
@@ -141,11 +158,14 @@ class NarInfo(object):
                          references=self.abs_references,
                          deriver=self.abs_deriver)
 
-    def signature(self, secret_key):
+    def signature(self):
         """Compute a signature for a store path.
 
         Start by computing a fingerprint containing the store path, the base-32
         SHA256 hash of the contents of the path, and the references.
+
+        :param secret_key: The key to be used to sign the fingerprint.
+        :type secret_key: ``bytes``
 
         :return: A string which can be put in a narinfo signature.
         :rtype: ``str``
@@ -153,15 +173,11 @@ class NarInfo(object):
         # Hash must be a sha256 hash, encoded in base-32.
         if not self.nar_hash.startswith("sha256:"):
             raise ValueError("Hash must be sha256 to compute a signature.")
-        elif len(nar_hash) != 59:
+        elif len(self.nar_hash) != 59:
             raise ValueError("Hash must be encoded in base-32 (length 59)")
-        elif len(secret_key) != crypto_sign_SECRETKEYBYTES:
-            raise ValueError("Secret key must be length {}"
-                             .format(crypto_sign_SECRETKEYBYTES))
         fingerprint = ";".join([self.store_path, self.nar_hash, self.nar_size,
-                                ",".join(self.abs_references)])
-        sig = crypto_sign_detached(fingerprint, secret_key)
-        return sig
+                                ",".join(self.abs_references)]).encode("utf-8")
+        return crypto_sign_detached(fingerprint, self.secret_key)
 
     @classmethod
     def from_dict(cls, dictionary):
@@ -238,12 +254,21 @@ class NarInfo(object):
         raise NoNarGenerated(compressed_path, nar_extension)
 
     @classmethod
-    def from_store_path(cls, store_path, compression_type="xz"):
+    def from_store_path(cls, store_path, compression_type="xz",
+                        secret_key_name=None,
+                        secret_key=None):
         """Load a narinfo from a store path.
 
         :param store_path: Path in the nix store to load info on.
         :type store_path: ``str``
         :param compression_type: What type of compression to use on the NAR.
+        :param secret_key_name: Name of a secret key to use to sign
+                                requests. Optional, but must be
+                                supplied if secret_key is supplied.
+        :type secret_key_name: ``str`` or ``NoneType``
+        :param secret_key: Secret key to use to sign requests. Optional, but
+                           must be supplied if secret_key_name is supplied.
+        :type secret_key: ``bytes`` or ``NoneType``
 
         :return: A NarInfo for the path.
         :rtype: :py:class:`NarInfo`
@@ -271,11 +296,12 @@ class NarInfo(object):
             file_size=str(file_size),
             file_hash="sha256:{}".format(file_hash),
             references=references,
-            deriver=None if deriver == "unknown-deriver" else deriver
+            deriver=None if deriver == "unknown-deriver" else deriver,
+            secret_key_name=secret_key_name,
+            secret_key=secret_key
         )
         cls.NARINFO_CACHE[compression_type][store_path] = narinfo
         return narinfo
-
 
 
 class NarExport(object):

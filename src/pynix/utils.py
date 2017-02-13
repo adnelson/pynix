@@ -1,7 +1,10 @@
 """Some utility functions to support store operations."""
+import base64
 import os
 from os.path import exists, join, dirname, isdir
 from subprocess import check_output, PIPE, Popen
+
+from pysodium import crypto_sign_SECRETKEYBYTES
 
 def decode_str(string):
     """Convert a bytestring to a string. Is a no-op for strings.
@@ -106,6 +109,31 @@ def query_store(store_path, query, hide_stderr=False, nix_bin_path=None):
     command = [nix_store, "-q", query, store_path]
     result = strip_output(command, shell=False, hide_stderr=hide_stderr)
     return result
+
+def parse_secret_key_file(path):
+    """Given path to a secret key file, return a key name and secret key.
+
+    :param path: Path to a secret key file.
+    :type path: ``str``
+
+    :return: A secret key name, and secret key contents.
+    :rtype: (``str``, ``bytes``)
+    """
+    with open(path, "rb") as f:
+        contents_split = f.read().strip().split(b":")
+    if len(contents_split) != 2:
+        raise ValueError("Secret key file {} has invalid contents. "
+                         "Should contain a key name and base64-"
+                         "encoded key separated by ':'")
+    secret_key_name, secret_key_b64 = contents_split
+    secret_key_name = secret_key_name.decode("utf-8")
+    secret_key = base64.b64decode(secret_key_b64)
+    if secret_key is not None and \
+            len(secret_key) != crypto_sign_SECRETKEYBYTES:
+        raise ValueError("Secret key must be length {}"
+                         .format(crypto_sign_SECRETKEYBYTES))
+    return secret_key_name, secret_key
+
 
 def decompress(program, data):
     """Decompresses the given data by via the given program."""
