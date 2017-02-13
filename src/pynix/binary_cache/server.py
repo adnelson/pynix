@@ -27,7 +27,7 @@ from pysodium import crypto_sign_SECRETKEYBYTES
 import six
 
 from pynix import __version__
-from pynix.utils import (decode_str, strip_output, decompress,
+from pynix.utils import (decode_str, decompress, GZIP,
                          parse_secret_key_file, query_store,
                          NIX_STORE_PATH, NIX_STATE_PATH, NIX_BIN_PATH)
 from pynix.narinfo import NarInfo
@@ -329,7 +329,7 @@ class NixServer(Flask):
             if content_type in (None, "", "application/octet-stream"):
                 data = request.data
             elif content_type == "application/x-gzip":
-                data = decompress("gzip -d", request.data)
+                data = decompress(GZIP, request.data)
             else:
                 msg = "Unsupported content type '{}'".format(content_type)
                 raise ClientError(msg)

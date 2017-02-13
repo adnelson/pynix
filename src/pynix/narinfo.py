@@ -8,6 +8,7 @@ from subprocess import check_output
 
 from pysodium import crypto_sign_detached, crypto_sign_SECRETKEYBYTES
 
+from pynix import utils
 from pynix.utils import decode_str, strip_output, NIX_BIN_PATH, query_store
 from pynix.exceptions import NoNarGenerated
 
@@ -226,10 +227,8 @@ class NarInfo(object):
             "})"])
 
         # Nix-build this expression, resulting in a store object.
-        compressed_path = strip_output([
-            join(NIX_BIN_PATH, "nix-build"),
-            "--expr", nar_expr, "--no-out-link"
-        ], shell=False)
+        compressed_path = strip_output(
+            [utils.NIX_BUILD, "--expr", nar_expr, "--no-out-link"])
 
         # This path will contain a compressed file; return its path.
         extension = ".nar." + ("bz2" if compression_type == "bzip2" else "xz")
@@ -268,10 +267,10 @@ class NarInfo(object):
 
         # Build the compressed version. Compute its hash and size.
         nar_path = cls.build_nar(store_path, compression_type=compression_type)
-        du = strip_output("du -sb {}".format(nar_path))
+        du = strip_output([utils.DU, "-sb", nar_path])
         file_size = int(du.split()[0])
-        file_hash = strip_output("nix-hash --type sha256 --base32 --flat {}"
-                                 .format(nar_path))
+        file_hash = strip_output([utils.NIX_HASH, "--type", "sha256",
+                                  "--base32", "--flat", nar_path])
         nar_size = query_store(store_path, "--size")
         nar_hash = query_store(store_path, "--hash")
         references = query_store(store_path, "--references").split()

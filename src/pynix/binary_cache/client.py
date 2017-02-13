@@ -31,7 +31,7 @@ import time
 import requests
 import six
 
-from pynix import __version__
+from pynix import __version__, utils
 from pynix.utils import (strip_output, nixpaths, decode_str, decompress,
                          NIX_STORE_PATH, NIX_STATE_PATH, NIX_BIN_PATH)
 from pynix.exceptions import CouldNotConnect, NixImportFailed
@@ -49,8 +49,7 @@ SHOW_PATHS_LIMIT = int(os.environ.get("SHOW_PATHS_LIMIT", 25))
 class NixCacheClient(object):
     """Wraps some state for sending store objects."""
     def __init__(self, endpoint, dry_run=False, username=None,
-                 password=None, cache_location=None, cache_enabled=True,
-                 nix_bin_path=None, nix_state_path=None, nix_store_path=None):
+                 password=None, cache_location=None, cache_enabled=True):
         #: Server running servenix (string).
         self._endpoint = endpoint
         #: Base name of server (for caching).
@@ -217,8 +216,9 @@ class NixCacheClient(object):
                         if path != basename(path)]
             # If it's not in the cache, try asking nix-store for it.
             try:
-                refs = strip_output("nix-store --query --references {}"
-                                    .format(path), hide_stderr=query_server)
+                refs = strip_output([utils.NIX_STORE, "--query",
+                                     "--references", path],
+                                    hide_stderr=query_server)
                 refs = [r for r in refs.split() if r != path]
             # If nix-store gives an error and server querying is
             # enabled, query the binary cache.
@@ -419,11 +419,11 @@ class NixCacheClient(object):
         # possible with current requests, or indeed possible in
         # general without knowing the file size.
         auth = self._get_auth()
-        export = check_output("nix-store --export {}".format(path), shell=True)
+        export = check_output([utils.NIX_STORE, "--export", path])
         # For large files, show progress when compressing
         if len(export) > 1000000:
             logging.info("Compressing {}".format(basename(path)))
-            cmd = "pv -ptef -s {} | gzip".format(len(export))
+            cmd = "{} -ptef -s {} | gzip".format(utils.PV, len(export))
             proc = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE)
             data = proc.communicate(input=export)[0]
         else:
@@ -533,11 +533,11 @@ class NixCacheClient(object):
 
         # Figure out how to extract the content.
         if narinfo.compression.lower() in ("xz", "xzip"):
-            data = decompress("xz -d", response.content)
+            data = decompress(utils.XZ, response.content)
         elif narinfo.compression.lower() in ("bz2", "bzip2"):
-            data = decompress("bzip2 -d", response.content)
+            data = decompress(utils.BZIP2, response.content)
         elif narinfo.compression.lower() in ("gzip", "gz"):
-            data = decompress("gzip -d", response.content)
+            data = decompress(utils.GZIP, response.content)
         else:
             raise ValueError("Unsupported narinfo compression type {}"
                              .format(narinfo.compression))
@@ -636,12 +636,6 @@ def _get_args():
         subparser.add_argument("-u", "--username",
             default=os.environ.get("NIX_BINARY_CACHE_USERNAME"),
             help="User to authenticate to the cache as.")
-        subparser.add_argument("--nix-state-path",
-                               help="Location of nix state directory.")
-        subparser.add_argument("--nix-store-path",
-                               help="Location of nix store directory.")
-        subparser.add_argument("--nix-bin-path",
-                               help="Location of nix binary directory.")
         subparser.add_argument("-D", "--dry-run", action="store_true",
                                default=False,
                                help="If true, reports which paths would "
@@ -667,8 +661,6 @@ def main():
     for name in ("requests", "urllib", "urllib2", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
     client = NixCacheClient(
-        nix_bin_path=args.nix_bin_path, nix_state_path=args.nix_state_path,
-        nix_store_path=args.nix_store_path,
         endpoint=args.endpoint, dry_run=args.dry_run, username=args.username)
     if args.command == "send":
         client.send_objects(args.paths)

@@ -53,9 +53,9 @@ pythonPackages.buildPythonPackage {
   propagatedBuildInputs = [
     pkgs.coreutils
     pkgs.gzip
-    pkgs.nix.out
+    pkgs.xz
+    pkgs.nix
     pkgs.pv
-    pkgs.which
     pythonPackages.flask
     pythonPackages.requests2
     pythonPackages.ipdb
@@ -67,7 +67,23 @@ pythonPackages.buildPythonPackage {
   src = ./.;
   postInstall = writePaths;
   passthru = {inherit pythonPackages;} // passthru;
-  makeWrapperArgs = [
-    "--set NIX_BIN_PATH ${pkgs.lib.makeBinPath [pkgs.nix]}"
-  ];
+  # Hard-code a bunch of paths so that they can be called even when
+  # the library is imported.
+  patchPhase = let
+    mkPath = deriv: bin: "${pkgs.lib.makeBinPath [deriv]}/${bin}";
+    utils = "src/pynix/utils.py";
+    fixpath = deriv: bin: let bpath = mkPath deriv bin; in ''
+      if ! [[ -x ${bpath} ]]; then
+        echo "Invalid binary path for ${bin}: ${bpath}"
+        exit 1
+      fi
+      sed -i 's,strip_output("type -p ${bin}"),"${bpath}",' ${utils}
+    '';
+  in ''
+    ${fixpath pkgs.gzip "gzip"}
+    ${fixpath pkgs.bzip2 "bzip2"}
+    ${fixpath pkgs.xz "xz"}
+    ${fixpath pkgs.pv "pv"}
+    ${fixpath pkgs.coreutils "du"}
+  '';
 }

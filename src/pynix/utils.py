@@ -28,13 +28,11 @@ def decode_str(string):
     else:
         return string
 
-def strip_output(command, shell=True, input=None, hide_stderr=False):
+def strip_output(command, input=None, hide_stderr=False):
     """Execute a bash command, and return its stripped output.
 
     :param command: A command, either a string or list.
     :type command: ``str`` or ``list`` of ``str``
-    :param shell: Execute the command as a shell command.
-    :type shell: ``bool``
     :param input: If specified, text to send to the process stdin.
     :type input: ``str`` or ``NoneType``
     :param hide_stderr: If true, stderr will be hidden.
@@ -43,7 +41,7 @@ def strip_output(command, shell=True, input=None, hide_stderr=False):
     :return: The resulting stdout, stripped of trailing whitespace.
     :rtype: ``str``
     """
-    kwargs = {"shell": shell}
+    kwargs = {"shell": isinstance(command, str)}
     if hide_stderr is True:
         kwargs["stderr"] = PIPE
     if input is not None:
@@ -115,9 +113,21 @@ def parse_secret_key_file(path):
 
 def decompress(program, data):
     """Decompresses the given data by via the given program."""
-    proc = Popen(program, stdin=PIPE, stdout=PIPE, shell=True)
+    proc = Popen([program, "-d"], stdin=PIPE, stdout=PIPE)
     out = proc.communicate(input=data)[0]
     if proc.wait() != 0:
         raise ServerError("Decompression with '{}' failed"
                           .format(program))
     return out
+
+# Some paths to binaries that the library wants to call. If any of
+# these are not available, instantiation of this module will fail.
+GZIP = strip_output("type -p gzip")
+BZIP2 = strip_output("type -p bzip2")
+XZ = strip_output("type -p xz")
+PV = strip_output("type -p pv")
+DU = strip_output("type -p du")
+NIX_STORE = join(NIX_BIN_PATH, "nix-store")
+NIX_BUILD = join(NIX_BIN_PATH, "nix-build")
+NIX_ENV = join(NIX_BIN_PATH, "nix-env")
+NIX_HASH = join(NIX_BIN_PATH, "nix-env")
