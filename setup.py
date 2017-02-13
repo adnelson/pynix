@@ -13,6 +13,7 @@ setuptools.setup(
     packages=setuptools.find_packages("src"),
     provides=setuptools.find_packages("src"),
     install_requires=open("requirements.txt").readlines(),
+    test_suite="pynix.tests",
     entry_points={
         "console_scripts": [
             "servenix = pynix.binary_cache.server:main",

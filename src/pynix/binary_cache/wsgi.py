@@ -19,8 +19,6 @@ elif secret_key_file is not None and public_key_file is not None:
         public_key_file=public_key_file)
 else:
     key_info = None
-nixserver = NixServer(compression_type=compression_type,
-                      debug=debug, direct_db=direct_db,
-                      key_info=key_info)
+nixserver = NixServer(compression_type=compression_type, key_info=key_info)
 
 app = nixserver.make_app()

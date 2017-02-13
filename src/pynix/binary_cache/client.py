@@ -32,7 +32,7 @@ import requests
 import six
 
 from pynix import __version__, utils
-from pynix.utils import (strip_output, nixpaths, decode_str, decompress,
+from pynix.utils import (strip_output, decode_str, decompress,
                          NIX_STORE_PATH, NIX_STATE_PATH, NIX_BIN_PATH)
 from pynix.exceptions import CouldNotConnect, NixImportFailed
 from pynix.narinfo import NarInfo

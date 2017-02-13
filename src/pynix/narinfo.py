@@ -9,7 +9,8 @@ from subprocess import check_output
 from pysodium import crypto_sign_detached, crypto_sign_SECRETKEYBYTES
 
 from pynix import utils
-from pynix.utils import decode_str, strip_output, NIX_BIN_PATH, query_store
+from pynix.utils import (decode_str, strip_output, NIX_BIN_PATH, query_store,
+                         KeyInfo)
 from pynix.exceptions import NoNarGenerated
 
 # Magic 8-byte number that comes at the beginning of the export's bytes.
@@ -28,9 +29,7 @@ class NarInfo(object):
 
     def __init__(self, store_path, url, compression,
                  nar_size, nar_hash, file_size, file_hash,
-                 references, deriver, key_info=None,
-                 secret_key_name=None,
-                 secret_key=None):
+                 references, deriver, key_info=None):
         """Initializer.
 
         :param url: The URL at which this NAR can be fetched.
@@ -52,13 +51,8 @@ class NarInfo(object):
         :type references: ``list`` of ``str``
         :param deriver: Path to the derivation used to build path (optional).
         :type deriver: ``str`` or ``NoneType``
-        :param secret_key_name: Name of a secret key to use to sign
-                                requests. Optional, but must be
-                                supplied if secret_key is supplied.
-        :type secret_key_name: ``str`` or ``NoneType``
-        :param secret_key: Secret key to use to sign requests. Optional, but
-                           must be supplied if secret_key_name is supplied.
-        :type secret_key: ``bytes`` or ``NoneType``
+        :param key_info: Information about secret keys, for signatures.
+        :type key_info: :py:class:`KeyInfo` or ``NoneType``
         """
         # We require a particular nar_hash.
         if not nar_hash.startswith("sha256:"):
@@ -75,17 +69,19 @@ class NarInfo(object):
         self.file_hash = file_hash
         self.references = list(sorted(basename(r) for r in references))
         self.deriver = deriver if deriver is None else basename(deriver)
-        self._key_info = key_info
+        self.set_key_info(key_info)
 
-        # Compute signature if we have a key.
-        if key_info is not None:
+    def set_key_info(self, key_info):
+        """Set the key info on the narinfo, and update the signature."""
+        self._key_info = key_info
+        if self._key_info is None:
+            self.signature = None
+        else:
             fingerprint = ";".join(
                 [self.store_path, self.nar_hash, self.nar_size,
                  ",".join(self.abs_references)]).encode("utf-8")
             self.signature = crypto_sign_detached(fingerprint,
                                                   key_info.secret_key)
-        else:
-            self.signature = None
 
     def __repr__(self):
         return "NarInfo({})".format(self.store_path)
@@ -240,27 +236,23 @@ class NarInfo(object):
         raise NoNarGenerated(compressed_path, nar_extension)
 
     @classmethod
-    def from_store_path(cls, store_path, compression_type="xz",
-                        secret_key_name=None,
-                        secret_key=None):
+    def from_store_path(cls, store_path, compression_type="xz", key_info=None):
         """Load a narinfo from a store path.
 
         :param store_path: Path in the nix store to load info on.
         :type store_path: ``str``
         :param compression_type: What type of compression to use on the NAR.
-        :param secret_key_name: Name of a secret key to use to sign
-                                requests. Optional, but must be
-                                supplied if secret_key is supplied.
-        :type secret_key_name: ``str`` or ``NoneType``
-        :param secret_key: Secret key to use to sign requests. Optional, but
-                           must be supplied if secret_key_name is supplied.
-        :type secret_key: ``bytes`` or ``NoneType``
+        :param key_info: Information about secret keys, for signatures.
+        :type key_info: :py:class:`KeyInfo` or ``NoneType``
 
         :return: A NarInfo for the path.
         :rtype: :py:class:`NarInfo`
         """
         if store_path in cls.NARINFO_CACHE[compression_type]:
-            return cls.NARINFO_CACHE[compression_type][store_path]
+            # Make sure it has up-to-date key info.
+            result = cls.NARINFO_CACHE[compression_type][store_path]
+            result.set_key_info(key_info)
+            return result
 
         # Build the compressed version. Compute its hash and size.
         nar_path = cls.build_nar(store_path, compression_type=compression_type)
@@ -283,8 +275,7 @@ class NarInfo(object):
             file_hash="sha256:{}".format(file_hash),
             references=references,
             deriver=None if deriver == "unknown-deriver" else deriver,
-            secret_key_name=secret_key_name,
-            secret_key=secret_key
+            key_info=key_info,
         )
         cls.NARINFO_CACHE[compression_type][store_path] = narinfo
         return narinfo

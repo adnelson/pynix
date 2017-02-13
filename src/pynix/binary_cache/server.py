@@ -241,8 +241,7 @@ class NixServer(Flask):
             narinfo = NarInfo.from_store_path(
                 store_path,
                 compression_type=self._compression_type,
-                secret_key_name=self._secret_key_name,
-                secret_key=self._secret_key)
+                key_info=self._key_info)
             return make_response((narinfo.to_string(), 200,
                                  {"Content-Type": "application/octet-stream"}))
 

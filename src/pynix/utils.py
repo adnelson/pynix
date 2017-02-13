@@ -69,6 +69,18 @@ NIX_STATE_PATH = getenv("NIX_STATE_PATH", join(dirname(NIX_STORE_PATH), "var"))
 assert isdir(NIX_STATE_PATH), \
     "Nix state directory {} doesn't exist".format(NIX_STATE_PATH)
 
+# Some paths to binaries that the library wants to call. If any of
+# these are not available, instantiation of this module will fail.
+GZIP = strip_output("type -p gzip")
+BZIP2 = strip_output("type -p bzip2")
+XZ = strip_output("type -p xz")
+PV = strip_output("type -p pv")
+DU = strip_output("type -p du")
+NIX_STORE = join(NIX_BIN_PATH, "nix-store")
+NIX_BUILD = join(NIX_BIN_PATH, "nix-build")
+NIX_ENV = join(NIX_BIN_PATH, "nix-env")
+NIX_HASH = join(NIX_BIN_PATH, "nix-hash")
+
 def query_store(store_path, query, hide_stderr=False):
     """Given a query (e.g. --hash or --size), perform the query.
 
@@ -82,9 +94,8 @@ def query_store(store_path, query, hide_stderr=False):
     :return: The result of the query.
     :rtype: ``str``
     """
-    nix_store = join(NIX_BIN_PATH, "nix-store")
-    command = [nix_store, "-q", query, store_path]
-    result = strip_output(command, shell=False, hide_stderr=hide_stderr)
+    command = [NIX_STORE, "-q", query, store_path]
+    result = strip_output(command, hide_stderr=hide_stderr)
     return result
 
 def parse_key_file(path):
@@ -151,15 +162,3 @@ def decompress(program, data):
         raise ServerError("Decompression with '{}' failed"
                           .format(program))
     return out
-
-# Some paths to binaries that the library wants to call. If any of
-# these are not available, instantiation of this module will fail.
-GZIP = strip_output("type -p gzip")
-BZIP2 = strip_output("type -p bzip2")
-XZ = strip_output("type -p xz")
-PV = strip_output("type -p pv")
-DU = strip_output("type -p du")
-NIX_STORE = join(NIX_BIN_PATH, "nix-store")
-NIX_BUILD = join(NIX_BIN_PATH, "nix-build")
-NIX_ENV = join(NIX_BIN_PATH, "nix-env")
-NIX_HASH = join(NIX_BIN_PATH, "nix-env")
