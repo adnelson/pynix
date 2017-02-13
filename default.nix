@@ -47,7 +47,7 @@ let
   '';
 in
 
-pythonPackages.buildPythonPackage rec {
+pythonPackages.buildPythonPackage {
   name = "pynix-${version}";
   buildInputs = [pythonPackages.ipython];
   propagatedBuildInputs = [
@@ -68,6 +68,6 @@ pythonPackages.buildPythonPackage rec {
   postInstall = writePaths;
   passthru = {inherit pythonPackages;} // passthru;
   makeWrapperArgs = [
-    "--set NIX_BIN_PATH ${pkgs.lib.makeBinPath [pkgs.nix.out]}"
+    "--set NIX_BIN_PATH ${pkgs.lib.makeBinPath [pkgs.nix]}"
   ];
 }
