@@ -32,8 +32,8 @@ import requests
 import six
 
 from pynix import __version__
-from pynix.utils import (strip_output, nixpaths, decode_str,
-                                decompress)
+from pynix.utils import (strip_output, nixpaths, decode_str, decompress,
+                         NIX_STORE_PATH, NIX_STATE_PATH, NIX_BIN_PATH)
 from pynix.exceptions import CouldNotConnect, NixImportFailed
 from pynix.narinfo import NarInfo
 
@@ -93,15 +93,11 @@ class NixCacheClient(object):
         if not isdir(NIX_PATH_CACHE):
             return {}
         logging.debug("Loading path cache...", file=sys.stderr)
-        store = nixpaths.nix_store_path
-        # path_cache = {}
         for store_path in os.listdir(NIX_PATH_CACHE):
             refs_dir = join(NIX_PATH_CACHE, store_path)
-            refs = [join(store, path) for path in os.listdir(refs_dir)
+            refs = [join(NIX_STORE_PATH, path) for path in os.listdir(refs_dir)
                     if path != store_path]
-            self._path_references[join(store, store_path)] = refs
-        # logging.debug("Loaded references of {} paths".format(len(path_cache)))
-        # return path_cache
+            self._path_references[join(NIX_STORE_PATH, store_path)] = refs
 
     def _update_narinfo_cache(self, narinfo, write_to_disk):
         """Write a narinfo entry to the cache.
@@ -285,7 +281,7 @@ class NixCacheClient(object):
         Side effects:
         * Adds 0 or more paths to `self._objects_on_server`.
         """
-        paths = [os.path.join(nixpaths.nix_store_path, p) for p in paths]
+        paths = [os.path.join(NIX_STORE_PATH, p) for p in paths]
         total = len(paths)
         step = max(total // 10, 1)
         full_path_set = set()
@@ -547,7 +543,7 @@ class NixCacheClient(object):
                              .format(narinfo.compression))
         # Once extracted, convert it into a nix export object and pass
         # it into the nix-store --import command.
-        proc = Popen([join(nixpaths.nix_bin_path, "nix-store"), "--import"],
+        proc = Popen([join(NIX_BIN_PATH, "nix-store"), "--import"],
                      stdin=PIPE, stderr=PIPE, stdout=PIPE)
         export = narinfo.nar_to_export(data)
         out, err = proc.communicate(input=export.to_bytes())
@@ -567,7 +563,7 @@ class NixCacheClient(object):
         try:
             while True:
                 # Parse the timestamp of the nix store into a datetime
-                stamp = datetime.fromtimestamp(getmtime(nixpaths.nix_store_path))
+                stamp = datetime.fromtimestamp(getmtime(NIX_STORE_PATH))
                 # If it's changed since last time, run a sync.
                 if stamp == prev_stamp:
                     logging.debug("Store hasn't updated since last check ({})"
@@ -599,8 +595,7 @@ class NixCacheClient(object):
         :param ignore: A list of regexes of objects to ignore.
         :type ignore: ``list`` of (``str`` or ``regex``)
         """
-        db_path = os.path.join(nixpaths.nix_state_path,
-                               "nix", "db", "db.sqlite")
+        db_path = os.path.join(NIX_STATE_PATH, "nix", "db", "db.sqlite")
         ignore = [re.compile(r) for r in ignore]
         paths = []
         with sqlite3.connect(db_path) as con:

@@ -8,7 +8,7 @@ from subprocess import check_output
 
 from pysodium import crypto_sign_detached, crypto_sign_SECRETKEYBYTES
 
-from pynix.utils import decode_str, strip_output, nixpaths
+from pynix.utils import decode_str, strip_output, NIX_BIN_PATH, query_store
 from pynix.exceptions import NoNarGenerated
 
 # Magic 8-byte number that comes at the beginning of the export's bytes.
@@ -227,7 +227,7 @@ class NarInfo(object):
 
         # Nix-build this expression, resulting in a store object.
         compressed_path = strip_output([
-            join(nixpaths.nix_bin_path, "nix-build"),
+            join(NIX_BIN_PATH, "nix-build"),
             "--expr", nar_expr, "--no-out-link"
         ], shell=False)
 
