@@ -27,7 +27,8 @@ from pysodium import crypto_sign_SECRETKEYBYTES
 import six
 
 from pynix import __version__
-from pynix.utils import decode_str, strip_output, find_nix_paths, decompress
+from pynix.utils import (decode_str, strip_output, nixpaths, decompress,
+                         parse_secret_key_file)
 from pynix.narinfo import NarInfo
 from pynix.exceptions import (NoSuchObject, NoNarGenerated,
                               BaseHTTPError, NixImportFailed,
@@ -35,38 +36,27 @@ from pynix.exceptions import (NoSuchObject, NoNarGenerated,
 
 _HASH_REGEX=re.compile(r"[a-z0-9]{32}")
 _PATH_REGEX=re.compile(r"([a-z0-9]{32})-[^' \n/]*$")
+# Matches valid nix store paths.
+_STORE_PATH_REGEX = re.compile(
+    join(nixpaths.nix_store_path, _PATH_REGEX.pattern))
 
 class NixServer(Flask):
     """Serves nix packages."""
     def __init__(self,
-                 nix_store_path=find_nix_paths()["nix_store_path"],
-                 nix_state_path=find_nix_paths()["nix_state_path"],
-                 nix_bin_path=find_nix_paths()["nix_bin_path"],
                  compression_type="xz",
                  debug=False,
                  secret_key_name=None,
                  secret_key=None):
-        # Path to the local nix store.
-        self._nix_store_path = nix_store_path
-        # Path to the local nix state directory.
-        self._nix_state_path = nix_state_path
-        # Path to the folder containing nix binaries.
-        self._nix_bin_path = nix_bin_path
-        # Matches valid nix store paths (local to this store)
-        self._full_store_path_regex = re.compile(
-            join(self._nix_store_path, _PATH_REGEX.pattern))
         self._compression_type = compression_type
         # Cache mapping object hashes to store paths.
         self._hashes_to_paths = {}
         # Cache mapping object hashes to store paths which have been validated.
         self._hashes_to_valid_paths = {}
-        # Cache mapping store paths to object info.
-        self._paths_to_info = {}
         # Set of known store paths.
         self._known_store_paths = set()
         # A static string telling a nix client what this store serves.
         self._cache_info = "\n".join([
-            "StoreDir: {}".format(self._nix_store_path),
+            "StoreDir: {}".format(nixpaths.nix_store_path),
             "WantMassQuery: 1",
             "Priority: 30"
         ]) + "\n"
@@ -94,7 +84,7 @@ class NixServer(Flask):
         # using nix-store. This is much faster, but is unavailable on
         # some systems.
         try:
-            db_path = join(nix_state_path, "nix", "db", "db.sqlite")
+            db_path = join(nixpaths.nix_state_path, "nix", "db", "db.sqlite")
             query = "select * from ValidPaths limit 1"
             db_con = sqlite3.connect(db_path)
             db_con.execute(query).fetchall()
@@ -104,22 +94,6 @@ class NixServer(Flask):
             logging.warn("Couldn't connect to the database ({}). Can't "
                          "operate in direct-database mode :(".format(err))
             self._db_con = None
-
-    @classmethod
-    def from_secret_key_file(cls, secret_key_file_path, **kwargs):
-        """Given the path to a secret key file, read the file to set
-        secret key name and secret key.
-
-        :param secret_key_file_path: Path to a file containing secret key info.
-        :type secret_key_file_path: ``str``
-        :param kwargs: Arguments to be passed to the __init__ function.
-        :type kwargs: ``dict``
-
-        :return: A nix repo server object.
-        :rtype: :py:class:`NixServer`
-        """
-        key_name, key = parse_secret_key_file(secret_key_file_path)
-        return cls(secret_key_name=key_name, secret_key=key, **kwargs)
 
     def store_path_from_hash(self, store_object_hash):
         """Look up a store path using its hash.
@@ -156,7 +130,7 @@ class NixServer(Flask):
             # If we have a direct database connection, use this to check
             # path existence.
             query = "select path from ValidPaths where path like ?"
-            path_prefix = join(self._nix_store_path, store_object_hash) + "%"
+            path_prefix = join(nixpaths.nix_store_path, store_object_hash) + "%"
             with self._db_con:
                 paths = self._db_con.execute(query, (path_prefix,)).fetchall()
             if len(paths) > 0:
@@ -167,11 +141,11 @@ class NixServer(Flask):
             # Get the list of store objects by listing the directory.
             # Iterate through them until a matching hash is found, or
             # we've exhausted all paths, in which case we error.
-            for path in map(decode_str, os.listdir(self._nix_store_path)):
+            for path in map(decode_str, os.listdir(nixpaths.nix_store_path)):
                 match = _PATH_REGEX.match(path)
                 if match is None:
                     continue
-                path = join(self._nix_store_path, path)
+                path = join(nixpaths.nix_store_path, path)
                 prefix = match.group(1)
                 # Add every path seen to the _hashes_to_paths cache.
                 self._hashes_to_paths[prefix] = path
@@ -219,29 +193,11 @@ class NixServer(Flask):
         else:
             # Otherwise we have to use the slower method :(
             try:
-                self.query_store(store_path, "--hash", hide_stderr=True)
+                nixpaths.query_store(store_path, "--hash", hide_stderr=True)
                 self._known_store_paths.add(store_path)
                 return True
             except CalledProcessError:
                 return False
-
-    def query_store(self, store_path, query, hide_stderr=False):
-        """Given a query (e.g. --hash or --size), perform the query.
-
-        :param store_path: The store path to query.
-        :type store_path: ``str``
-        :param query: The query to perform. Must be a valid nix-store query.
-        :type query: ``str``
-        :param hide_stderr: If true, stderr will be hidden.
-        :type hide_stderr: ``bool``
-
-        :return: The result of the query.
-        :rtype: ``str``
-        """
-        nix_store = join(self._nix_bin_path, "nix-store")
-        command = [nix_store, "-q", query, store_path]
-        result = strip_output(command, shell=False, hide_stderr=hide_stderr)
-        return result
 
     def make_app(self):
         """Create a flask app and set up routes on it.
@@ -324,12 +280,12 @@ class NixServer(Flask):
             # Validate that all paths match the path regex; this will make
             # the SQL query we build correct and safe.
             for path in paths:
-                match = self._full_store_path_regex.match(path)
+                match = _STORE_PATH_REGEX.match(path)
                 if match is None:
                     raise ClientError(
                         "Encountered invalid store path '{}': does not match "
                         "pattern '{}'"
-                        .format(path, self._full_store_path_regex.pattern))
+                        .format(path, _STORE_PATH_REGEX.pattern))
                 if self.check_in_store(path):
                     path_results[path] = True
                     found += 1
@@ -367,7 +323,7 @@ class NixServer(Flask):
             else:
                 msg = "Unsupported content type '{}'".format(content_type)
                 raise ClientError(msg)
-            proc = Popen([join(self._nix_bin_path, "nix-store"), "--import"],
+            proc = Popen([join(nixpaths.nix_bin_path, "nix-store"), "--import"],
                          stdin=PIPE, stderr=PIPE, stdout=PIPE)
             # Get the request data and send it to the subprocess.
             out, err = proc.communicate(input=data)
@@ -418,22 +374,28 @@ def _get_args():
     parser.add_argument("--debug", action="store_true", default=False,
                         help="Enable interactive debugging on unknown errors.")
     parser.add_argument("--log-level", help="Log messages level.",
-                        default="INFO", choices=("CRITICAL", "ERROR", "INFO",
-                                                 "WARNING", "DEBUG"))
+                        default=os.environ.get("LOG_LEVEL", "INFO"),
+                        choices=("CRITICAL", "ERROR", "INFO",
+                                 "WARNING", "DEBUG"))
+    parser.add_argument("--secret-key-file",
+                        help="Path to file containing secret key information.",
+                        default=os.environ.get("NIX_SECRET_KEY_FILE"))
     return parser.parse_args()
 
 
 def main():
     """Main entry point."""
-    nix_paths = find_nix_paths()
     args = _get_args()
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(message)s")
-    nixserver = NixServer(nix_store_path=nix_paths["nix_store_path"],
-                          nix_state_path=nix_paths["nix_state_path"],
-                          nix_bin_path=nix_paths["nix_bin_path"],
-                          compression_type=args.compression_type,
-                          debug=args.debug)
+    if args.secret_key_file is not None:
+        key_name, key = parse_secret_key_file(args.secret_key_file)
+    else:
+        key_name, key = None, None
+    nixserver = NixServer(compression_type=args.compression_type,
+                          debug=args.debug,
+                          secret_key_name=key_name,
+                          secret_key=key)
     app = nixserver.make_app()
     app.run(port=args.port, host=args.host)
 

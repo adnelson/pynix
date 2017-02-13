@@ -8,7 +8,7 @@ from subprocess import check_output
 
 from pysodium import crypto_sign_detached, crypto_sign_SECRETKEYBYTES
 
-from pynix.utils import decode_str, strip_output, find_nix_paths, query_store
+from pynix.utils import decode_str, strip_output, nixpaths
 from pynix.exceptions import NoNarGenerated
 
 # Magic 8-byte number that comes at the beginning of the export's bytes.
@@ -24,9 +24,6 @@ class NarInfo(object):
 
     # Cache of nar paths, indexed by compression type.
     NAR_CACHE = {"xz": {}, "bzip2": {}}
-
-    # Load up nix paths. These can be overwritten if they're wrong.
-    NIX_PATHS = find_nix_paths()
 
     def __init__(self, store_path, url, compression,
                  nar_size, nar_hash, file_size, file_hash,
@@ -62,6 +59,12 @@ class NarInfo(object):
                            must be supplied if secret_key_name is supplied.
         :type secret_key: ``bytes`` or ``NoneType``
         """
+        # We require a particular nar_hash.
+        if not nar_hash.startswith("sha256:"):
+            raise ValueError("NAR hash must be sha256.")
+        elif len(nar_hash) != 59:
+            raise ValueError("Hash must be encoded in base-32 (length 59)")
+
         self.url = url
         self.store_path = store_path
         self.compression = compression
@@ -73,9 +76,18 @@ class NarInfo(object):
         self.deriver = deriver if deriver is None else basename(deriver)
         self.secret_key_name = secret_key_name
         self.secret_key = secret_key
-        if (secret_key is None) != (secret_key_name is None):
-            raise ValueError("Either both or neither of secret_key_name and "
-                             "secret_key must be supplied")
+
+        # Compute signature if we have a secret key.
+        if secret_key is not None:
+            # Make sure there's a secret key name as well.
+            if secret_key_name is None:
+                raise ValueError("Must provide a secret key name.")
+            fingerprint = ";".join(
+                [self.store_path, self.nar_hash, self.nar_size,
+                 ",".join(self.abs_references)]).encode("utf-8")
+            self.signature = crypto_sign_detached(fingerprint, secret_key)
+        else:
+            self.signature = None
 
     def __repr__(self):
         return "NarInfo({})".format(self.store_path)
@@ -100,10 +112,9 @@ class NarInfo(object):
         if self.deriver is not None:
             result["Deriver"] = self.deriver
         if self.secret_key_name is not None:
-            sig = self.signature()
             result["Sig"] = "{}:{}".format(
                 self.secret_key_name,
-                base64.b64encode(sig).decode("utf-8"))
+                base64.b64encode(self.signature).decode("utf-8"))
         return result
 
     def to_string(self):
@@ -157,27 +168,6 @@ class NarInfo(object):
         return NarExport(self.store_path, nar_bytes=nar_bytes,
                          references=self.abs_references,
                          deriver=self.abs_deriver)
-
-    def signature(self):
-        """Compute a signature for a store path.
-
-        Start by computing a fingerprint containing the store path, the base-32
-        SHA256 hash of the contents of the path, and the references.
-
-        :param secret_key: The key to be used to sign the fingerprint.
-        :type secret_key: ``bytes``
-
-        :return: A string which can be put in a narinfo signature.
-        :rtype: ``str``
-        """
-        # Hash must be a sha256 hash, encoded in base-32.
-        if not self.nar_hash.startswith("sha256:"):
-            raise ValueError("Hash must be sha256 to compute a signature.")
-        elif len(self.nar_hash) != 59:
-            raise ValueError("Hash must be encoded in base-32 (length 59)")
-        fingerprint = ";".join([self.store_path, self.nar_hash, self.nar_size,
-                                ",".join(self.abs_references)]).encode("utf-8")
-        return crypto_sign_detached(fingerprint, self.secret_key)
 
     @classmethod
     def from_dict(cls, dictionary):
@@ -237,7 +227,7 @@ class NarInfo(object):
 
         # Nix-build this expression, resulting in a store object.
         compressed_path = strip_output([
-            join(cls.NIX_PATHS["nix_bin_path"], "nix-build"),
+            join(nixpaths.nix_bin_path, "nix-build"),
             "--expr", nar_expr, "--no-out-link"
         ], shell=False)
 
