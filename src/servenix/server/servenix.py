@@ -34,6 +34,9 @@ from servenix.common.exceptions import (NoSuchObject, NoNarGenerated,
 _HASH_REGEX=re.compile(r"[a-z0-9]{32}")
 _PATH_REGEX=re.compile(r"([a-z0-9]{32})-[^' \n/]*$")
 
+# The types of NAR compression supported by the server.
+COMPRESSION_TYPES = ("xz", "bzip2")
+
 class NixServer(Flask):
     """Serves nix packages."""
     def __init__(self, nix_store_path, nix_bin_path, nix_state_path,
@@ -47,6 +50,9 @@ class NixServer(Flask):
         # Matches valid nix store paths (local to this store)
         self._full_store_path_regex = re.compile(
             join(self._nix_store_path, _PATH_REGEX.pattern))
+        if compression_type not in COMPRESSION_TYPES:
+            raise ValueError("Invalid compression type: {}. Valid types are "
+                             + ", ".join(COMPRESSION_TYPES))
         self._compression_type = compression_type
         # Cache mapping object hashes to store paths.
         self._hashes_to_paths = {}
@@ -243,17 +249,22 @@ class NixServer(Flask):
         self._paths_to_info[store_path] = info
         return info
 
-    def build_nar(self, store_path):
+    def build_nar(self, store_path, compression_type=None, 
+                  nar_extension=None):
         """Build a nix archive (nar) and return the resulting path."""
         if isinstance(store_path, tuple):
             store_path = store_path[0]
+
+        if compression_type is None:
+            compression_type = self._compression_type
+            nar_extension = self._nar_extension
 
         # Construct a nix expression which will produce a nar.
         nar_expr = "".join([
             "(import <nix/nar.nix> {",
             'storePath = "{}";'.format(store_path),
             'hashAlgo = "sha256";',
-            'compressionType = "{}";'.format(self._compression_type),
+            'compressionType = "{}";'.format(compression_type),
             "})"])
 
         # Nix-build this expression, resulting in a store object.
@@ -265,11 +276,11 @@ class NixServer(Flask):
         # This path will contain a compressed file; return its path.
         contents = map(decode_str, os.listdir(compressed_path))
         for filename in contents:
-            if filename.endswith(self._nar_extension):
+            if filename.endswith(nar_extension):
                 return join(compressed_path, filename)
         # This might happen if we run out of disk space or something
         # else terrible.
-        raise NoNarGenerated(compressed_path, self._nar_extension)
+        raise NoNarGenerated(compressed_path, nar_extension)
 
     def make_app(self):
         """Create a flask app and set up routes on it.
@@ -313,9 +324,9 @@ class NixServer(Flask):
             return make_response((info_string, 200,
                                  {"Content-Type": "application/octet-stream"}))
 
-        @app.route("/nar/<obj_hash>{}".format(self._nar_extension))
-        def serve_nar(obj_hash):
-            """Return the compressed binary from the nix store.
+        @app.route("/nar/<obj_hash>.nar.xz")
+        def serve_nar_xz(obj_hash):
+            """Return the compressed binary from the nix store, in xz format.
 
             If the object isn't found, return a 404.
 
@@ -323,7 +334,20 @@ class NixServer(Flask):
             :type obj_hash: ``str``
             """
             store_path = self.store_path_from_hash(obj_hash)
-            nar_path = self.build_nar(store_path)
+            nar_path = self.build_nar(store_path, "xz", ".nar.xz")
+            return send_file(nar_path, mimetype="application/octet-stream")
+
+        @app.route("/nar/<obj_hash>.nar.bz2")
+        def serve_nar_bz2(obj_hash):
+            """Return the compressed binary from the nix store, in bz2 format.
+
+            If the object isn't found, return a 404.
+
+            :param obj_hash: First 32 characters of the object's store path.
+            :type obj_hash: ``str``
+            """
+            store_path = self.store_path_from_hash(obj_hash)
+            nar_path = self.build_nar(store_path, "bzip2", ".nar.bz2")
             return send_file(nar_path, mimetype="application/octet-stream")
 
         @app.route("/query-paths")
