@@ -104,7 +104,7 @@ def query_store(store_path, query, hide_stderr=False):
 
 def decompress(program, data):
     """Decompresses the given data by via the given program."""
-    proc = Popen(program, stdin=PIPE, stdout=PIPE)
+    proc = Popen(program, stdin=PIPE, stdout=PIPE, shell=True)
     out = proc.communicate(input=data)[0]
     if proc.wait() != 0:
         raise ServerError("Decompression with '{}' failed"
