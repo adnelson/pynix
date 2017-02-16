@@ -133,34 +133,3 @@ def parse_deriv_paths(paths):
         for output in outputs:
             result[deriv].add(output)
     return result
-
-
-def print_preview(paths, binary_cache, show_existing=False, show_outputs=False,
-                  numbers_only=True):
-    """Print the result of a `preview_build` operation."""
-    def print_set(action, s):
-        desc = "output" if show_outputs else "path"
-        if len(s) != 1:
-            desc += "s"
-        message = "{} {} {}".format(len(s), desc, action)
-        if len(s) > 0:
-            if numbers_only is True:
-                print(message + ".")
-            else:
-                print(message + ":")
-                for deriv, outs in s.items():
-                    if show_outputs is True:
-                        print("  {} -> {}"
-                              .format(basename(deriv.path), ", ".join(outs)))
-                    else:
-                        for out in outs:
-                            print("  " + basename(deriv.output_mapping[out]))
-        else:
-            print("No derivation outputs {}.".format(action))
-    needed, need_fetch = preview_build(paths, binary_cache)
-    if len(needed) == 0 and len(need_fetch) == 0:
-        print("All paths have already been built.")
-        return
-    print_set("need to be built", needed)
-    if binary_cache is not None:
-        print_set("will be fetched from {}".format(binary_cache), need_fetch)

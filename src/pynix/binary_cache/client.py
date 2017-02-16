@@ -10,7 +10,8 @@ from os.path import (join, exists, isdir, isfile, expanduser, basename,
                      getmtime)
 import re
 import shutil
-from subprocess import Popen, PIPE, check_output, CalledProcessError
+from subprocess import (Popen, PIPE, check_output, CalledProcessError,
+                        check_call)
 import sys
 import tempfile
 from threading import Thread
@@ -35,7 +36,8 @@ import six
 
 from pynix import __version__
 from pynix.utils import (strip_output, decode_str, decompress, NIX_BIN_PATH,
-                         NIX_STORE_PATH, NIX_STATE_PATH, NIX_DB_PATH, nix_cmd)
+                         NIX_STORE_PATH, NIX_STATE_PATH, NIX_DB_PATH, nix_cmd,
+                         query_store)
 from pynix.exceptions import CouldNotConnect, NixImportFailed
 from pynix.narinfo import NarInfo
 from pynix.build import needed_to_build_multi, parse_deriv_paths
@@ -202,7 +204,8 @@ class NixCacheClient(object):
     def get_references(self, path, query_server=False):
         """Get a path's direct references.
 
-        :param path: A nix store path. It must exist in the store.
+        :param path: A nix store path. It must either exist in the
+                     local nix store or be available in the binary cache.
         :type path: ``str``
         :param query_server: If true, will attempt to query the server
                              for the paths if not on disk. This is
@@ -225,8 +228,8 @@ class NixCacheClient(object):
                         if path != basename(path)]
             # If it's not in the cache, try asking nix-store for it.
             try:
-                refs = strip_output("nix-store --query --references {}"
-                                    .format(path), hide_stderr=query_server)
+                refs = query_store(path, "--references",
+                                   hide_stderr=query_server)
                 refs = [r for r in refs.split() if r != path]
             # If nix-store gives an error and server querying is
             # enabled, query the binary cache.
@@ -292,6 +295,7 @@ class NixCacheClient(object):
         else:
             logging.debug("{} does not have path {}"
                           .format(self._endpoint, path))
+        return has_path
 
     def query_path_closures(self, paths):
         """Given a list of paths, compute their whole closure and ask
@@ -633,25 +637,35 @@ class NixCacheClient(object):
         logging.info("Found {} paths in the store.".format(len(paths)))
         self.send_objects(paths)
 
-    def build_fetch(self, path, attributes):
-        command = nix_cmd("nix-instantiate", [path, "--no-gc-warning"])
+    def build_fetch(self, nix_file, attributes, dry_run=False, verbose=False):
+        command = nix_cmd("nix-instantiate", [nix_file, "--no-gc-warning"])
         for attr in attributes:
             command.append("-A")
             command.append(attr)
         print("Instantiating attribute{} {} from path {}"
               .format("s" if len(attributes) > 1 else "",
-                      ", ".join(attributes), path))
-        result_drvs = strip_output(command).split()
+                      ", ".join(attributes), nix_file))
+        deriv_paths = strip_output(command).split()
         print("Querying {} for which paths it has..."
               .format(self._endpoint))
-        self.print_preview(result_drvs)
+        need_to_build, need_to_fetch = self.preview_build(deriv_paths)
+        self.print_preview(need_to_build, need_to_fetch, verbose)
+        if dry_run is True:
+            return
+        for deriv, outputs in need_to_fetch.items():
+            for output in outputs:
+                path = deriv.output_mapping[output]
+                self.fetch_object(path)
+        # Build up the command for nix store to build the remaining paths.
+        cmd = nix_cmd("nix-store",
+                      ["--realise"] + [d.path for d in need_to_build])
+        check_call(cmd)
 
     def preview_build(self, paths):
-        """Given some derivation paths, generate three sets:
+        """Given some derivation paths, generate two sets:
 
         * Set of derivations which need to be built from scratch
         * Set of derivations which can be fetched from a binary cache
-        * Set of derivations which already exist.
 
         Of course, the second set will be empty if no binary cache is given.
         """
@@ -678,7 +692,7 @@ class NixCacheClient(object):
                 # If the request is asyncronous, resolve it here.
                 if isinstance(is_on_server, Future):
                     is_on_server = is_on_server.result()
-                if is_on_server is False:
+                if is_on_server is not True:
                     continue
                 deriv, out_name = path_mapping[path]
                 # First, remove these from the `needed` set, because
@@ -698,36 +712,29 @@ class NixCacheClient(object):
                                                            existing=existing)
         return needed, need_fetch
 
-    def print_preview(self, paths, show_existing=False, show_outputs=False,
-                      numbers_only=True):
+    def print_preview(self, need_to_build, need_to_fetch, verbose=False):
         """Print the result of a `preview_build` operation."""
         def print_set(action, s):
-            desc = "output" if show_outputs else "path"
+            desc = "derivation" if verbose else "path"
             if len(s) != 1:
                 desc += "s"
             message = "{} {} {}".format(len(s), desc, action)
             if len(s) > 0:
-                if numbers_only is True:
+                if verbose is False:
                     print(message + ".")
                 else:
                     print(message + ":")
                     for deriv, outs in s.items():
-                        if show_outputs is True:
-                            print("  {} -> {}"
-                                  .format(basename(deriv.path),
-                                          ", ".join(outs)))
-                        else:
-                            for out in outs:
-                                print("  " +
-                                      basename(deriv.output_mapping[out]))
+                        print("  {} -> {}".format(basename(deriv.path),
+                                                  ", ".join(outs)))
             else:
                 print("No derivation outputs {}.".format(action))
-        needed, need_fetch = self.preview_build(paths)
-        if len(needed) == 0 and len(need_fetch) == 0:
+        if len(need_to_build) == 0 and len(need_to_fetch) == 0:
             print("All paths have already been built.")
             return
-        print_set("need to be built", needed)
-        print_set("will be fetched from {}".format(self._endpoint), need_fetch)
+        print_set("need to be built", need_to_build)
+        print_set("will be fetched from {}"
+                  .format(self._endpoint), need_to_fetch)
 
 
 def _get_args():
@@ -753,6 +760,8 @@ def _get_args():
                        help="Base path to evaluate.")
     build.add_argument("attributes", nargs="*",
                        help="Expressions to evaluate.")
+    build.add_argument("--verbose", action="store_true", default=False,
+                       help="Show verbose output.")
     for subparser in (send, sync, daemon, fetch, build):
         subparser.add_argument("-e", "--endpoint",
                                default=os.environ.get("NIX_REPO_HTTP"),
@@ -773,7 +782,7 @@ def _get_args():
         subparser.add_argument("-D", "--dry-run", action="store_true",
                                default=False,
                                help="If true, reports which paths would "
-                                    "be sent.")
+                                    "be sent/fetched/built.")
     for subparser in (sync, daemon):
         subparser.add_argument("--ignore", nargs="*", default=[],
                                help="Regexes of store paths to ignore.")
@@ -806,6 +815,7 @@ def main():
         for path in args.paths:
             client.fetch_object(path)
     elif args.command == "build":
-        client.build_fetch(path=args.path, attributes=args.attributes)
+        client.build_fetch(nix_file=args.path, attributes=args.attributes,
+                           dry_run=args.dry_run, verbose=args.verbose)
     else:
         exit("Unknown command '{}'".format(args.command))

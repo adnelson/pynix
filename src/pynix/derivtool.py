@@ -5,7 +5,7 @@ import os
 import sys
 
 from pynix.derivation import Derivation
-from pynix.build import print_preview
+from pynix.binary_cache.client import NixCacheClient
 
 def get_args():
     """Parse command-line arguments."""
