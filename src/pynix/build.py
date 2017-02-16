@@ -4,7 +4,6 @@ import sys
 from os.path import exists, basename
 
 import requests
-from pynix.binary_cache.client import NixCacheClient
 from pynix.derivation import Derivation
 
 def needed_to_build(deriv, outputs=None, needed=None, need_fetch=None,
@@ -136,58 +135,7 @@ def parse_deriv_paths(paths):
     return result
 
 
-def preview_build(paths, binary_cache=None):
-    """Given some derivation paths, generate three sets:
-
-    * Set of derivations which need to be built from scratch
-    * Set of derivations which can be fetched from a binary cache
-    * Set of derivations which already exist.
-
-    Of course, the second set will be empty if no binary cache is given.
-    """
-    derivs_outs = parse_deriv_paths(paths)
-    existing = {}
-    # Run the first time with no on_server argument.
-    needed, need_fetch = needed_to_build_multi(derivs_outs, existing=existing)
-    if len(needed) > 0 and binary_cache is not None:
-        on_server = {}
-        client = NixCacheClient(endpoint=binary_cache)
-        # Query the server for missing paths. Start by trying a
-        # multi-query because it's faster; if the server doesn't
-        # implement that behavior then try individual queries.
-        paths_to_ask = []
-        # Make a dictionary mapping paths back to the
-        # derivations/outputs they came from.
-        path_mapping = {}
-        for deriv, outs in needed.items():
-            for out in outs:
-                path = deriv.output_mapping[out]
-                paths_to_ask.append(path)
-                path_mapping[path] = (deriv, out)
-        query_result = client.query_paths(paths_to_ask)
-        for path, is_on_server in query_result.items():
-            if is_on_server is False:
-                continue
-            deriv, out_name = path_mapping[path]
-            # First, remove these from the `needed` set, because
-            # we can fetch them from the server.
-            needed[deriv].remove(out_name)
-            if len(needed[deriv]) == 0:
-                del needed[deriv]
-            # Then add them to the `on_server` set.
-            if deriv not in on_server:
-                on_server[deriv] = set()
-            on_server[deriv].add(out_name)
-        if len(on_server) > 0:
-            # Run the check again, this time using the information
-            # collected from the server.
-            needed, need_fetch = needed_to_build_multi(derivs_outs,
-                                                       on_server=on_server,
-                                                       existing=existing)
-    return needed, need_fetch
-
-
-def print_preview(paths, binary_cache, show_existing, show_outputs,
+def print_preview(paths, binary_cache, show_existing=False, show_outputs=False,
                   numbers_only=True):
     """Print the result of a `preview_build` operation."""
     def print_set(action, s):

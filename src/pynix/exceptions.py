@@ -57,7 +57,6 @@ class CouldNotUpdateHash(ServerError):
                    .format(path, stored_hash, valid_hash, message))
         ServerError.__init__(self, message=message)
 
-
 class NixImportFailed(BaseHTTPError):
     """Raised when we couldn't import a store object."""
     def __init__(self, err_message):

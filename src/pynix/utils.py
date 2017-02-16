@@ -1,6 +1,8 @@
 """Some utility functions to support store operations."""
+import base64
 import os
-from os.path import exists, join, dirname, isdir
+from os import getenv
+from os.path import exists, join, dirname, isdir, realpath
 from subprocess import check_output, PIPE, Popen
 
 def decode_str(string):
@@ -24,7 +26,7 @@ def decode_str(string):
     else:
         return string
 
-def strip_output(command, shell=True, input=None, hide_stderr=False):
+def strip_output(command, input=None, hide_stderr=False):
     """Execute a bash command, and return its stripped output.
 
     :param command: A command, either a string or list.
@@ -39,7 +41,7 @@ def strip_output(command, shell=True, input=None, hide_stderr=False):
     :return: The resulting stdout, stripped of trailing whitespace.
     :rtype: ``str``
     """
-    kwargs = {"shell": shell}
+    kwargs = {"shell": isinstance(command, str)}
     if hide_stderr is True:
         kwargs["stderr"] = PIPE
     if input is not None:
@@ -47,48 +49,62 @@ def strip_output(command, shell=True, input=None, hide_stderr=False):
     output = check_output(command, **kwargs)
     return decode_str(output).strip()
 
-def find_nix_paths():
-    """Load up the nix bin, store and state paths, from environment.
+# Load nix paths from environment
+if "NIX_BIN_PATH" in os.environ:
+    NIX_BIN_PATH = os.environ["NIX_BIN_PATH"]
+else:
+    NIX_BIN_PATH = dirname(realpath(strip_output("type -p nix-env")))
+assert exists(join(NIX_BIN_PATH, "nix-build")), \
+    "Couldn't determine a valid nix binary path. Set NIX_BIN_PATH"
+# The store path can be given explicitly, or else it will be
+# inferred to be 2 levels up from the bin path. E.g., if the
+# bin path is /foo/bar/123-nix/bin, the store directory will
+# be /foo/bar.
+NIX_STORE_PATH = getenv("NIX_STORE", dirname(dirname(NIX_BIN_PATH)))
+assert isdir(NIX_STORE_PATH), \
+    "Nix store directory {} doesn't exist".format(NIX_STORE_PATH)
+# The state path can be given explicitly, or else it will be
+# inferred to be sibling to the store directory.
+NIX_STATE_PATH = getenv("NIX_STATE_PATH", join(dirname(NIX_STORE_PATH), "var"))
+assert isdir(NIX_STATE_PATH), \
+    "Nix state directory {} doesn't exist".format(NIX_STATE_PATH)
 
-    :return: A dictionary with three keys, each mapping to paths:
-        * nix_bin_path: path to where nix binaries live
-        * nix_store_path: path to where nix store objects live
-        * nix_state_path: path to where nix state objects live
-    :rtype: ``dict``
+NIX_DB_PATH = getenv("NIX_DB_PATH", join(NIX_STATE_PATH, "nix/db/db.sqlite"))
 
-    :raises:
-    * ``KeyError`` if 'NIX_BIN_PATH' isn't in the environment.
-    * ``AssertionError`` if any of these paths don't exist.
+def nix_cmd(command_name, args=None):
+    """Build a nix command, using the absolute path to the given nix binary.
+
+    :param command_name: A nix command, it must live in the /bin dir of nix.
+    :type command_name: ``str``
+    :param args: Arguments to pass to the binary.
+    :type args: ``str``
     """
-    if "NIX_BIN_PATH" in os.environ:
-        nix_bin_path = os.environ["NIX_BIN_PATH"]
-    else:
-        nix_env = check_output("which nix-env", shell=True).strip()
-        nix_bin_path = dirname(decode_str(nix_env))
-    assert exists(join(nix_bin_path, "nix-build"))
-    # The store path can be given explicitly, or else it will be
-    # inferred to be 2 levels up from the bin path. E.g., if the
-    # bin path is /foo/bar/123-nix/bin, the store directory will
-    # be /foo/bar.
-    nix_store_path = os.environ.get("NIX_STORE_PATH",
-                                    dirname(dirname(nix_bin_path)))
-    assert isdir(nix_store_path), \
-        "Nix store directory {} doesn't exist".format(nix_store_path)
-    # The state path can be given explicitly, or else it will be
-    # inferred to be sibling to the store directory.
-    nix_state_path = os.environ.get("NIX_STATE_PATH",
-                                    join(dirname(nix_store_path), "var"))
-    assert isdir(nix_state_path), \
-        "Nix state directory {} doesn't exist".format(nix_state_path)
-    return {
-        "nix_bin_path": nix_bin_path,
-        "nix_store_path": nix_store_path,
-        "nix_state_path": nix_state_path,
-    }
+    bin_path = join(NIX_BIN_PATH, command_name)
+    if not exists(bin_path):
+        raise ValueError("Invalid nix command {}".format(command_name))
+    return [bin_path] + args
+
+def query_store(store_path, query, hide_stderr=False):
+    """Given a query (e.g. --hash or --size), perform the query.
+
+    :param store_path: The store path to query.
+    :type store_path: ``str``
+    :param query: The query to perform. Must be a valid nix-store query.
+    :type query: ``str``
+    :param hide_stderr: If true, stderr will be hidden.
+    :type hide_stderr: ``bool``
+
+    :return: The result of the query.
+    :rtype: ``str``
+    """
+    nix_store = join(NIX_BIN_PATH, "nix-store")
+    command = [nix_store, "-q", query, store_path]
+    result = strip_output(command, hide_stderr=hide_stderr)
+    return result
 
 def decompress(program, data):
     """Decompresses the given data by via the given program."""
-    proc = Popen(program, stdin=PIPE, stdout=PIPE, shell=True)
+    proc = Popen(program, stdin=PIPE, stdout=PIPE)
     out = proc.communicate(input=data)[0]
     if proc.wait() != 0:
         raise ServerError("Decompression with '{}' failed"
