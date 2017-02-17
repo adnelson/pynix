@@ -3,7 +3,9 @@ import base64
 import os
 from os import getenv
 from os.path import exists, join, dirname, isdir, realpath
-from subprocess import check_output, PIPE, Popen
+from subprocess import check_output, PIPE, Popen, CalledProcessError
+
+from pynix.exceptions import NixInstantiationError
 
 def decode_str(string):
     """Convert a bytestring to a string. Is a no-op for strings.
@@ -101,6 +103,19 @@ def query_store(store_path, query, hide_stderr=False):
     command = [nix_store, "-q", query, store_path]
     result = strip_output(command, hide_stderr=hide_stderr)
     return result
+
+def instantiate(nix_file, attributes=None, show_trace=True):
+    """Wraps a call to nix-instantiate."""
+    attributes = [] if attributes is None else attributes
+    command = nix_cmd("nix-instantiate", [nix_file, "--no-gc-warning"])
+    if show_trace is True:
+        command.append("--show-trace")
+    for attr in attributes:
+        command.extend(["-A", attr])
+    try:
+        return strip_output(command).split()
+    except CalledProcessError as err:
+        raise NixInstantiationError(nix_file, attributes) from err
 
 def decompress(program, data):
     """Decompresses the given data by via the given program."""

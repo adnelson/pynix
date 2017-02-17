@@ -33,7 +33,9 @@ pythonPackages.buildPythonPackage rec {
     pythonPackages.six
     pythonPackages.datadiff
     rtyaml
-  ];
+  ] ++ (if pythonPackages.isPy3k or false then [] else [
+    pythonPackages.futures
+  ]);
   src = ./.;
   makeWrapperArgs = [
     "--set NIX_BIN_PATH ${pkgs.lib.makeBinPath [pkgs.nix.out]}"

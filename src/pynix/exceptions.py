@@ -1,4 +1,5 @@
 """Exceptions specific to pynix."""
+import sys
 
 class BaseHTTPError(Exception):
     """Base class for all HTTP errors."""
@@ -20,6 +21,19 @@ class BaseHTTPError(Exception):
         """Render error as a dictionary."""
         return {"message": self.message}
 
+class CliError(Exception):
+    """Base class for errors thrown from a CLI.
+
+    Has an exit function which exits the process with a message and status.
+    """
+    EXIT_MESSAGE = None
+    RETURN_CODE = 1
+    def exit(self):
+        system_exit = SystemExit()
+        system_exit.code = self.RETURN_CODE
+        if self.EXIT_MESSAGE is not None:
+            sys.stderr.write(self.EXIT_MESSAGE + "\n")
+        raise system_exit
 
 class ClientError(BaseHTTPError):
     """Base class for errors on the client side."""
@@ -59,15 +73,32 @@ class CouldNotUpdateHash(ServerError):
 
 class NixOperationError(RuntimeError):
     """When an error is encountered in a nix operation."""
-    def __init__(self, nix_operation, message):
-        self.nix_operation = nix_operation
-        self.message = message
+    OPERATION = None
 
 class NixImportFailed(BaseHTTPError, NixOperationError):
     """Raised when we couldn't import a store object."""
     def __init__(self, err_message):
         message = "Couldn't perform the import: {}".format(err_message)
+        NixOperationError.__init__(self, nix_operation="nix-store --import",
+                                   message=message)
         BaseHTTPError.__init__(self, message=message)
+
+class NixInstantiationError(NixOperationError, CliError):
+    """Raised when nix-instantiate fails."""
+    OPERATION = "nix-instantiate"
+    def __init__(self, nix_file, attributes):
+        self.nix_file = nix_file
+        self.attributes = attributes
+        if len(attributes) == 0:
+            message = "Couldn't evaluate file {}".format(nix_file)
+        elif len(attributes) == 1:
+            message = ("Couldn't evaluate attribute {} from file {}"
+                       .format(attributes[0], nix_file))
+        else:
+            message = ("Couldn't evaluate attributes {} from file {}"
+                       .format(", ".join(attributes), nix_file))
+        self.EXIT_MESSAGE = message
+
 
 class ObjectNotBuilt(NixOperationError):
     def __init__(self, store_path):
