@@ -14,7 +14,7 @@ from subprocess import (Popen, PIPE, check_output, CalledProcessError,
                         check_call)
 import sys
 import tempfile
-from threading import Thread, RLock
+from threading import Thread, RLock, BoundedSemaphore
 from six.moves.urllib_parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, Future, wait, as_completed
 from multiprocessing import cpu_count
@@ -92,8 +92,15 @@ class NixCacheClient(object):
         self._paths_fetched = set()
         self._max_jobs = max_jobs
         self._query_pool = ThreadPoolExecutor(max_workers=max_jobs)
-        self._fetch_pool = ThreadPoolExecutor(max_workers=max_jobs)
-        self._fetch_futures = {}
+
+        # A semaphore which will bound the number of concurrent fetches.
+        self._fetch_semaphore = BoundedSemaphore(value=max_jobs)
+        # A dictionary mapping nix store paths to threads fetching
+        # those paths from a cache. Each fetch happens in a different
+        # thread, and we use this dictionary to make sure that a fetch
+        # only happens once.
+        self._fetch_threads = {}
+        # A lock which syncronizes access to the fetch_threads dictionary.
         self._fetch_lock = RLock()
 
     def _load_path_cache(self):
@@ -570,86 +577,61 @@ class NixCacheClient(object):
         refs = self.get_references(path, query_server=True)
         logging.debug("Waiting for parent paths of {} ({}) to fetch..."
                       .format(path, ", ".join(refs)))
-        parent_fetches = self.fetch_objects(refs)
-        wait(list(parent_fetches.values()))
-        # done = False
-        # while not done:
-        #     done = True
-        #     for rpath, fut in parent_fetches.items():
-        #         if fut.done():
-        #             pass# logging.debug("Yay, {} finished.".format(rpath))
-        #         else:
-        #             done = False
-        #             logging.debug("{} is still waiting for {} ({})"
-        #                           .format(path, rpath, fut))
-        #     if not done:
-        #         import time
-        #         time.sleep(1)
-        # for f in as_completed(parent_fetches):
-        #     refpath = parent_fetches[f]
-        #     print("future completed: {}".format(refpath))
-        # for refpath, future in self.fetch_objects(refs).items():
-        #     logging.debug("Waiting for {} (referenced by {})"
-        #                   .format(refpath, path))
-        #     future.result()
-        #     logging.debug("{} (referenced by {}) finished."
-        #                   .format(refpath, path))
+        ref_fetches = {ref: self.start_fetching(ref) for ref in refs}
+        for rpath, thread in ref_fetches.items():
+            logging.debug("{} waiting for reference {} to fetch..."
+                          .format(path, rpath))
+            thread.join()
+            logging.debug("Path {} (ref of {}) has fetched.".format(rpath, path))
         logging.debug("All parent paths of {} finished.".format(path))
 
-        # Now we can fetch the object itself. Get its info first.
-        narinfo = self.get_narinfo(path)
+        # Now we can fetch the object itself. Syncronize this with the
+        # fetch semaphore to prevent too many simultaneous
+        # connections.
+        with self._fetch_semaphore:
+            # Get the info of the store path.
+            narinfo = self.get_narinfo(path)
 
-        # Use the URL in the narinfo to fetch the object.
-        url = "{}/{}".format(self._endpoint, narinfo.url)
+            # Use the URL in the narinfo to fetch the object.
+            url = "{}/{}".format(self._endpoint, narinfo.url)
 
-        response = requests.get(url, auth=self._connect())
-        response.raise_for_status()
+            response = requests.get(url, auth=self._connect())
+            response.raise_for_status()
 
-        # Figure out how to extract the content.
-        if narinfo.compression.lower() in ("xz", "xzip"):
-            data = decompress("xz -d", response.content)
-        elif narinfo.compression.lower() in ("bz2", "bzip2"):
-            data = decompress("bzip2 -d", response.content)
-        elif narinfo.compression.lower() in ("gzip", "gz"):
-            data = decompress("gzip -d", response.content)
-        else:
-            raise ValueError("Unsupported narinfo compression type {}"
-                             .format(narinfo.compression))
-        # Once extracted, convert it into a nix export object and pass
-        # it into the nix-store --import command.
-        proc = Popen([join(NIX_BIN_PATH, "nix-store"), "--import"],
-                     stdin=PIPE, stderr=PIPE, stdout=PIPE)
-        export = narinfo.nar_to_export(data)
-        out, err = proc.communicate(input=export.to_bytes())
-        if proc.wait() != 0:
-            raise NixImportFailed(decode_str(err))
-        logging.info("Imported path {}".format(out.decode("utf-8")))
-        self._paths_fetched.add(path)
+            # Figure out how to extract the content.
+            if narinfo.compression.lower() in ("xz", "xzip"):
+                data = decompress("xz -d", response.content)
+            elif narinfo.compression.lower() in ("bz2", "bzip2"):
+                data = decompress("bzip2 -d", response.content)
+            elif narinfo.compression.lower() in ("gzip", "gz"):
+                data = decompress("gzip -d", response.content)
+            else:
+                raise ValueError("Unsupported narinfo compression type {}"
+                                 .format(narinfo.compression))
+            # Once extracted, convert it into a nix export object and pass
+            # it into the nix-store --import command.
+            proc = Popen([join(NIX_BIN_PATH, "nix-store"), "--import"],
+                         stdin=PIPE, stderr=PIPE, stdout=PIPE)
+            export = narinfo.nar_to_export(data)
+            out, err = proc.communicate(input=export.to_bytes())
+            if proc.wait() != 0:
+                raise NixImportFailed(decode_str(err))
+            logging.info("Imported path {}".format(out.decode("utf-8")))
+            self._paths_fetched.add(path)
 
     def start_fetching(self, path):
         """Start a fetch thread. Syncronized so that a fetch of a
         single path will only happen once."""
         with self._fetch_lock:
-            if path not in self._fetch_futures:
-                future = self._fetch_pool.submit(self.fetch_object, path)
-                logging.debug("Putting fetch of path {} in future {}"
-                              .format(path, future))
-                self._fetch_futures[path] = future
-                return future
+            if path not in self._fetch_threads:
+                thread = Thread(target=self.fetch_object, args=(path,))
+                logging.debug("Putting fetch of path {} in thread {}"
+                              .format(path, thread))
+                thread.start()
+                self._fetch_threads[path] = thread
+                return thread
             else:
-                return self._fetch_futures[path]
-
-
-    def fetch_objects(self, paths):
-        """Fetch a list of objects. This is done asyncronously, so
-        it returns a list of futures.
-        """
-        logging.debug("waiting for the fetch lock...")
-        with self._fetch_lock:
-            logging.debug("acquired the fetch lock")
-            futures = {path: self.start_fetching(path) for path in paths}
-        logging.debug("returning futures: {}".format(futures))
-        return futures
+                return self._fetch_threads[path]
 
     def watch_store(self, ignore):
         """Watch the nix store's timestamp and sync whenever it changes.
