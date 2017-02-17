@@ -571,20 +571,20 @@ class NixCacheClient(object):
         logging.debug("Waiting for parent paths of {} ({}) to fetch..."
                       .format(path, ", ".join(refs)))
         parent_fetches = self.fetch_objects(refs)
-        # wait(parent_fetches)
-        done = False
-        while not done:
-            done = True
-            for rpath, fut in parent_fetches.items():
-                if fut.done():
-                    pass# logging.debug("Yay, {} finished.".format(rpath))
-                else:
-                    done = False
-                    #logging.debug("{} is still waiting for {} ({})"
-                    #              .format(path, rpath, fut))
-            if not done:
-                import time
-                time.sleep(1)
+        wait(list(parent_fetches.values()))
+        # done = False
+        # while not done:
+        #     done = True
+        #     for rpath, fut in parent_fetches.items():
+        #         if fut.done():
+        #             pass# logging.debug("Yay, {} finished.".format(rpath))
+        #         else:
+        #             done = False
+        #             logging.debug("{} is still waiting for {} ({})"
+        #                           .format(path, rpath, fut))
+        #     if not done:
+        #         import time
+        #         time.sleep(1)
         # for f in as_completed(parent_fetches):
         #     refpath = parent_fetches[f]
         #     print("future completed: {}".format(refpath))
@@ -626,6 +626,20 @@ class NixCacheClient(object):
         logging.info("Imported path {}".format(out.decode("utf-8")))
         self._paths_fetched.add(path)
 
+    def start_fetching(self, path):
+        """Start a fetch thread. Syncronized so that a fetch of a
+        single path will only happen once."""
+        with self._fetch_lock:
+            if path not in self._fetch_futures:
+                future = self._fetch_pool.submit(self.fetch_object, path)
+                logging.debug("Putting fetch of path {} in future {}"
+                              .format(path, future))
+                self._fetch_futures[path] = future
+                return future
+            else:
+                return self._fetch_futures[path]
+
+
     def fetch_objects(self, paths):
         """Fetch a list of objects. This is done asyncronously, so
         it returns a list of futures.
@@ -633,14 +647,7 @@ class NixCacheClient(object):
         logging.debug("waiting for the fetch lock...")
         with self._fetch_lock:
             logging.debug("acquired the fetch lock")
-            futures = {}
-            for path in paths:
-                if path not in self._fetch_futures:
-                    future = self._fetch_pool.submit(self.fetch_object, path)
-                    logging.debug("Putting fetch of path {} in future {}"
-                                  .format(path, future))
-                    self._fetch_futures[path] = future
-                futures[path] = self._fetch_futures[path]
+            futures = {path: self.start_fetching(path) for path in paths}
         logging.debug("returning futures: {}".format(futures))
         return futures
 
