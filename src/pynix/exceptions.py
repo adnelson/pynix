@@ -57,11 +57,25 @@ class CouldNotUpdateHash(ServerError):
                    .format(path, stored_hash, valid_hash, message))
         ServerError.__init__(self, message=message)
 
-class NixImportFailed(BaseHTTPError):
+class NixOperationError(RuntimeError):
+    """When an error is encountered in a nix operation."""
+    def __init__(self, nix_operation, message):
+        self.nix_operation = nix_operation
+        self.message = message
+
+class NixImportFailed(BaseHTTPError, NixOperationError):
     """Raised when we couldn't import a store object."""
     def __init__(self, err_message):
         message = "Couldn't perform the import: {}".format(err_message)
         BaseHTTPError.__init__(self, message=message)
+
+class ObjectNotBuilt(NixOperationError):
+    def __init__(self, store_path):
+        message = ("Expected store path {} to be built, but it wasn't"
+                   .format(store_path))
+        NixOperationError.__init__(self, nix_operation="nix-store",
+                                   message=message)
+        self.store_path = store_path
 
 class CouldNotConnect(Exception):
     def __init__(self, endpoint, status_code, content):

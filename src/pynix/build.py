@@ -73,15 +73,13 @@ def needed_to_build(deriv, outputs=None, needed=None, need_fetch=None,
             if deriv not in needed:
                 needed[deriv] = set()
             needed[deriv].add(output)
-            # Even though we're doing this repeatedly, it will
-            # exit early on subsequent invocations, so it should
-            # be fast.
-            for path, outs in deriv.input_derivations.items():
+            # Even though we're doing this repeatedly, it will exit
+            # early on subsequent invocations, so it will be fast.
+            for path, outputs in deriv.input_derivations.items():
                 subderiv = Derivation.parse_derivation_file(path)
-                needed_to_build(subderiv, outputs=outs,
+                needed_to_build(subderiv, outputs=outputs,
                                 needed=needed, need_fetch=need_fetch,
-                                on_server=on_server,
-                                existing=existing)
+                                on_server=on_server, existing=existing)
     return needed, need_fetch
 
 

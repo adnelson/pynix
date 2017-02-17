@@ -650,12 +650,18 @@ class NixCacheClient(object):
         logging.info("Found {} paths in the store.".format(len(paths)))
         self.send_objects(paths)
 
-    def build_fetch(self, nix_file, attributes, verbose=False):
+    def build_fetch(self, nix_file, attributes, verbose=False,
+                    show_trace=True, keep_going=True):
         """Given a nix file, instantiate the given attributes within the file,
         query the server for which files can be fetched, and then
         build/fetch everything.
+
+        :return: A dictionary mapping derivations to outputs that were built.
+        :rtype: ``dict``
         """
         command = nix_cmd("nix-instantiate", [nix_file, "--no-gc-warning"])
+        if show_trace is True:
+            command.append("--show-trace")
         for attr in attributes:
             command.append("-A")
             command.append(attr)
@@ -663,8 +669,9 @@ class NixCacheClient(object):
               .format("s" if len(attributes) > 1 else "",
                       ", ".join(attributes), nix_file))
         deriv_paths = strip_output(command).split()
+        derivs_to_outputs = parse_deriv_paths(deriv_paths)
         logging.info("Querying {} for which paths it has..."
-              .format(self._endpoint))
+                     .format(self._endpoint))
         need_to_build, need_to_fetch = self.preview_build(deriv_paths)
         self.print_preview(need_to_build, need_to_fetch, verbose)
         if self._dry_run is True:
@@ -677,9 +684,24 @@ class NixCacheClient(object):
         # Build up the command for nix store to build the remaining paths.
         if len(need_to_build) > 0:
             args = ["--max-jobs", str(self._max_jobs), "--realise"]
+            if keep_going is True:
+                args.append("--keep-going")
             args.extend(d.path for d in need_to_build)
             cmd = nix_cmd("nix-store", args)
-            check_call(cmd)
+            strip_output(cmd).split()
+        else:
+            logging.info("No derivations needed to be built locally")
+        # Confirm that every derivation that was supposed to be built was.
+        for deriv, outputs in derivs_to_outputs.items():
+            for output in outputs:
+                store_path = deriv.output_mapping[output]
+                logging.debug("Checking that path {} is valid..."
+                              .format(store_path))
+                try:
+                    query_store(store_path, "--hash")
+                except CalledProcessError:
+                    raise ObjectNotBuilt(store_path)
+        return derivs_to_outputs
 
     def preview_build(self, paths):
         """Given some derivation paths, generate two sets:
@@ -689,7 +711,10 @@ class NixCacheClient(object):
 
         Of course, the second set will be empty if no binary cache is given.
         """
-        derivs_outs = parse_deriv_paths(paths)
+        if isinstance(paths, dict):
+            derivs_outs = paths
+        else:
+            derivs_outs = parse_deriv_paths(paths)
         existing = {}
         # Run the first time with no on_server argument.
         needed, need_fetch = needed_to_build_multi(derivs_outs, existing=existing)
@@ -782,6 +807,15 @@ def _get_args():
                        help="Expressions to evaluate.")
     build.add_argument("--verbose", action="store_true", default=False,
                        help="Show verbose output.")
+    build.add_argument("--no-trace", action="store_false", dest="show_trace",
+                       help="Hide stack trace on instantiation error.")
+    build.add_argument("-S", "--stop-on-failure", action="store_false",
+                       dest="keep_going",
+                       help="Stop all builders if any builder fails.")
+    build.add_argument("--hide-paths", action="store_false",
+                       dest="print_paths",
+                       help="Don't print built paths to stdout")
+    build.set_defaults(show_trace=True, keep_going=True, print_paths=True)
     for subparser in (send, sync, daemon, fetch, build):
         subparser.add_argument("-e", "--endpoint",
                                default=os.environ.get("NIX_REPO_HTTP"),
@@ -838,7 +872,13 @@ def main():
         for path in args.paths:
             client.fetch_object(path)
     elif args.command == "build":
-        client.build_fetch(nix_file=args.path, attributes=args.attributes,
-                           verbose=args.verbose)
+        result_derivs = client.build_fetch(
+            nix_file=args.path, attributes=args.attributes,
+            verbose=args.verbose, show_trace=args.show_trace,
+            keep_going=args.keep_going)
+        if args.print_paths is True:
+            for deriv, outputs in result_derivs.items():
+                for output in outputs:
+                    print(deriv.output_mapping[output])
     else:
         exit("Unknown command '{}'".format(args.command))
