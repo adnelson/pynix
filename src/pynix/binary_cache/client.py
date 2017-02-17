@@ -14,9 +14,9 @@ from subprocess import (Popen, PIPE, check_output, CalledProcessError,
                         check_call)
 import sys
 import tempfile
-from threading import Thread
+from threading import Thread, RLock
 from six.moves.urllib_parse import urlparse
-from concurrent.futures import ThreadPoolExecutor, Future, as_completed
+from concurrent.futures import ThreadPoolExecutor, Future, wait, as_completed
 from multiprocessing import cpu_count
 import yaml
 
@@ -91,7 +91,10 @@ class NixCacheClient(object):
         self._narinfo_cache = {}
         self._paths_fetched = set()
         self._max_jobs = max_jobs
-        self._pool = ThreadPoolExecutor(max_workers=max_jobs)
+        self._query_pool = ThreadPoolExecutor(max_workers=max_jobs)
+        self._fetch_pool = ThreadPoolExecutor(max_workers=max_jobs)
+        self._fetch_futures = {}
+        self._fetch_lock = RLock()
 
     def _load_path_cache(self):
         """Load the store reference path cache.
@@ -195,7 +198,8 @@ class NixCacheClient(object):
                 prefix = basename(path).split("-")[0]
                 url = "{}/{}.narinfo".format(self._endpoint, prefix)
                 auth = self._connect()
-                logging.debug("hitting url {}...".format(url))
+                logging.debug("hitting url {} (for path {})..."
+                              .format(url, path))
                 response = requests.get(url, auth=auth)
                 logging.debug("response arrived from {}".format(url))
                 response.raise_for_status()
@@ -273,10 +277,11 @@ class NixCacheClient(object):
                          "route. Querying paths individually."
                          .format(self._endpoint))
             result = {
-                path: self._pool.submit(self.query_path_individually, path)
+                path: self._query_pool.submit(self.query_path_individually,
+                                              path)
                 for path in paths
             }
-            return result # as_completed(result)
+            return result
 
     def query_path_individually(self, path):
         """Send an individual query (.narinfo) for a store path.
@@ -562,8 +567,35 @@ class NixCacheClient(object):
             logging.debug("{} has already been fetched.".format(path))
             return
         # First fetch all of the object's references.
-        for ref in self.get_references(path, query_server=True):
-            self.fetch_object(ref)
+        refs = self.get_references(path, query_server=True)
+        logging.debug("Waiting for parent paths of {} ({}) to fetch..."
+                      .format(path, ", ".join(refs)))
+        parent_fetches = self.fetch_objects(refs)
+        # wait(parent_fetches)
+        done = False
+        while not done:
+            done = True
+            for rpath, fut in parent_fetches.items():
+                if fut.done():
+                    pass# logging.debug("Yay, {} finished.".format(rpath))
+                else:
+                    done = False
+                    #logging.debug("{} is still waiting for {} ({})"
+                    #              .format(path, rpath, fut))
+            if not done:
+                import time
+                time.sleep(1)
+        # for f in as_completed(parent_fetches):
+        #     refpath = parent_fetches[f]
+        #     print("future completed: {}".format(refpath))
+        # for refpath, future in self.fetch_objects(refs).items():
+        #     logging.debug("Waiting for {} (referenced by {})"
+        #                   .format(refpath, path))
+        #     future.result()
+        #     logging.debug("{} (referenced by {}) finished."
+        #                   .format(refpath, path))
+        logging.debug("All parent paths of {} finished.".format(path))
+
         # Now we can fetch the object itself. Get its info first.
         narinfo = self.get_narinfo(path)
 
@@ -593,6 +625,24 @@ class NixCacheClient(object):
             raise NixImportFailed(decode_str(err))
         logging.info("Imported path {}".format(out.decode("utf-8")))
         self._paths_fetched.add(path)
+
+    def fetch_objects(self, paths):
+        """Fetch a list of objects. This is done asyncronously, so
+        it returns a list of futures.
+        """
+        logging.debug("waiting for the fetch lock...")
+        with self._fetch_lock:
+            logging.debug("acquired the fetch lock")
+            futures = {}
+            for path in paths:
+                if path not in self._fetch_futures:
+                    future = self._fetch_pool.submit(self.fetch_object, path)
+                    logging.debug("Putting fetch of path {} in future {}"
+                                  .format(path, future))
+                    self._fetch_futures[path] = future
+                futures[path] = self._fetch_futures[path]
+        logging.debug("returning futures: {}".format(futures))
+        return futures
 
     def watch_store(self, ignore):
         """Watch the nix store's timestamp and sync whenever it changes.
@@ -869,14 +919,13 @@ def main():
     elif args.command == "daemon":
         client.watch_store(args.ignore)
     elif args.command == "fetch":
-        for path in args.paths:
-            client.fetch_object(path)
+        wait(list(client.fetch_objects(args.paths).values()))
     elif args.command == "build":
         result_derivs = client.build_fetch(
             nix_file=args.path, attributes=args.attributes,
             verbose=args.verbose, show_trace=args.show_trace,
             keep_going=args.keep_going)
-        if args.print_paths is True:
+        if args.dry_run is False and args.print_paths is True:
             for deriv, outputs in result_derivs.items():
                 for output in outputs:
                     print(deriv.output_mapping[output])
