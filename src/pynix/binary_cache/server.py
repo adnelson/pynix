@@ -359,7 +359,7 @@ class NixServer(Flask):
 
 def _get_args():
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(prog="servenix")
+    parser = argparse.ArgumentParser(prog="nix-server")
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--port", type=int, default=5000,
                         help="Port to listen on.")

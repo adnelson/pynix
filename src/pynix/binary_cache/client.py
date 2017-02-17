@@ -847,7 +847,7 @@ class NixCacheClient(object):
 
 def _get_args():
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(prog="sendnix")
+    parser = argparse.ArgumentParser(prog="nix-client")
     parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(title="Command", dest="command")
     subparsers.required = True
