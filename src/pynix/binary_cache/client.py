@@ -600,7 +600,8 @@ class NixCacheClient(object):
 
             # Use the URL in the narinfo to fetch the object.
             url = "{}/{}".format(self._endpoint, narinfo.url)
-            logging.info("Requesting {}...".format(url))
+            logging.info("Requesting {} from {}..."
+                         .format(basename(path), self._endpoint))
             response = self._connect().get(url)
             response.raise_for_status()
 
@@ -698,7 +699,7 @@ class NixCacheClient(object):
         self.send_objects(paths)
 
     def build_fetch(self, nix_file, attributes, verbose=False, show_trace=True,
-                    keep_going=True,  create_symlinks=False):
+                    keep_going=True, create_links=False, use_deriv_name=True):
         """Given a nix file, instantiate the given attributes within the file,
         query the server for which files can be fetched, and then
         build/fetch everything.
@@ -722,33 +723,56 @@ class NixCacheClient(object):
         path_fetches = {}
         for deriv, outputs in need_to_fetch.items():
             for output in outputs:
-                path = deriv.output_mapping[output]
+                path = deriv.output_path(output)
                 path_fetches[path] = self.start_fetching(path)
-            for path, thread in path_fetches.items():
-                thread.join()
+        # Wait for each thread to complete.
+        for deriv, outputs in need_to_fetch.items():
+            for output in outputs:
+                path = deriv.output_path(output)
+                path_fetches[path].join()
 
         # Build up the command for nix store to build the remaining paths.
         if len(need_to_build) > 0:
-            args = ["--max-jobs", str(self._max_jobs), "--realise"]
+            args = ["--max-jobs", str(self._max_jobs), "--no-gc-warning",
+                    "--realise"]
             args.extend(d.path for d in need_to_build)
-            args.append("--add-root" if create_symlinks else "--no-gc-warning")
             if keep_going is True:
                 args.append("--keep-going")
             cmd = nix_cmd("nix-store", args)
             strip_output(cmd).split()
         else:
             logging.info("No derivations needed to be built locally")
-        # Confirm that every derivation that was supposed to be built was.
+        if create_links is True:
+            self._create_symlinks(derivs_to_outputs, use_deriv_name)
+        return derivs_to_outputs
+
+    def _create_symlinks(self, derivs_to_outputs, use_deriv_name):
+        """Create symlinks to all built derivations.
+
+        :param derivs_to_outputs: Maps derivations to sets of output names.
+        :type derivs_to_outputs:
+            ``dict`` of ``Derivation`` to ``set`` of ``str``
+        :param use_deriv_name: If true, the symlink names will be
+                               generated from derivation names.
+                               Otherwise, `result` will be used.
+        :type use_deriv_name: ``bool``
+        """
+        count = 0
         for deriv, outputs in derivs_to_outputs.items():
             for output in outputs:
-                store_path = deriv.output_mapping[output]
-                logging.debug("Checking that path {} is valid..."
-                              .format(store_path))
-                try:
-                    query_store(store_path, "--hash")
-                except CalledProcessError:
-                    raise ObjectNotBuilt(store_path)
-        return derivs_to_outputs
+                path = deriv.output_path(output)
+                if use_deriv_name:
+                    link_path = deriv.link_path(output)
+                else:
+                    link_path = join(os.getcwd(), "result")
+                    if output != "out":
+                        link_path += "-" + output
+                    if count > 0:
+                        link_path += "-" + str(count)
+                args = ["--realise", path, "--add-root", link_path,
+                        "--indirect"]
+                check_output(nix_cmd("nix-store", args))
+                count += 1
 
     def preview_build(self, paths):
         """Given some derivation paths, generate two sets:
@@ -776,7 +800,7 @@ class NixCacheClient(object):
             path_mapping = {}
             for deriv, outs in needed.items():
                 for out in outs:
-                    path = deriv.output_mapping[out]
+                    path = deriv.output_path(out)
                     paths_to_ask.append(path)
                     path_mapping[path] = (deriv, out)
             query_result = self.query_paths(paths_to_ask)
@@ -818,7 +842,7 @@ class NixCacheClient(object):
             if verbose:
                 for deriv, outs in need_to_fetch.items():
                     for out in outs:
-                        msg += "\n  " + deriv.output_mapping[out]
+                        msg += "\n  " + deriv.output_path(out)
             logging.info(msg)
 
 def _get_args():
@@ -854,6 +878,11 @@ def _get_args():
     build.add_argument("--hide-paths", action="store_false",
                        dest="print_paths",
                        help="Don't print built paths to stdout")
+    build.add_argument("-C", "--create-links", action="store_true",
+                       default=False, help="Create symlinks to built objects.")
+    build.add_argument("-g", "--generic-link-name", action="store_true",
+                       default=False,
+                       help="Use generic `result` name for symlinks.")
     build.set_defaults(show_trace=True, keep_going=True, print_paths=True)
     for subparser in (send, sync, daemon, fetch, build):
         subparser.add_argument("-e", "--endpoint",
@@ -908,11 +937,12 @@ def main():
             result_derivs = client.build_fetch(
                 nix_file=args.path, attributes=args.attributes,
                 verbose=args.verbose, show_trace=args.show_trace,
-                keep_going=args.keep_going)
+                keep_going=args.keep_going, create_links=args.create_links,
+                use_deriv_name=not args.generic_link_name)
             if args.dry_run is False and args.print_paths is True:
                 for deriv, outputs in result_derivs.items():
                     for output in outputs:
-                        print(deriv.output_mapping[output])
+                        print(deriv.output_path(output))
         else:
             exit("Unknown command '{}'".format(args.command))
     except CliError as err:

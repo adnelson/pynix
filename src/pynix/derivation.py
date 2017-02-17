@@ -151,6 +151,19 @@ class Derivation(object):
             self._as_dict = res
         return self._as_dict
 
+    def link_path(self, output_name):
+        """Return the default path for a symlink created to this output."""
+        path = os.path.join(os.getcwd(), self.name)
+        if output_name != "out":
+            path += "-" + output_name
+        return path
+
+    def output_path(self, output_name):
+        """Get the path to an output with the given name."""
+        if output_name not in self.output_mapping:
+            raise ValueError("No output named {}".format(output_name))
+        return self.output_mapping[output_name]
+
     def __eq__(self, other):
         """Test if one derivation is equal to another."""
         if isinstance(other, str):
