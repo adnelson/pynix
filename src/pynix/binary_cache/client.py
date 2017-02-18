@@ -595,36 +595,71 @@ class NixCacheClient(object):
         # fetch semaphore to prevent too many simultaneous
         # connections.
         with self._fetch_semaphore:
-            # Get the info of the store path.
-            narinfo = self.get_narinfo(path)
+            self._fetch_single(path)
 
-            # Use the URL in the narinfo to fetch the object.
-            url = "{}/{}".format(self._endpoint, narinfo.url)
-            logging.info("Requesting {} from {}..."
-                         .format(basename(path), self._endpoint))
-            response = self._connect().get(url)
-            response.raise_for_status()
+    def compute_fetch_order(self, starting_path):
+        """Given some starting path, compute the order in which paths
+        should be fetched from the cache in order to fetch the path
+        with its dependencies satisfied.
 
-            # Figure out how to extract the content.
-            if narinfo.compression.lower() in ("xz", "xzip"):
-                data = decompress("xz -d", response.content)
-            elif narinfo.compression.lower() in ("bz2", "bzip2"):
-                data = decompress("bzip2 -d", response.content)
-            elif narinfo.compression.lower() in ("gzip", "gz"):
-                data = decompress("gzip -d", response.content)
-            else:
-                raise ValueError("Unsupported narinfo compression type {}"
-                                 .format(narinfo.compression))
-            # Once extracted, convert it into a nix export object and pass
-            # it into the nix-store --import command.
-            proc = Popen([join(NIX_BIN_PATH, "nix-store"), "--import"],
-                         stdin=PIPE, stderr=PIPE, stdout=PIPE)
-            export = narinfo.nar_to_export(data)
-            out, err = proc.communicate(input=export.to_bytes())
-            if proc.wait() != 0:
-                raise NixImportFailed(decode_str(err))
-            logging.info("Imported {}".format(out.decode("utf-8")).strip())
-            self._paths_fetched.add(path)
+        :param starting_path: A store path to start with.
+        :type starting_path: ``str``
+
+        :return: An iterator of paths in the order that they should be fetched.
+        :rtype: ``iterator`` of ``str``
+        """
+        order = []
+        order_set = set()
+        stack = [starting_path]
+        while len(stack) > 0:
+            path = stack.pop()
+            if path not in order_set:
+                order.append(path)
+                order_set.add(path)
+                for ref in self.get_references(path):
+                    stack.append(ref)
+        return reversed(order)
+
+    def fetch_single(self, path):
+        """Fetch a single path."""
+        # First ensure that all referenced paths have been fetched.
+        refs = self.get_references(path)
+        for ref in refs:
+            self._wait_till_fetched(ref)
+        # Get the info of the store path.
+        narinfo = self.get_narinfo(path)
+
+        # Use the URL in the narinfo to fetch the object.
+        url = "{}/{}".format(self._endpoint, narinfo.url)
+        logging.info("Requesting {} from {}..."
+                     .format(basename(path), self._endpoint))
+        response = self._connect().get(url)
+        response.raise_for_status()
+
+        # Figure out how to extract the content.
+        if narinfo.compression.lower() in ("xz", "xzip"):
+            data = decompress("xz -d", response.content)
+        elif narinfo.compression.lower() in ("bz2", "bzip2"):
+            data = decompress("bzip2 -d", response.content)
+        elif narinfo.compression.lower() in ("gzip", "gz"):
+            data = decompress("gzip -d", response.content)
+        else:
+            raise ValueError("Unsupported narinfo compression type {}"
+                             .format(narinfo.compression))
+        # Once extracted, convert it into a nix export object and pass
+        # it into the nix-store --import command.
+        proc = Popen([join(NIX_BIN_PATH, "nix-store"), "--import"],
+                     stdin=PIPE, stderr=PIPE, stdout=PIPE)
+        export = narinfo.nar_to_export(data)
+        out, err = proc.communicate(input=export.to_bytes())
+        if proc.wait() != 0:
+            raise NixImportFailed(decode_str(err))
+        logging.info("Imported {}".format(out.decode("utf-8")).strip())
+        self._register_as_fetched(path)
+
+    def _register_as_fetched(self, path):
+        """Register that a store path has been fetched."""
+        self._paths_fetched.add(path)
 
     def start_fetching(self, path):
         """Start a fetch thread. Syncronized so that a fetch of a
