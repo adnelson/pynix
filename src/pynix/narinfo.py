@@ -22,7 +22,7 @@ class NarInfo(object):
 
     def __init__(self, store_path, url, compression,
                  nar_size, nar_hash, file_size, file_hash,
-                 references, deriver):
+                 references, deriver, signature):
         """Initializer.
 
         :param url: The URL at which this NAR can be fetched.
@@ -44,6 +44,8 @@ class NarInfo(object):
         :type references: ``list`` of ``str``
         :param deriver: Path to the derivation used to build path (optional).
         :type deriver: ``str`` or ``NoneType``
+        :param signature: Signature guaranteeing correctness (optional).
+        :type signature: ``str`` or ``NoneType``
         """
         # We require a particular nar_hash.
         if not nar_hash.startswith("sha256:"):
@@ -59,7 +61,10 @@ class NarInfo(object):
         self.file_size = file_size
         self.file_hash = file_hash
         self.references = list(sorted(basename(r) for r in references))
-        self.deriver = deriver if deriver is None else basename(deriver)
+        self.deriver = basename(deriver) if deriver else None
+        self.signature = signature
+        if signature is None:
+            raise ValueError("fartyfarts")
 
     def __repr__(self):
         return "NarInfo({})".format(self.store_path)
@@ -83,6 +88,8 @@ class NarInfo(object):
         }
         if self.deriver is not None:
             result["Deriver"] = self.deriver
+        if self.signature is not None:
+            result["Sig"] = self.signature
         return result
 
     def to_string(self):
@@ -135,7 +142,7 @@ class NarInfo(object):
         """
         return NarExport(self.store_path, nar_bytes=nar_bytes,
                          references=self.abs_references,
-                         deriver=self.abs_deriver)
+                         deriver=self.abs_deriver, signature=self.signature)
 
     @classmethod
     def from_dict(cls, dictionary):
@@ -151,25 +158,22 @@ class NarInfo(object):
         """
         # Convert keys to lower case
         dictionary = {k.lower(): v for k, v in dictionary.items()}
-        def get(key, parser=None, optional=False, default=None):
-            optional = optional or default is not None
-            if key not in dictionary and optional is False:
-                raise ValueError("Dictionary must have key {}".format(key))
-            val = dictionary.get(key, default)
-            return val if parser is None else parser(val)
-        def split_refs(refs):
-            return refs.split() if isinstance(refs, str) else refs
-        return cls(
-            url= get("url"),
-            store_path=get("storepath"),
-            compression=get("compression"),
-            nar_size=get("narsize", parser=int),
-            nar_hash=get("narhash"),
-            file_size=get("filesize", parser=int),
-            file_hash=get("filehash"),
-            references=get("references", default=[], parser=split_refs),
-            deriver=get("deriver", optional=True)
-        )
+        url = dictionary["url"]
+        store_path = dictionary["storepath"]
+        compression = dictionary["compression"]
+        nar_size = int(dictionary["narsize"])
+        nar_hash = dictionary["narhash"]
+        file_size = int(dictionary["filesize"])
+        file_hash = dictionary["filehash"]
+        references = dictionary.get("references") or []
+        if isinstance(dictionary["references"], str):
+            references = dictionary["references"].split()
+        deriver = dictionary.get("deriver") or None
+        signature = dictionary.get("sig")
+        return cls(url=url, store_path=store_path, compression=compression,
+                   nar_size=nar_size, nar_hash=nar_hash, file_size=file_size,
+                   file_hash=file_hash, references=references, deriver=deriver,
+                   signature=signature)
 
     @classmethod
     def from_string(cls, string):
@@ -254,7 +258,7 @@ class NarExport(object):
     with the `nix-store --export` command. Specifically, it adds
     information about references and optionally a deriver path.
     """
-    def __init__(self, store_path, nar_bytes, references, deriver=None):
+    def __init__(self, store_path, nar_bytes, references, deriver, signature):
         """Initializer.
 
         :param store_path: Path to the object being encoded.
@@ -267,11 +271,15 @@ class NarExport(object):
         :param deriver: The absolute path to the derivation that
                         built the object. Optional.
         :type deriver: ``str`` or ``NoneType``
+        :param signature: Signature of the binary cache. Optional, but
+                          might be required depending on the nix settings.
+        :type signature: ``str`` or ``NoneType``
         """
         self.store_path = store_path
         self.nar_bytes = nar_bytes
         self.references = references
         self.deriver = deriver
+        self.signature = signature
 
         _paths = [store_path] + references
         if deriver is not None:
@@ -339,8 +347,12 @@ class NarExport(object):
         else:
             addstr(bio, b"")
 
-        # Add a 0 to indicate no signature, and then another 0 (not sure why).
-        bio.write(EIGHT_ZEROS)
+        if self.signature is not None:
+            addstr(bio, self.signature.encode("utf-8"))
+        else:
+            addstr(bio, b"")
+
+        # Add a final 0, not sure why though...
         bio.write(EIGHT_ZEROS)
 
         # Return the contents of the bytesio as the resulting bytestring.

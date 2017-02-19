@@ -117,6 +117,24 @@ def instantiate(nix_file, attributes=None, show_trace=True):
     except CalledProcessError as err:
         raise NixInstantiationError(nix_file, attributes) from err
 
+def tell_size(obj, word, suffix="s"):
+    """Useful when you want to write a message to the user.
+
+    :param obj: The object being described.
+    :type obj: Anything that works with the len() function.
+    :param word: Word to use to describe the object.
+    :type word: ``str``
+    :param suffix: What to append to the word if plural.
+    :type suffix: ``str``
+
+    :return: The length, followed by the possibly pluralized word.
+    :rtype: ``str``
+    """
+    if len(obj) == 1:
+        return "1 {}".format(word)
+    else:
+        return "{} {}{}".format(len(obj), word, suffix)
+
 def decompress(program, data):
     """Decompresses the given data by via the given program."""
     proc = Popen(program, stdin=PIPE, stdout=PIPE, shell=True)

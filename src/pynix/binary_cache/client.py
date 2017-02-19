@@ -38,7 +38,7 @@ import six
 from pynix import __version__
 from pynix.utils import (strip_output, decode_str, decompress, NIX_BIN_PATH,
                          NIX_STORE_PATH, NIX_STATE_PATH, NIX_DB_PATH, nix_cmd,
-                         query_store, instantiate)
+                         query_store, instantiate, tell_size)
 from pynix.exceptions import (CouldNotConnect, NixImportFailed, CliError)
 from pynix.narinfo import NarInfo
 from pynix.build import needed_to_build_multi, parse_deriv_paths
@@ -94,6 +94,7 @@ class NixCacheClient(object):
         self._paths_fetched = set()
         self._max_jobs = max_jobs
         self._query_pool = ThreadPoolExecutor(max_workers=max_jobs)
+        self._fetch_pool = ThreadPoolExecutor(max_workers=max_jobs)
 
         # A semaphore which will bound the number of concurrent fetches.
         self._fetch_semaphore = BoundedSemaphore(value=max_jobs)
@@ -102,10 +103,9 @@ class NixCacheClient(object):
         # thread, and we use this dictionary to make sure that a fetch
         # only happens once.
         self._fetch_threads = {}
+        self._fetch_futures = {}
         # A lock which syncronizes access to the fetch_threads dictionary.
         self._fetch_lock = RLock()
-        # Paths being fetched.
-        self._current_fetches = {}
 
     def _load_path_cache(self):
         """Load the store reference path cache.
@@ -202,10 +202,14 @@ class NixCacheClient(object):
             cache_path = join(NIX_NARINFO_CACHE, self._endpoint_server,
                               basename(path))
             if isfile(cache_path):
+                logging.debug("Loading {} narinfo from on-disk cache"
+                              .format(basename(path)))
                 write_to_disk = False
                 with open(cache_path) as f:
                     narinfo = NarInfo.from_dict(json.load(f))
             else:
+                logging.debug("Requesting {} narinfo from server"
+                              .format(basename(path)))
                 prefix = basename(path).split("-")[0]
                 url = "{}/{}.narinfo".format(self._endpoint, prefix)
                 logging.debug("hitting url {} (for path {})..."
@@ -251,6 +255,9 @@ class NixCacheClient(object):
             # enabled, query the binary cache.
             except CalledProcessError:
                 if query_server is False:
+                    logging.error("Couldn't determine the references of {} "
+                                  "locally, and can't query the server"
+                                  .format(path))
                     raise
                 narinfo = self.get_narinfo(path)
                 refs = [r for r in narinfo.abs_references if r != path]
@@ -536,7 +543,7 @@ class NixCacheClient(object):
             for path in to_send:
                 logging.info(basename(path))
 
-    def have_fetched(self, path):
+    def _have_fetched(self, path):
         """Checks if we've fetched a given path, or if it exists on disk.
 
         :param path: The path to the store object to check.
@@ -576,7 +583,7 @@ class NixCacheClient(object):
         is idempotent.
         """
         # Check if the object has already been fetched; if so we can stop.
-        if self.have_fetched(path):
+        if self._have_fetched(path):
             logging.debug("{} has already been fetched.".format(path))
             return
         # First fetch all of the object's references.
@@ -597,35 +604,58 @@ class NixCacheClient(object):
         with self._fetch_semaphore:
             self._fetch_single(path)
 
-    def compute_fetch_order(self, starting_path):
-        """Given some starting path, compute the order in which paths
-        should be fetched from the cache in order to fetch the path
-        with its dependencies satisfied.
+    # def _compute_fetch_order(self, starting_path):
+    #     """Given some starting path, compute the order in which paths
+    #     should be fetched from the cache in order to fetch the path
+    #     with its dependencies satisfied.
 
-        :param starting_path: A store path to start with.
-        :type starting_path: ``str``
+    #     :param starting_path: A store path to start with.
+    #     :type starting_path: ``str``
 
-        :return: An iterator of paths in the order that they should be fetched.
-        :rtype: ``iterator`` of ``str``
-        """
+    #     :return: An iterator of paths in the order that they should be fetched.
+    #     :rtype: ``iterator`` of ``str``
+    #     """
+    #     order = []
+    #     order_set = set()
+    #     stack = [starting_path]
+    #     while len(stack) > 0:
+    #         path = stack.pop()
+    #         if path not in order_set:
+    #             order.append(path)
+    #             order_set.add(path)
+    #             for ref in self.get_references(path):
+    #                 stack.append(ref)
+    #     return reversed(order)
+
+    def _compute_fetch_order(self, paths):
         order = []
         order_set = set()
-        stack = [starting_path]
-        while len(stack) > 0:
-            path = stack.pop()
+        def _order(path):
             if path not in order_set:
+                for ref in self.get_references(path, query_server=True):
+                    _order(ref)
                 order.append(path)
                 order_set.add(path)
-                for ref in self.get_references(path):
-                    stack.append(ref)
-        return reversed(order)
+        logging.debug("Computing a fetch order for {}"
+                      .format(tell_size(paths, "path")))
+        for path in paths:
+            _order(path)
+        return order
 
-    def fetch_single(self, path):
+    def _fetch_ordered_paths(self, store_paths):
+        for path in store_paths:
+            self._start_fetching(path)
+        for path in store_paths:
+             self._finish_fetching(path)
+
+    def _fetch_single(self, path):
         """Fetch a single path."""
+        # Return if the path has already been fetched, or already exists.
+        if self._have_fetched(path):
+            return
         # First ensure that all referenced paths have been fetched.
-        refs = self.get_references(path)
-        for ref in refs:
-            self._wait_till_fetched(ref)
+        for ref in self.get_references(path):
+            self._finish_fetching(ref)
         # Get the info of the store path.
         narinfo = self.get_narinfo(path)
 
@@ -676,6 +706,30 @@ class NixCacheClient(object):
                 return thread
             else:
                 return self._fetch_threads[path]
+
+    def _start_fetching(self, path):
+        """Start a fetch thread. Syncronized so that a fetch of a
+        single path will only happen once."""
+        with self._fetch_lock:
+            if path not in self._fetch_futures:
+                future = self._fetch_pool.submit(self._fetch_single, path)
+                logging.debug("Putting fetch of path {} in future {}"
+                              .format(path, future))
+                self._fetch_futures[path] = future
+                return future
+            else:
+                return self._fetch_futures[path]
+
+    def _finish_fetching(self, path):
+        """Given a path, wait until that path's fetch has finished. It
+        must already have been started."""
+        with self._fetch_lock:
+            if path not in self._fetch_futures:
+                raise RuntimeError("Fetch of path {} has not been started."
+                                   .format(path))
+            future = self._fetch_futures[path]
+        # Now that we have the future, wait for it to finish before returning.
+        future.result()
 
     def watch_store(self, ignore):
         """Watch the nix store's timestamp and sync whenever it changes.
@@ -755,16 +809,14 @@ class NixCacheClient(object):
         if self._dry_run is True:
             return
         # Build the list of paths to fetch from the remote store.
-        path_fetches = {}
+        paths_to_fetch = []
         for deriv, outputs in need_to_fetch.items():
             for output in outputs:
-                path = deriv.output_path(output)
-                path_fetches[path] = self.start_fetching(path)
-        # Wait for each thread to complete.
-        for deriv, outputs in need_to_fetch.items():
-            for output in outputs:
-                path = deriv.output_path(output)
-                path_fetches[path].join()
+                paths_to_fetch.append(deriv.output_path(output))
+        # Figure out the order to fetch them in.
+        fetch_order = self._compute_fetch_order(paths_to_fetch)
+        # Perform the fetches.
+        self._fetch_ordered_paths(fetch_order)
 
         # Build up the command for nix store to build the remaining paths.
         if len(need_to_build) > 0:
@@ -864,16 +916,17 @@ class NixCacheClient(object):
         """Print the result of a `preview_build` operation."""
         if len(need_to_build) == 0 and len(need_to_fetch) == 0:
             logging.info("All paths have already been built.")
-        if len(need_to_build) > 0:
-            msg = ("{} derivations need to be built"
-                   .format(len(need_to_build)) + (":" if verbose else "."))
+        n_need_build, n_need_fetch = len(need_to_build), len(need_to_fetch)
+        if n_need_build > 0:
+            msg = (("{} will be built" + (":" if verbose else "."))
+                   .format(tell_size(need_to_build, "derivation")))
             if verbose:
-                msg += "\n  ".join(deriv.path for deriv in need_to_build)
+                for deriv in need_to_build:
+                    msg += "\n  " + deriv.path
             logging.info(msg)
-        if len(need_to_fetch) > 0:
-            msg = ("{} paths will be fetched from {}"
-                   .format(len(need_to_fetch), self._endpoint) +
-                   (":" if verbose else "."))
+        if n_need_fetch > 0:
+            msg = (("{} will be fetched from {}" + (":" if verbose else "."))
+                   .format(tell_size(need_to_fetch, "path"), self._endpoint))
             if verbose:
                 for deriv, outs in need_to_fetch.items():
                     for out in outs:
@@ -903,7 +956,7 @@ def _get_args():
                        help="Base path to evaluate.")
     build.add_argument("attributes", nargs="*",
                        help="Expressions to evaluate.")
-    build.add_argument("--verbose", action="store_true", default=False,
+    build.add_argument("-v", "--verbose", action="store_true", default=False,
                        help="Show verbose output.")
     build.add_argument("--no-trace", action="store_false", dest="show_trace",
                        help="Hide stack trace on instantiation error.")
