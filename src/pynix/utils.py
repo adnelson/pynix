@@ -135,11 +135,26 @@ def tell_size(obj, word, suffix="s"):
     else:
         return "{} {}{}".format(len(obj), word, suffix)
 
-def decompress(program, data):
-    """Decompresses the given data by via the given program."""
-    proc = Popen(program, stdin=PIPE, stdout=PIPE, shell=True)
-    out = proc.communicate(input=data)[0]
-    if proc.wait() != 0:
-        raise ServerError("Decompression with '{}' failed"
-                          .format(program))
-    return out
+def is_path_in_store(store_path, db_con=None):
+    """Check if a path is in the nix store.
+
+    Optionally provide a database connection which speeds things up.
+    """
+    # If we have a connection to the database, all we have to
+    # do is look in the database.
+    if db_con is not None:
+        query = "select path from ValidPaths where path = ?"
+        with db_con:
+            results = db_con.execute(query, (store_path,)).fetchall()
+        if len(results) > 0:
+            return True
+        else:
+            return False
+    else:
+        # Otherwise we have to use the slower method :( Subprocess
+        # into nix-store and execute a query.
+        try:
+            query_store(store_path, "--hash", hide_stderr=True)
+            return True
+        except CalledProcessError:
+            return False

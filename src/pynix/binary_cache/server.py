@@ -169,28 +169,10 @@ class NixServer(Flask):
             # If the path isn't in the filesystem, it definitely is
             # not a valid path.
             return False
-        # If it is on the filesystem, it doesn't necessarily mean
-        # that it's a registered path in the store. Check that
-        # here.
-        # If we have a connection to the database, all we have to
-        # do is look in the database.
-        if self._db_con is not None:
-            query = "select path from ValidPaths where path = ?"
-            with self._db_con:
-                results = self._db_con.execute(query, (store_path,)).fetchall()
-            if len(results) > 0:
-                self._known_store_paths.add(store_path)
-                return True
-            else:
-                return False
-        else:
-            # Otherwise we have to use the slower method :(
-            try:
-                query_store(store_path, "--hash", hide_stderr=True)
-                self._known_store_paths.add(store_path)
-                return True
-            except CalledProcessError:
-                return False
+        in_store = is_path_in_store(store_path, db_con=self._db_con)
+        if in_store is True:
+            self._known_store_paths.add(store_path)
+        return in_store
 
     @functools.lru_cache(maxsize=2048)
     def build_nar(self, store_path, compression_type):

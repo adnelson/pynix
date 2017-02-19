@@ -29,11 +29,12 @@ class CliError(Exception):
     EXIT_MESSAGE = None
     RETURN_CODE = 1
     def exit(self):
-        system_exit = SystemExit()
-        system_exit.code = self.RETURN_CODE
+        _name = type(self).__name__
         if self.EXIT_MESSAGE is not None:
-            sys.stderr.write(self.EXIT_MESSAGE + "\n")
-        raise system_exit
+            sys.stderr.write(_name + ": " + self.EXIT_MESSAGE + "\n")
+        else:
+            sys.stderr.write(_name + "\n")
+        raise SystemExit(self.RETURN_CODE)
 
 class ClientError(BaseHTTPError):
     """Base class for errors on the client side."""
@@ -99,13 +100,18 @@ class NixInstantiationError(NixOperationError, CliError):
                        .format(", ".join(attributes), nix_file))
         self.EXIT_MESSAGE = message
 
+class NixBuildError(NixOperationError, CliError):
+    """Raised when building a nix expression fails."""
+    OPERATION = "nix-build"
 
-class ObjectNotBuilt(NixOperationError):
+class ObjectNotBuilt(NixOperationError, CliError):
     def __init__(self, store_path):
         message = ("Expected store path {} to be built, but it wasn't"
                    .format(store_path))
+        self.EXIT_MESSAGE = message
         NixOperationError.__init__(self, nix_operation="nix-store",
                                    message=message)
+        CliError.__init__(self)
         self.store_path = store_path
 
 class CouldNotConnect(Exception):

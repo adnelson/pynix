@@ -19,6 +19,9 @@ from six.moves.urllib_parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, Future, wait, as_completed
 from multiprocessing import cpu_count
 import yaml
+import lzma
+import gzip
+import bz2
 
 # Special-case here to address a runtime bug I've encountered
 try:
@@ -36,10 +39,12 @@ import requests
 import six
 
 from pynix import __version__
-from pynix.utils import (strip_output, decode_str, decompress, NIX_BIN_PATH,
-                         NIX_STORE_PATH, NIX_STATE_PATH, NIX_DB_PATH, nix_cmd,
-                         query_store, instantiate, tell_size)
-from pynix.exceptions import (CouldNotConnect, NixImportFailed, CliError)
+from pynix.utils import (strip_output, decode_str, NIX_STORE_PATH,
+                         NIX_STATE_PATH, NIX_DB_PATH, nix_cmd,
+                         query_store, instantiate, tell_size,
+                         is_path_in_store)
+from pynix.exceptions import (CouldNotConnect, NixImportFailed, CliError,
+                              ObjectNotBuilt, NixBuildError)
 from pynix.narinfo import NarInfo
 from pynix.build import needed_to_build_multi, parse_deriv_paths
 
@@ -83,18 +88,17 @@ class NixCacheClient(object):
         #: Cache of direct path references (string -> strings). This
         # is loaded asyncronously from an on-disk cache located in
         # NIX_PATH_CACHE.
-        self._path_references = {}
+        self.__path_references = None
+        self._query_pool = ThreadPoolExecutor(max_workers=max_jobs)
+        self._fetch_pool = ThreadPoolExecutor(max_workers=max_jobs)
         # Start the cache loading thread but don't block on it; this
         # prevents slow startup time due to the loading of a large
         # cache.
-        self._cache_thread = Thread(target=self._load_path_cache)
-        self._cache_thread.start()
+        self._cache_future = self._query_pool.submit(self._load_path_cache)
         #: Cache of narinfo objects requested from the server.
         self._narinfo_cache = {}
         self._paths_fetched = set()
         self._max_jobs = max_jobs
-        self._query_pool = ThreadPoolExecutor(max_workers=max_jobs)
-        self._fetch_pool = ThreadPoolExecutor(max_workers=max_jobs)
 
         # A semaphore which will bound the number of concurrent fetches.
         self._fetch_semaphore = BoundedSemaphore(value=max_jobs)
@@ -106,6 +110,7 @@ class NixCacheClient(object):
         self._fetch_futures = {}
         # A lock which syncronizes access to the fetch_threads dictionary.
         self._fetch_lock = RLock()
+        self._db_con = sqlite3.connect(NIX_DB_PATH)
 
     def _load_path_cache(self):
         """Load the store reference path cache.
@@ -115,15 +120,21 @@ class NixCacheClient(object):
         if not isdir(NIX_PATH_CACHE):
             return {}
         logging.debug("Loading path cache...")
-        # path_cache = {}
+        path_cache = {}
         for store_path in os.listdir(NIX_PATH_CACHE):
             refs_dir = join(NIX_PATH_CACHE, store_path)
             refs = [join(NIX_STORE_PATH, path) for path in os.listdir(refs_dir)
                     if path != store_path]
-            self._path_references[join(NIX_STORE_PATH, store_path)] = refs
+            path_cache[join(NIX_STORE_PATH, store_path)] = refs
         logging.debug("Finished loading path cache.")
-        # logging.debug("Loaded references of {} paths".format(len(path_cache)))
-        # return path_cache
+        return path_cache
+
+    @property
+    def _path_references(self):
+        """Resolve the path reference future and return the result."""
+        if self.__path_references is None:
+            self.__path_references = self._cache_future.result()
+        return self.__path_references
 
     def _update_narinfo_cache(self, narinfo, write_to_disk):
         """Write a narinfo entry to the cache.
@@ -144,8 +155,8 @@ class NixCacheClient(object):
             os.makedirs(server_cache)
         if isfile(narinfo_path):
             return
-        tempfile_path = tempfile.mkstemp()[1]
-        with open(tempfile_path, "w") as f:
+        tempfile_fd, tempfile_path = tempfile.mkstemp()
+        with os.fdopen(tempfile_fd, "w") as f:
             f.write(json.dumps(narinfo.as_dict()))
         shutil.move(tempfile_path, narinfo_path)
 
@@ -202,11 +213,16 @@ class NixCacheClient(object):
             cache_path = join(NIX_NARINFO_CACHE, self._endpoint_server,
                               basename(path))
             if isfile(cache_path):
-                logging.debug("Loading {} narinfo from on-disk cache"
-                              .format(basename(path)))
-                write_to_disk = False
-                with open(cache_path) as f:
-                    narinfo = NarInfo.from_dict(json.load(f))
+                try:
+                    logging.debug("Loading {} narinfo from on-disk cache"
+                                  .format(basename(path)))
+                    with open(cache_path) as f:
+                        narinfo = NarInfo.from_dict(json.load(f))
+                    write_to_disk = False
+                except json.decoder.JSONDecodeError:
+                    logging.debug("Invalid cache JSON: {}".format(cache_path))
+                    os.unlink(cache_path)
+                    return self.get_narinfo(path)
             else:
                 logging.debug("Requesting {} narinfo from server"
                               .format(basename(path)))
@@ -563,46 +579,46 @@ class NixCacheClient(object):
         else:
             return False
 
-    def fetch_object(self, path):
-        """Fetch a store object from a nix server.
+    # def fetch_object(self, path):
+    #     """Fetch a store object from a nix server.
 
-        This is obviously the inverse of a send, and quite a similar
-        algorithm (first fetch parents, and then fetch the
-        object). But it's a little different because although with a
-        send you already know (or can derive) the references of the
-        object, with fetching you need to ask the server for the
-        references.
+    #     This is obviously the inverse of a send, and quite a similar
+    #     algorithm (first fetch parents, and then fetch the
+    #     object). But it's a little different because although with a
+    #     send you already know (or can derive) the references of the
+    #     object, with fetching you need to ask the server for the
+    #     references.
 
-        :param path: The path to the store object to fetch.
-        :type path: ``str``
+    #     :param path: The path to the store object to fetch.
+    #     :type path: ``str``
 
-        Side effects:
-        * Adds 0 or 1 paths to `self._paths_fetched`.
+    #     Side effects:
+    #     * Adds 0 or 1 paths to `self._paths_fetched`.
 
-        This function should be thread safe, since a nix-store import
-        is idempotent.
-        """
-        # Check if the object has already been fetched; if so we can stop.
-        if self._have_fetched(path):
-            logging.debug("{} has already been fetched.".format(path))
-            return
-        # First fetch all of the object's references.
-        refs = self.get_references(path, query_server=True)
-        logging.debug("Waiting for parent paths of {} ({}) to fetch..."
-                      .format(path, ", ".join(refs)))
-        ref_fetches = {ref: self.start_fetching(ref) for ref in refs}
-        for rpath, thread in ref_fetches.items():
-            logging.debug("{} waiting for reference {} to fetch..."
-                          .format(path, rpath))
-            thread.join()
-            logging.debug("Path {} (ref of {}) has fetched.".format(rpath, path))
-        logging.debug("All parent paths of {} finished.".format(path))
+    #     This function should be thread safe, since a nix-store import
+    #     is idempotent.
+    #     """
+    #     # Check if the object has already been fetched; if so we can stop.
+    #     if self._have_fetched(path):
+    #         logging.debug("{} has already been fetched.".format(path))
+    #         return
+    #     # First fetch all of the object's references.
+    #     refs = self.get_references(path, query_server=True)
+    #     logging.debug("Waiting for parent paths of {} ({}) to fetch..."
+    #                   .format(path, ", ".join(refs)))
+    #     ref_fetches = {ref: self.start_fetching(ref) for ref in refs}
+    #     for rpath, thread in ref_fetches.items():
+    #         logging.debug("{} waiting for reference {} to fetch..."
+    #                       .format(path, rpath))
+    #         thread.join()
+    #         logging.debug("Path {} (ref of {}) has fetched.".format(rpath, path))
+    #     logging.debug("All parent paths of {} finished.".format(path))
 
-        # Now we can fetch the object itself. Syncronize this with the
-        # fetch semaphore to prevent too many simultaneous
-        # connections.
-        with self._fetch_semaphore:
-            self._fetch_single(path)
+    #     # Now we can fetch the object itself. Syncronize this with the
+    #     # fetch semaphore to prevent too many simultaneous
+    #     # connections.
+    #     with self._fetch_semaphore:
+    #         self._fetch_single(path)
 
     # def _compute_fetch_order(self, starting_path):
     #     """Given some starting path, compute the order in which paths
@@ -640,6 +656,7 @@ class NixCacheClient(object):
                       .format(tell_size(paths, "path")))
         for path in paths:
             _order(path)
+        logging.debug("Finished computing fetch order.")
         return order
 
     def _fetch_ordered_paths(self, store_paths):
@@ -668,44 +685,39 @@ class NixCacheClient(object):
 
         # Figure out how to extract the content.
         if narinfo.compression.lower() in ("xz", "xzip"):
-            data = decompress("xz -d", response.content)
+            data = lzma.decompress(response.content)
         elif narinfo.compression.lower() in ("bz2", "bzip2"):
-            data = decompress("bzip2 -d", response.content)
+            data = bz2.decompress(response.content)
         elif narinfo.compression.lower() in ("gzip", "gz"):
-            data = decompress("gzip -d", response.content)
+            data = gzip.decompress(response.content)
         else:
             raise ValueError("Unsupported narinfo compression type {}"
                              .format(narinfo.compression))
-        # Once extracted, convert it into a nix export object and pass
-        # it into the nix-store --import command.
-        proc = Popen([join(NIX_BIN_PATH, "nix-store"), "--import"],
-                     stdin=PIPE, stderr=PIPE, stdout=PIPE)
+        # Once extracted, convert it into a nix export object and import.
         export = narinfo.nar_to_export(data)
-        out, err = proc.communicate(input=export.to_bytes())
-        if proc.wait() != 0:
-            raise NixImportFailed(decode_str(err))
-        logging.info("Imported {}".format(out.decode("utf-8")).strip())
+        imported_path = export.import_to_store()
+        logging.info("Imported {}".format(imported_path))
         self._register_as_fetched(path)
 
     def _register_as_fetched(self, path):
         """Register that a store path has been fetched."""
         self._paths_fetched.add(path)
 
-    def start_fetching(self, path):
-        """Start a fetch thread. Syncronized so that a fetch of a
-        single path will only happen once."""
-        with self._fetch_lock:
-            if path not in self._fetch_threads:
-                thread = Thread(target=self.fetch_object, args=(path,))
-                # Tell thread to terminate on keyboard interrupt.
-                thread.daemon = True
-                logging.debug("Putting fetch of path {} in thread {}"
-                              .format(path, thread))
-                thread.start()
-                self._fetch_threads[path] = thread
-                return thread
-            else:
-                return self._fetch_threads[path]
+    # def start_fetching(self, path):
+    #     """Start a fetch thread. Syncronized so that a fetch of a
+    #     single path will only happen once."""
+    #     with self._fetch_lock:
+    #         if path not in self._fetch_threads:
+    #             thread = Thread(target=self.fetch_object, args=(path,))
+    #             # Tell thread to terminate on keyboard interrupt.
+    #             thread.daemon = True
+    #             logging.debug("Putting fetch of path {} in thread {}"
+    #                           .format(path, thread))
+    #             thread.start()
+    #             self._fetch_threads[path] = thread
+    #             return thread
+    #         else:
+    #             return self._fetch_threads[path]
 
     def _start_fetching(self, path):
         """Start a fetch thread. Syncronized so that a fetch of a
@@ -775,7 +787,7 @@ class NixCacheClient(object):
         """
         ignore = [re.compile(r) for r in ignore]
         paths = []
-        with sqlite3.connect(NIX_DB_PATH) as con:
+        with self._db_con:
             query = con.execute("SELECT path FROM ValidPaths")
             for result in query.fetchall():
                 path = result[0]
@@ -812,10 +824,14 @@ class NixCacheClient(object):
             for output in outputs:
                 paths_to_fetch.append(deriv.output_path(output))
         # Figure out the order to fetch them in.
+        logging.info("Computing fetch order...")
         fetch_order = self._compute_fetch_order(paths_to_fetch)
+        logging.info("Beginning fetches. Total of {} to fetch."
+                     .format(tell_size(fetch_order, "store object")))
         # Perform the fetches.
         self._fetch_ordered_paths(fetch_order)
-
+        logging.info("Finished fetching from remote server. Verifying...")
+        self._verify(need_to_fetch)
         # Build up the command for nix store to build the remaining paths.
         if len(need_to_build) > 0:
             args = ["--max-jobs", str(self._max_jobs), "--no-gc-warning",
@@ -823,13 +839,34 @@ class NixCacheClient(object):
             args.extend(d.path for d in need_to_build)
             if keep_going is True:
                 args.append("--keep-going")
+            logging.info("Building {} locally"
+                         .format(tell_size(need_to_build, "derivation")))
             cmd = nix_cmd("nix-store", args)
-            strip_output(cmd).split()
+            try:
+                strip_output(cmd).split()
+            except CalledProcessError as err:
+                self._handle_build_failure(need_to_build)
         else:
             logging.info("No derivations needed to be built locally")
         if create_links is True:
             self._create_symlinks(derivs_to_outputs, use_deriv_name)
         return derivs_to_outputs
+
+    def _handle_build_failure(self, derivs_to_outputs):
+        """In a failure situation, report which derivations succeeded and
+        which failed.
+        """
+        # TODO: report exactly which derivations succeeded/failed.
+        raise NixBuildError()
+
+    def _verify(self, derivs_to_outputs):
+        """Given a derivation-output mapping, verify all paths."""
+        for deriv, outputs in derivs_to_outputs.items():
+            for output in outputs:
+                path = deriv.output_path(output)
+                logging.info("Verifying {}".format(path))
+                if not is_path_in_store(path, db_con=self._db_con):
+                    raise ObjectNotBuilt(path)
 
     def _create_symlinks(self, derivs_to_outputs, use_deriv_name):
         """Create symlinks to all built derivations.
@@ -877,7 +914,7 @@ class NixCacheClient(object):
         if len(needed) > 0:
             logging.info("{} were not in the local nix store. Querying {} to "
                          "see which paths it has..."
-                         .format(tell_size(needed, "needed object"), 
+                         .format(tell_size(needed, "needed object"),
                                  self._endpoint))
             on_server = {}
             # Query the server for missing paths. Start by trying a
@@ -973,6 +1010,8 @@ def _get_args():
     build.add_argument("-g", "--generic-link-name", action="store_true",
                        default=False,
                        help="Use generic `result` name for symlinks.")
+    build.add_argument("-1", "--one", action="store_true", default=False,
+                       help="Alias for '--max-jobs=1 --stop-on-failure'")
     build.set_defaults(show_trace=True, keep_going=True, print_paths=True)
     for subparser in (send, sync, daemon, fetch, build):
         subparser.add_argument("-e", "--endpoint",
@@ -1011,10 +1050,10 @@ def main():
     # Hide noisy logging of some external libs
     for name in ("requests", "urllib", "urllib2", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
+    max_jobs = 1 if args.one else args.max_jobs
+    client = NixCacheClient(endpoint=args.endpoint, dry_run=args.dry_run,
+                            username=args.username, max_jobs=max_jobs)
     try:
-        client = NixCacheClient(
-            endpoint=args.endpoint, dry_run=args.dry_run,
-            username=args.username, max_jobs=args.max_jobs)
         if args.command == "send":
             client.send_objects(args.paths)
         elif args.command == "sync":
@@ -1024,10 +1063,11 @@ def main():
         elif args.command == "fetch":
             wait(list(client.fetch_objects(args.paths).values()))
         elif args.command == "build":
+            keep_going = False if args.one else args.keep_going
             result_derivs = client.build_fetch(
                 nix_file=args.path, attributes=args.attributes,
                 verbose=args.verbose, show_trace=args.show_trace,
-                keep_going=args.keep_going, create_links=args.create_links,
+                keep_going=keep_going, create_links=args.create_links,
                 use_deriv_name=not args.generic_link_name)
             if args.dry_run is False and args.print_paths is True:
                 for deriv, outputs in result_derivs.items():

@@ -4,9 +4,9 @@ from io import BytesIO
 import os
 from os.path import join, basename, dirname
 import yaml
-from subprocess import check_output
+from subprocess import check_output, CalledProcessError
 
-from pynix.utils import decode_str, strip_output, NIX_BIN_PATH, query_store
+from pynix.utils import decode_str, strip_output, nix_cmd, query_store
 from pynix.exceptions import NoNarGenerated
 
 # Magic 8-byte number that comes at the beginning of the export's bytes.
@@ -164,8 +164,8 @@ class NarInfo(object):
         file_size = int(dictionary["filesize"])
         file_hash = dictionary["filehash"]
         references = dictionary.get("references") or []
-        if isinstance(dictionary["references"], str):
-            references = dictionary["references"].split()
+        if isinstance(references, str):
+            references = references.split()
         deriver = dictionary.get("deriver") or None
         signature = dictionary.get("sig")
         return cls(url=url, store_path=store_path, compression=compression,
@@ -194,10 +194,8 @@ class NarInfo(object):
             "})"])
 
         # Nix-build this expression, resulting in a store object.
-        compressed_path = strip_output([
-            join(NIX_BIN_PATH, "nix-build"),
-            "--expr", nar_expr, "--no-out-link"
-        ], shell=False)
+        compressed_path = strip_output(
+            nix_cmd( "nix-build", ["--expr", nar_expr, "--no-out-link"]))
 
         # This path will contain a compressed file; return its path.
         extension = ".nar." + ("bz2" if compression_type == "bzip2" else "xz")
@@ -227,8 +225,8 @@ class NarInfo(object):
         nar_path = cls.build_nar(store_path, compression_type=compression_type)
         du = strip_output("du -sb {}".format(nar_path))
         file_size = int(du.split()[0])
-        file_hash = strip_output("nix-hash --type sha256 --base32 --flat {}"
-                                 .format(nar_path))
+        file_hash = strip_output(nix_cmd("nix-hash", ["--type", "sha256",
+                                         "--base32", "--flat", nar_path]))
         nar_size = query_store(store_path, "--size")
         nar_hash = query_store(store_path, "--hash")
         references = query_store(store_path, "--references").split()
@@ -285,6 +283,14 @@ class NarExport(object):
         for path in _paths:
             if not os.path.isabs(path):
                 raise ValueError("Paths must be absolute ({}).".format(path))
+
+    def import_to_store(self):
+        """Import this NarExport into the local nix store."""
+        try:
+            return strip_output(nix_cmd("nix-store", ["--import"]),
+                                input=self.to_bytes())
+        except CalledProcessError:
+            raise NixImportFailed("See above stderr")
 
     def to_bytes(self):
         """Convert a nar export into bytes.
@@ -353,7 +359,7 @@ class NarExport(object):
         else:
             # Write a zero here so that nix doesn't look for a signature.
             bio.write(EIGHT_ZEROS)
-                                
+
         # Write a final zero to indicate the end of the export.
         bio.write(EIGHT_ZEROS)
 

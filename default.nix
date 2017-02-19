@@ -23,8 +23,8 @@ pythonPackages.buildPythonPackage rec {
     ipdb
     six
     datadiff
-    pythonPackages.curio
-    curio-http
+    # pythonPackages.curio
+    # curio-http
     rtyaml
   ] ++ (if pythonPackages.isPy3k or false then [] else [
     pythonPackages.futures

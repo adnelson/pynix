@@ -11,7 +11,7 @@ import rtyaml
 
 class Derivation(object):
     """A Python representation of a derivation."""
-    # Cache of parsed derivations, to avoid duplicat parsing.
+    # Cache of parsed derivations, to avoid duplicate parsing.
     CACHE = {}
 
     def __init__(self, path, raw, outputs, input_derivations,
