@@ -1,3 +1,5 @@
 result
 *.nar.xz
 *.nar.bz2
+**/*.egg-info
+**/__pycache__

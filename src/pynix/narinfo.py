@@ -63,8 +63,6 @@ class NarInfo(object):
         self.references = list(sorted(basename(r) for r in references))
         self.deriver = basename(deriver) if deriver else None
         self.signature = signature
-        if signature is None:
-            raise ValueError("fartyfarts")
 
     def __repr__(self):
         return "NarInfo({})".format(self.store_path)
@@ -348,11 +346,15 @@ class NarExport(object):
             addstr(bio, b"")
 
         if self.signature is not None:
+            # First write a '1' to tell nix that we have a signature.
+            bio.write((1).to_bytes(8, "little"))
+            # Then write the signature.
             addstr(bio, self.signature.encode("utf-8"))
         else:
-            addstr(bio, b"")
-
-        # Add a final 0, not sure why though...
+            # Write a zero here so that nix doesn't look for a signature.
+            bio.write(EIGHT_ZEROS)
+                                
+        # Write a final zero to indicate the end of the export.
         bio.write(EIGHT_ZEROS)
 
         # Return the contents of the bytesio as the resulting bytestring.

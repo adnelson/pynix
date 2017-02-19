@@ -802,8 +802,6 @@ class NixCacheClient(object):
         deriv_paths = instantiate(nix_file, attributes=attributes,
                                   show_trace=show_trace)
         derivs_to_outputs = parse_deriv_paths(deriv_paths)
-        logging.info("Querying {} for which paths it has..."
-                     .format(self._endpoint))
         need_to_build, need_to_fetch = self.preview_build(deriv_paths)
         self.print_preview(need_to_build, need_to_fetch, verbose)
         if self._dry_run is True:
@@ -877,6 +875,10 @@ class NixCacheClient(object):
         # Run the first time with no on_server argument.
         needed, need_fetch = needed_to_build_multi(derivs_outs, existing=existing)
         if len(needed) > 0:
+            logging.info("{} were not in the local nix store. Querying {} to "
+                         "see which paths it has..."
+                         .format(tell_size(needed, "needed object"), 
+                                 self._endpoint))
             on_server = {}
             # Query the server for missing paths. Start by trying a
             # multi-query because it's faster; if the server doesn't
