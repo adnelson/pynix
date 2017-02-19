@@ -85,28 +85,24 @@ class NixCacheClient(object):
         self._objects_on_server = set()
         #: When sending objects, this can be used to count remaining.
         self._remaining_objects = None
-        #: Cache of direct path references (string -> strings). This
-        # is loaded asyncronously from an on-disk cache located in
-        # NIX_PATH_CACHE.
-        self.__path_references = None
+        # A thread pool which handles queries for narinfo.
         self._query_pool = ThreadPoolExecutor(max_workers=max_jobs)
+        # A thread pool which handles store object fetches.
         self._fetch_pool = ThreadPoolExecutor(max_workers=max_jobs)
         # Start the cache loading thread but don't block on it; this
         # prevents slow startup time due to the loading of a large
         # cache.
+        self.__path_references = None
         self._cache_future = self._query_pool.submit(self._load_path_cache)
         #: Cache of narinfo objects requested from the server.
         self._narinfo_cache = {}
         self._paths_fetched = set()
         self._max_jobs = max_jobs
 
-        # A semaphore which will bound the number of concurrent fetches.
-        self._fetch_semaphore = BoundedSemaphore(value=max_jobs)
-        # A dictionary mapping nix store paths to threads fetching
+        # A dictionary mapping nix store paths to futures fetching
         # those paths from a cache. Each fetch happens in a different
         # thread, and we use this dictionary to make sure that a fetch
         # only happens once.
-        self._fetch_threads = {}
         self._fetch_futures = {}
         # A lock which syncronizes access to the fetch_threads dictionary.
         self._fetch_lock = RLock()
@@ -579,70 +575,6 @@ class NixCacheClient(object):
         else:
             return False
 
-    # def fetch_object(self, path):
-    #     """Fetch a store object from a nix server.
-
-    #     This is obviously the inverse of a send, and quite a similar
-    #     algorithm (first fetch parents, and then fetch the
-    #     object). But it's a little different because although with a
-    #     send you already know (or can derive) the references of the
-    #     object, with fetching you need to ask the server for the
-    #     references.
-
-    #     :param path: The path to the store object to fetch.
-    #     :type path: ``str``
-
-    #     Side effects:
-    #     * Adds 0 or 1 paths to `self._paths_fetched`.
-
-    #     This function should be thread safe, since a nix-store import
-    #     is idempotent.
-    #     """
-    #     # Check if the object has already been fetched; if so we can stop.
-    #     if self._have_fetched(path):
-    #         logging.debug("{} has already been fetched.".format(path))
-    #         return
-    #     # First fetch all of the object's references.
-    #     refs = self.get_references(path, query_server=True)
-    #     logging.debug("Waiting for parent paths of {} ({}) to fetch..."
-    #                   .format(path, ", ".join(refs)))
-    #     ref_fetches = {ref: self.start_fetching(ref) for ref in refs}
-    #     for rpath, thread in ref_fetches.items():
-    #         logging.debug("{} waiting for reference {} to fetch..."
-    #                       .format(path, rpath))
-    #         thread.join()
-    #         logging.debug("Path {} (ref of {}) has fetched.".format(rpath, path))
-    #     logging.debug("All parent paths of {} finished.".format(path))
-
-    #     # Now we can fetch the object itself. Syncronize this with the
-    #     # fetch semaphore to prevent too many simultaneous
-    #     # connections.
-    #     with self._fetch_semaphore:
-    #         self._fetch_single(path)
-
-    # def _compute_fetch_order(self, starting_path):
-    #     """Given some starting path, compute the order in which paths
-    #     should be fetched from the cache in order to fetch the path
-    #     with its dependencies satisfied.
-
-    #     :param starting_path: A store path to start with.
-    #     :type starting_path: ``str``
-
-    #     :return: An iterator of paths in the order that they should be fetched.
-    #     :rtype: ``iterator`` of ``str``
-    #     """
-    #     order = []
-    #     order_set = set()
-    #     stack = [starting_path]
-    #     while len(stack) > 0:
-    #         path = stack.pop()
-    #         if path not in order_set:
-    #             order.append(path)
-    #             order_set.add(path)
-    #             for ref in self.get_references(path):
-    #                 stack.append(ref)
-    #     return reversed(order)
-
     def _compute_fetch_order(self, paths):
         order = []
         order_set = set()
@@ -702,22 +634,6 @@ class NixCacheClient(object):
     def _register_as_fetched(self, path):
         """Register that a store path has been fetched."""
         self._paths_fetched.add(path)
-
-    # def start_fetching(self, path):
-    #     """Start a fetch thread. Syncronized so that a fetch of a
-    #     single path will only happen once."""
-    #     with self._fetch_lock:
-    #         if path not in self._fetch_threads:
-    #             thread = Thread(target=self.fetch_object, args=(path,))
-    #             # Tell thread to terminate on keyboard interrupt.
-    #             thread.daemon = True
-    #             logging.debug("Putting fetch of path {} in thread {}"
-    #                           .format(path, thread))
-    #             thread.start()
-    #             self._fetch_threads[path] = thread
-    #             return thread
-    #         else:
-    #             return self._fetch_threads[path]
 
     def _start_fetching(self, path):
         """Start a fetch thread. Syncronized so that a fetch of a
