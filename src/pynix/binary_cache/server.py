@@ -41,6 +41,8 @@ _PATH_REGEX=re.compile(r"([a-z0-9]{32})-[^' \n/]*$")
 _STORE_PATH_REGEX = re.compile(
     join(NIX_STORE_PATH, _PATH_REGEX.pattern))
 
+_NAR_CACHE_SIZE = int(os.getenv("NAR_CACHE_SIZE", 2048))
+
 class NixServer(Flask):
     """Serves nix packages."""
     def __init__(self,
@@ -174,7 +176,7 @@ class NixServer(Flask):
             self._known_store_paths.add(store_path)
         return in_store
 
-    @functools.lru_cache(maxsize=2048)
+    @functools.lru_cache(maxsize=_NAR_CACHE_SIZE)
     def build_nar(self, store_path, compression_type):
         """Start a build of a NAR (nix archive). The result is a
         future which will result in a NAR path."""
@@ -335,7 +337,6 @@ class NixServer(Flask):
                     import ipdb
                     ipdb.set_trace()
                 return ("An unknown error occurred", 500)
-
         return app
 
 

@@ -5,6 +5,8 @@ from os import getenv
 from os.path import exists, join, dirname, isdir, realpath
 from subprocess import check_output, PIPE, Popen, CalledProcessError
 
+import six
+
 from pynix.exceptions import NixInstantiationError
 
 def decode_str(string):
@@ -115,7 +117,7 @@ def instantiate(nix_file, attributes=None, show_trace=True):
     try:
         return strip_output(command).split()
     except CalledProcessError as err:
-        raise NixInstantiationError(nix_file, attributes) from err
+        six.raise_from(NixInstantiationError(nix_file, attributes), err)
 
 def tell_size(obj, word, suffix="s"):
     """Useful when you want to write a message to the user.

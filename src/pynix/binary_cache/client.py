@@ -19,7 +19,10 @@ from six.moves.urllib_parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, Future, wait, as_completed
 from multiprocessing import cpu_count
 import yaml
-import lzma
+if sys.version_info >= (3, 0):
+    import lzma
+else:
+    from backports import lzma
 import gzip
 import bz2
 
@@ -106,6 +109,7 @@ class NixCacheClient(object):
         self._fetch_futures = {}
         # A lock which syncronizes access to the fetch_threads dictionary.
         self._fetch_lock = RLock()
+        # Connection to the nix state database.
         self._db_con = sqlite3.connect(NIX_DB_PATH)
 
     def _load_path_cache(self):

@@ -15,6 +15,7 @@ let
     };
     propagatedBuildInputs = [pythonPackages.pyyaml];
   };
+  isPy3 = pythonPackages.isPy3k or false;
 in
 
 pythonPackages.buildPythonPackage rec {
@@ -32,8 +33,9 @@ pythonPackages.buildPythonPackage rec {
     six
     datadiff
     rtyaml
-  ] ++ (if pythonPackages.isPy3k or false then [] else [
+  ] ++ (if isPy3 then [] else [
     pythonPackages.futures
+    pythonPackages.backports_lzma
   ]);
   src = ./.;
   makeWrapperArgs = [
