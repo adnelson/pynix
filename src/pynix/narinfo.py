@@ -241,7 +241,8 @@ class NarInfo(object):
             file_size=str(file_size),
             file_hash="sha256:{}".format(file_hash),
             references=references,
-            deriver=None if deriver == "unknown-deriver" else deriver
+            deriver=None if deriver == "unknown-deriver" else deriver,
+            signature=None
         )
         cls.NARINFO_CACHE[compression_type][store_path] = narinfo
         return narinfo
