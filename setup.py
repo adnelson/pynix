@@ -15,6 +15,8 @@ setuptools.setup(
     install_requires=open("requirements.txt").readlines(),
     entry_points={
         "console_scripts": [
+            "servenix = pynix.binary_cache.server:main",
+            "sendnix = pynix.binary_cache.client:main",
             "nix-server = pynix.binary_cache.server:main",
             "nix-client = pynix.binary_cache.client:main",
             "derivtool = pynix.derivtool:main"

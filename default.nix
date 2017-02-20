@@ -20,7 +20,7 @@ in
 
 pythonPackages.buildPythonPackage rec {
   name = "pynix-${version}";
-  buildInputs = [pythonPackages.ipython];
+  buildInputs = with pythonPackages; [ipython nose mock];
   propagatedBuildInputs = with pythonPackages; [
     pkgs.coreutils
     pkgs.gzip
@@ -37,6 +37,7 @@ pythonPackages.buildPythonPackage rec {
     pythonPackages.futures
     pythonPackages.backports_lzma
   ]);
+  checkPhase = "nosetests tests";
   src = ./.;
   makeWrapperArgs = [
     "--set NIX_BIN_PATH ${pkgs.lib.makeBinPath [pkgs.nix.out]}"

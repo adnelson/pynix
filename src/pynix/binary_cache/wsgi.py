@@ -9,7 +9,6 @@ log_level = os.environ.get("LOG_LEVEL", "INFO")
 logging.basicConfig(level=getattr(logging, log_level), format="%(message)s")
 compression_type = os.getenv("COMPRESSION_TYPE", "xz")
 nixserver = NixServer(compression_type=compression_type,
-                      debug=False,
                       direct_db=os.getenv("NO_DIRECT_DB", "") == "")
 
 app = nixserver.make_app()

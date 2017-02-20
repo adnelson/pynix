@@ -5,6 +5,7 @@ import logging
 import os
 from os.path import exists, isdir, join, basename, dirname
 import re
+import gzip
 from subprocess import Popen, PIPE, CalledProcessError
 from threading import Thread
 # Special-case here to address a runtime bug I've encountered.
@@ -27,7 +28,7 @@ from flask import Flask, make_response, send_file, request, jsonify
 import six
 
 from pynix import __version__
-from pynix.utils import (decode_str, strip_output, decompress, query_store,
+from pynix.utils import (decode_str, strip_output, query_store,
                          NIX_STORE_PATH, NIX_STATE_PATH, NIX_BIN_PATH,
                          NIX_DB_PATH)
 from pynix.narinfo import NarInfo
@@ -43,12 +44,14 @@ _STORE_PATH_REGEX = re.compile(
 
 _NAR_CACHE_SIZE = int(os.getenv("NAR_CACHE_SIZE", 2048))
 
-class NixServer(Flask):
+class NixServer(object):
     """Serves nix packages."""
-    def __init__(self,
-                 compression_type="xz",
-                 debug=False,
-                 direct_db=True):
+    def __init__(self, compression_type="xz", direct_db=True):
+        """Initializer.
+
+        :param compression_type: How to compress NARs. Either 'xz' or 'bzip2'.
+        :type compression_type: ``str``
+        """
         self._compression_type = compression_type
         # Cache mapping object hashes to store paths.
         self._hashes_to_paths = {}
@@ -66,8 +69,6 @@ class NixServer(Flask):
             self._nar_extension = ".nar.bz2"
         else:
             self._nar_extension = ".nar.xz"
-        # Enable interactive debugging on unknown errors.
-        self._debug = debug
         logging.info("Nix store path: {}".format(NIX_STORE_PATH))
         logging.info("Nix state path: {}".format(NIX_STATE_PATH))
         logging.info("Nix bin path: {}".format(NIX_BIN_PATH))
@@ -301,7 +302,7 @@ class NixServer(Flask):
             if content_type in (None, "", "application/octet-stream"):
                 data = request.data
             elif content_type == "application/x-gzip":
-                data = decompress("gzip -d", request.data)
+                data = gzip.decompress(request.data)
             else:
                 msg = "Unsupported content type '{}'".format(content_type)
                 raise ClientError(msg)
@@ -327,16 +328,6 @@ class NixServer(Flask):
             response = jsonify(error.to_dict())
             response.status_code = error.status_code
             return response
-
-        if self._debug is True:
-            @app.errorhandler(Exception)
-            def handle_unknown(error):
-                """If we encounter an unknown error, this will be triggered."""
-                logging.exception(error)
-                if sys.stdin.isatty():
-                    import ipdb
-                    ipdb.set_trace()
-                return ("An unknown error occurred", 500)
         return app
 
 
@@ -369,7 +360,6 @@ def main():
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(message)s")
     nixserver = NixServer(compression_type=args.compression_type,
-                          debug=args.debug,
                           direct_db=args.direct_db)
     app = nixserver.make_app()
     app.run(port=args.port, host=args.host)
