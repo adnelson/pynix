@@ -47,7 +47,8 @@ from pynix.utils import (strip_output, decode_str, NIX_STORE_PATH,
                          query_store, instantiate, tell_size,
                          is_path_in_store)
 from pynix.exceptions import (CouldNotConnect, NixImportFailed, CliError,
-                              ObjectNotBuilt, NixBuildError)
+                              ObjectNotBuilt, NixBuildError, NoSuchObject)
+from pynix.binary_cache.nix_info_caches import PathReferenceCache
 from pynix.narinfo import NarInfo
 from pynix.build import needed_to_build_multi, parse_deriv_paths
 
@@ -92,11 +93,8 @@ class NixCacheClient(object):
         self._query_pool = ThreadPoolExecutor(max_workers=max_jobs)
         # A thread pool which handles store object fetches.
         self._fetch_pool = ThreadPoolExecutor(max_workers=max_jobs)
-        # Start the cache loading thread but don't block on it; this
-        # prevents slow startup time due to the loading of a large
-        # cache.
-        self.__path_references = None
-        self._cache_future = self._query_pool.submit(self._load_path_cache)
+        # Caches nix path references.
+        self._reference_cache = PathReferenceCache()
         #: Cache of narinfo objects requested from the server.
         self._narinfo_cache = {}
         self._paths_fetched = set()
@@ -111,30 +109,6 @@ class NixCacheClient(object):
         self._fetch_lock = RLock()
         # Connection to the nix state database.
         self._db_con = sqlite3.connect(NIX_DB_PATH)
-
-    def _load_path_cache(self):
-        """Load the store reference path cache.
-        :return: A mapping from store paths to their references.
-        :rtype: ``dict`` of ``str`` to ``str``
-        """
-        if not isdir(NIX_PATH_CACHE):
-            return {}
-        logging.debug("Loading path cache...")
-        path_cache = {}
-        for store_path in os.listdir(NIX_PATH_CACHE):
-            refs_dir = join(NIX_PATH_CACHE, store_path)
-            refs = [join(NIX_STORE_PATH, path) for path in os.listdir(refs_dir)
-                    if path != store_path]
-            path_cache[join(NIX_STORE_PATH, store_path)] = refs
-        logging.debug("Finished loading path cache.")
-        return path_cache
-
-    @property
-    def _path_references(self):
-        """Resolve the path reference future and return the result."""
-        if self.__path_references is None:
-            self.__path_references = self._cache_future.result()
-        return self.__path_references
 
     def _update_narinfo_cache(self, narinfo, write_to_disk):
         """Write a narinfo entry to the cache.
@@ -159,45 +133,6 @@ class NixCacheClient(object):
         with os.fdopen(tempfile_fd, "w") as f:
             f.write(json.dumps(narinfo.as_dict()))
         shutil.move(tempfile_path, narinfo_path)
-
-    def _update_reference_cache(self, store_path, references, write_to_disk):
-        """Given a store path and its references, write them to a cache.
-
-        Creates a directory for the base path of the store path, and
-        touches files corresponding to paths of its dependencies.
-        So for example, if /nix/store/xyz-foo depends on /nix/store/{a,b,c},
-        then we will create
-          NIX_PATH_CACHE/xyz-foo/a
-          NIX_PATH_CACHE/xyz-foo/b
-          NIX_PATH_CACHE/xyz-foo/c
-
-        :param store_path: A nix store path.
-        :type store_path: ``str``
-        :param references: A list of that path's references.
-        :type references: ``list`` of ``str``
-        :param write_to_disk: If true, write the entry to disk.
-        :type write_to_disk: ``bool``
-        """
-        self._path_references[store_path] = references
-        if write_to_disk is False:
-            return
-        if not isdir(NIX_PATH_CACHE):
-            os.makedirs(NIX_PATH_CACHE)
-        ref_dir = join(NIX_PATH_CACHE, basename(store_path))
-        if isdir(ref_dir):
-            # The cache already has this path; nothing to do.
-            return
-        # Create path directory in a tempdir to avoid inconsistent state.
-        tempdir = tempfile.mkdtemp()
-        for ref in references:
-            # Create an empty file with the name of the reference.
-            fname = join(tempdir, basename(ref))
-            with open(fname, 'a'):
-                os.utime(fname, (0, 0))
-        # Remove the directory just in case, and then move the tempdir
-        # to the target location.
-        shutil.rmtree(ref_dir, ignore_errors=True)
-        shutil.move(tempdir, ref_dir)
 
     def get_narinfo(self, path):
         """Request narinfo from a server. These are cached in memory.
@@ -250,35 +185,20 @@ class NixCacheClient(object):
 
         :return: A list of absolute paths that the path refers to directly.
         :rtype: ``list`` of ``str``
-
-        Side effects:
-        * Caches reference lists in `self._path_references`.
         """
-        if path not in self._path_references:
-            write_to_disk = True
-            # First see if it's in the on-disk cache.
-            if isdir(join(NIX_PATH_CACHE, basename(path))):
-                write_to_disk = False # Not necessary, already there.
-                refs_dir = join(NIX_PATH_CACHE, basename(path))
-                refs = [join(store, path) for path in os.listdir(refs_dir)
-                        if path != basename(path)]
-            # If it's not in the cache, try asking nix-store for it.
-            try:
-                refs = query_store(path, "--references",
-                                   hide_stderr=query_server)
-                refs = [r for r in refs.split() if r != path]
-            # If nix-store gives an error and server querying is
-            # enabled, query the binary cache.
-            except CalledProcessError:
-                if query_server is False:
-                    logging.error("Couldn't determine the references of {} "
-                                  "locally, and can't query the server"
-                                  .format(path))
-                    raise
-                narinfo = self.get_narinfo(path)
-                refs = [r for r in narinfo.abs_references if r != path]
-            self._update_reference_cache(path, refs, write_to_disk)
-        return self._path_references[path]
+        try:
+            return self._reference_cache.get_references(path,
+                                                        hide_stderr=query_server)
+        except NoSuchObject as err:
+            if query_server is False:
+                logging.error("Couldn't determine the references of {} "
+                              "locally, and can't query the server"
+                              .format(path))
+                raise
+            narinfo = self.get_narinfo(path)
+            refs = [r for r in narinfo.abs_references if r != path]
+            self._reference_cache.record_references(path, refs)
+            return refs
 
     def query_paths(self, paths):
         """Given a list of paths, see which the server has.
@@ -580,6 +500,19 @@ class NixCacheClient(object):
             return False
 
     def _compute_fetch_order(self, paths):
+        """Given a list of paths, compute an order to fetch them in.
+
+        The returned order will respect the dependency tree; no child
+        will appear before its parent in the list. In addition, the
+        returned list may be larger as some dependencies of input
+        paths might not be in the original list.
+
+        :param paths: A list of store paths.
+        :type paths: ``list`` of ``str``
+
+        :return: A list of paths in dependency-first order.
+        :rtype: ``list`` of ``str``
+        """
         order = []
         order_set = set()
         def _order(path):
@@ -875,18 +808,19 @@ class NixCacheClient(object):
         """Print the result of a `preview_build` operation."""
         if len(need_to_build) == 0 and len(need_to_fetch) == 0:
             logging.info("All paths have already been built.")
-        n_need_build, n_need_fetch = len(need_to_build), len(need_to_fetch)
-        if n_need_build > 0:
-            msg = (("{} will be built" + (":" if verbose else "."))
+        if len(need_to_build) > 0:
+            verbose_ = verbose or len(need_to_build) < SHOW_PATHS_LIMIT
+            msg = (("{} will be built" + (":" if verbose_ else "."))
                    .format(tell_size(need_to_build, "derivation")))
-            if verbose:
+            if verbose_:
                 for deriv in need_to_build:
                     msg += "\n  " + deriv.path
             logging.info(msg)
-        if n_need_fetch > 0:
-            msg = (("{} will be fetched from {}" + (":" if verbose else "."))
+        if len(need_to_fetch) > 0:
+            verbose_ = verbose or len(need_to_fetch) < SHOW_PATHS_LIMIT
+            msg = (("{} will be fetched from {}" + (":" if verbose_ else "."))
                    .format(tell_size(need_to_fetch, "path"), self._endpoint))
-            if verbose:
+            if verbose_:
                 for deriv, outs in need_to_fetch.items():
                     for out in outs:
                         msg += "\n  " + deriv.output_path(out)
