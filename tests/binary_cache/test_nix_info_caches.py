@@ -40,8 +40,7 @@ class TestPathReferenceCache(unittest.TestCase):
         path = join(NIX_STORE_PATH, "some_path")
         refs = [join(NIX_STORE_PATH, "ref1"), join(NIX_STORE_PATH, "ref2")]
         cache = PathReferenceCache(location=self.location)
-        future = cache.record_references(path, refs)
-        future.result()
+        cache.record_references(path, refs)
         self.assertEqual(cache._path_references[path], refs)
         assert isdir(join(self.location, basename(path))), \
             "No cache created for {}".format(path)

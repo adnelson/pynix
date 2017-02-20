@@ -1,9 +1,10 @@
 """Serve nix store objects over HTTP."""
 import argparse
 import functools
+import json
 import logging
 import os
-from os.path import exists, isdir, join, basename, dirname
+from os.path import exists, isdir, isabs, join, basename, dirname
 import re
 import gzip
 from subprocess import Popen, PIPE, CalledProcessError
@@ -28,9 +29,10 @@ from flask import Flask, make_response, send_file, request, jsonify
 import six
 
 from pynix import __version__
-from pynix.utils import (decode_str, strip_output, query_store,
+from pynix.binary_cache.nix_info_caches import PathReferenceCache
+from pynix.utils import (decode_str, strip_output, query_store, tell_size,
                          NIX_STORE_PATH, NIX_STATE_PATH, NIX_BIN_PATH,
-                         NIX_DB_PATH)
+                         NIX_DB_PATH, is_path_in_store)
 from pynix.narinfo import NarInfo
 from pynix.exceptions import (NoSuchObject, NoNarGenerated,
                               BaseHTTPError, NixImportFailed,
@@ -69,12 +71,17 @@ class NixServer(object):
             self._nar_extension = ".nar.bz2"
         else:
             self._nar_extension = ".nar.xz"
+
         logging.info("Nix store path: {}".format(NIX_STORE_PATH))
         logging.info("Nix state path: {}".format(NIX_STATE_PATH))
         logging.info("Nix bin path: {}".format(NIX_BIN_PATH))
 
+
+        # Try to connect to the database, and use this information to
+        # also initialze the path reference cache.
         if direct_db is False:
             self._db_con = None
+            self._reference_cache = PathReferenceCache(direct_db=False)
         else:
             # Test connect to the nix database; if successful, then we
             # will use a direct connection to the database rather than
@@ -86,10 +93,13 @@ class NixServer(object):
                 db_con.execute(query).fetchall()
                 # If this succeeds, assign the db_con attribute.
                 self._db_con = db_con
+                self._reference_cache = PathReferenceCache(db_con=db_con,
+                                                           location=None)
             except Exception as err:
                 logging.warn("Couldn't connect to the database ({}). Can't "
                              "operate in direct-database mode :(".format(err))
                 self._db_con = None
+                self._reference_cache = PathReferenceCache(direct_db=False)
 
     def store_path_from_hash(self, store_object_hash):
         """Look up a store path using its hash.
@@ -155,6 +165,38 @@ class NixServer(object):
         # If we've gotten here, then the hash doesn't match any path.
         raise NoSuchObject("No object with hash {} was found."
                            .format(store_object_hash))
+
+    def _compute_fetch_order(self, paths):
+        """Given a list of paths, compute an order to fetch them in.
+
+        The returned order will respect the dependency tree; no child
+        will appear before its parent in the list. In addition, the
+        returned list may be larger as some dependencies of input
+        paths might not be in the original list.
+
+        :param paths: A list of store paths.
+        :type paths: ``list`` of ``str``
+
+        :return: A list of tuples of (paths, refs) in dependency-first order.
+        :rtype: ``list`` of (``str``, ``list`` of ``str``)
+        """
+        order = []
+        order_set = set()
+        def _order(path):
+            if path not in order_set:
+                refs = self._reference_cache.get_references(path)
+                for ref in refs:
+                    _order(ref)
+                order.append((path, refs))
+                order_set.add(path)
+        logging.debug("Computing a fetch order for {}"
+                      .format(tell_size(paths, "path")))
+        for path in paths:
+            if not isabs(path):
+                path = os.path.join(NIX_STORE_PATH, path)
+            _order(path)
+        logging.debug("Finished computing fetch order.")
+        return order
 
     def check_in_store(self, store_path):
         """Check that a store path exists in the nix store.
@@ -278,6 +320,24 @@ class NixServer(object):
             logging.debug("{} of these paths were found, and {} were not."
                           .format(found, not_found))
             return jsonify(path_results)
+
+        @app.route("/compute-fetch-order")
+        def compute_fetch_order():
+            """Compute a fetch order for a client.
+
+            Input data should be a list of store paths separated by
+            newlines. Every store path in the list must exist on the
+            server or a 404 will be returned.
+
+            Returns a list in gzipped JSON. Each element of the list
+            is a length 2 list where the first element is a store path
+            and the second element is a list of references of that path.
+            """
+            paths = [p.decode("utf-8") for p in request.get_data().split()]
+            paths_j = json.dumps(self._compute_fetch_order(paths))
+            return make_response(gzip.compress(paths_j.encode("utf-8")), 200,
+                                 {"Content-Type": "application/octet-stream"})
+
 
         @app.route("/import-path", methods=["POST"])
         def import_path():

@@ -93,22 +93,22 @@ class NixCacheClient(object):
         self._query_pool = ThreadPoolExecutor(max_workers=max_jobs)
         # A thread pool which handles store object fetches.
         self._fetch_pool = ThreadPoolExecutor(max_workers=max_jobs)
-        # Caches nix path references.
-        self._reference_cache = PathReferenceCache()
         #: Cache of narinfo objects requested from the server.
         self._narinfo_cache = {}
+        #: This will get filled up as we fetch paths; it lets avoid repeats.
         self._paths_fetched = set()
         self._max_jobs = max_jobs
-
         # A dictionary mapping nix store paths to futures fetching
         # those paths from a cache. Each fetch happens in a different
         # thread, and we use this dictionary to make sure that a fetch
         # only happens once.
         self._fetch_futures = {}
-        # A lock which syncronizes access to the fetch_threads dictionary.
+        # A lock which syncronizes access to the fetch_futures dictionary.
         self._fetch_lock = RLock()
         # Connection to the nix state database.
         self._db_con = sqlite3.connect(NIX_DB_PATH)
+        # Caches nix path references.
+        self._reference_cache = PathReferenceCache(db_con=self._db_con)
 
     def _update_narinfo_cache(self, narinfo, write_to_disk):
         """Write a narinfo entry to the cache.
@@ -187,8 +187,8 @@ class NixCacheClient(object):
         :rtype: ``list`` of ``str``
         """
         try:
-            return self._reference_cache.get_references(path,
-                                                        hide_stderr=query_server)
+            return self._reference_cache.get_references(
+                path, hide_stderr=query_server)
         except NoSuchObject as err:
             if query_server is False:
                 logging.error("Couldn't determine the references of {} "
@@ -513,20 +513,40 @@ class NixCacheClient(object):
         :return: A list of paths in dependency-first order.
         :rtype: ``list`` of ``str``
         """
-        order = []
-        order_set = set()
-        def _order(path):
-            if path not in order_set:
-                for ref in self.get_references(path, query_server=True):
-                    _order(ref)
+        # Start by seeing if the server supports the
+        # compute-fetch-order route. If it does, we can just use that
+        # and save a lot of effort and network traffic.
+        try:
+            url = self._endpoint + "/compute-fetch-order"
+            response = self._connect().get(url)
+            response.raise_for_status()
+            pairs = json.loads(decode_str(gzip.decompress(response.content)))
+            assert isinstance(pairs, list)
+            # Server also returns the references for everything in the
+            # list. We can store those in our cache.
+            order = []
+            for item in pairs:
+                path, refs = item[0], item[1]
+                self._reference_cache.record_references(path, refs)
                 order.append(path)
-                order_set.add(path)
-        logging.debug("Computing a fetch order for {}"
-                      .format(tell_size(paths, "path")))
-        for path in paths:
-            _order(path)
-        logging.debug("Finished computing fetch order.")
-        return order
+            return order
+        except (requests.HTTPError, AssertionError) as err:
+            logging.info("Server doesn't support compute-fetch-order "
+                         "route. Have to do it ourselves...")
+            order = []
+            order_set = set()
+            def _order(path):
+                if path not in order_set:
+                    for ref in self.get_references(path, query_server=True):
+                        _order(ref)
+                    order.append(path)
+                    order_set.add(path)
+            logging.debug("Computing a fetch order for {}"
+                          .format(tell_size(paths, "path")))
+            for path in paths:
+                _order(path)
+            logging.debug("Finished computing fetch order.")
+            return order
 
     def _fetch_ordered_paths(self, store_paths):
         for path in store_paths:
