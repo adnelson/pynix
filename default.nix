@@ -37,7 +37,13 @@ pythonPackages.buildPythonPackage rec {
     pythonPackages.futures
     pythonPackages.backports_lzma
   ]);
-  checkPhase = "nosetests tests";
+  checkPhase = ''
+    # HACK: try to detect this failure case at runtime
+    if ! nix-store -q --hash ${pkgs.nix} >/dev/null 2>&1; then
+      export NIX_REMOTE=daemon
+    fi
+    nosetests tests
+  '';
   src = ./.;
   makeWrapperArgs = [
     "--set NIX_BIN_PATH ${pkgs.lib.makeBinPath [pkgs.nix.out]}"

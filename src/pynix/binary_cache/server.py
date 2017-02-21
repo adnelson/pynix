@@ -45,6 +45,17 @@ _STORE_PATH_REGEX = re.compile(
     join(NIX_STORE_PATH, _PATH_REGEX.pattern))
 
 _NAR_CACHE_SIZE = int(os.getenv("NAR_CACHE_SIZE", 2048))
+COMPRESSION_TYPES = ("xz", "bzip2")
+COMPRESSION_TYPE_ALIASES = {"xzip": "xz", "bz2": "bzip2"}
+
+def _resolve_compression_type(compression_type):
+    if compression_type in COMPRESSION_TYPE_ALIASES:
+        return COMPRESSION_TYPE_ALIASES[compression_type]
+    elif compression_type in COMPRESSION_TYPES:
+        return compression_type
+    else:
+        raise ValueError("Invalid compression type: {}"
+                         .format(compression_type))
 
 class NixServer(object):
     """Serves nix packages."""
@@ -53,8 +64,12 @@ class NixServer(object):
 
         :param compression_type: How to compress NARs. Either 'xz' or 'bzip2'.
         :type compression_type: ``str``
+        :param direct_db: Try to connect directly to the nix DB, to
+                          speed up queries. Might not be possible, due
+                          to permissions (e.g. on nixos).
+        :type direct_db: ``bool``
         """
-        self._compression_type = compression_type
+        self._compression_type = _resolve_compression_type(compression_type)
         # Cache mapping object hashes to store paths.
         self._hashes_to_paths = {}
         # Cache mapping object hashes to store paths which have been validated.
@@ -75,6 +90,7 @@ class NixServer(object):
         logging.info("Nix store path: {}".format(NIX_STORE_PATH))
         logging.info("Nix state path: {}".format(NIX_STATE_PATH))
         logging.info("Nix bin path: {}".format(NIX_BIN_PATH))
+        logging.info("Compression type: {}".format(self._compression_type))
 
 
         # Try to connect to the database, and use this information to
@@ -395,13 +411,16 @@ def _get_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(prog="nix-server")
     parser.add_argument("--version", action="version", version=__version__)
-    parser.add_argument("--port", type=int, default=5000,
+    parser.add_argument("--port", type=int,
+                        default=int(os.getenv("PORT", 5000)),
                         help="Port to listen on.")
     parser.add_argument("--host", default="localhost",
                         help="Host to listen on.")
-    parser.add_argument("--compression-type", default="xz",
-                        choices=("xz", "bzip2"),
-                        help="How served objects should be compressed.")
+    for t in sorted(list(COMPRESSION_TYPES) + list(COMPRESSION_TYPE_ALIASES)):
+        parser.add_argument("--" + t, action="store_const", const=t,
+                            dest="compression_type",
+                            help="Use {} compression for served NARs."
+                                 .format(_resolve_compression_type(t)))
     parser.add_argument("--debug", action="store_true", default=False,
                         help="Enable interactive debugging on unknown errors.")
     parser.add_argument("--log-level", help="Log messages level.",
@@ -410,7 +429,8 @@ def _get_args():
                                  "WARNING", "DEBUG"))
     parser.add_argument("--no-db", action="store_false", dest="direct_db",
                         help="Disable direct-database mode.")
-    parser.set_defaults(direct_db=os.getenv("NO_DIRECT_DB", "") == "")
+    parser.set_defaults(direct_db=os.getenv("NO_DIRECT_DB", "") == "",
+                        compression_type="xz")
     return parser.parse_args()
 
 

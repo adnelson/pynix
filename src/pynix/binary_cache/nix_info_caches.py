@@ -66,8 +66,8 @@ class PathReferenceCache(object):
                 # If this succeeds, assign the db_con attribute.
                 self._db_con = db_con
             except Exception as err:
-                logging.warn("Couldn't connect to the database ({}). Can't "
-                             "operate in direct-database mode :(".format(err))
+                logging.warn("Path cache can't connect to the database ({}). "
+                             "Can't use direct-database mode :(".format(err))
                 self._db_con = None
 
     @property
