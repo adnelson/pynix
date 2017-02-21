@@ -8,7 +8,8 @@ from os.path import exists, isdir, isabs, join, basename, dirname
 import re
 import gzip
 from subprocess import Popen, PIPE, CalledProcessError
-from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import cpu_count
 # Special-case here to address a runtime bug I've encountered.
 # Essentially having python libraries other than those
 # specifically built for this library in a PYTHONPATH can cause a
@@ -59,7 +60,8 @@ def _resolve_compression_type(compression_type):
 
 class NixServer(object):
     """Serves nix packages."""
-    def __init__(self, compression_type="xz", direct_db=True):
+    def __init__(self, compression_type="xz", direct_db=True,
+                 max_workers=cpu_count()):
         """Initializer.
 
         :param compression_type: How to compress NARs. Either 'xz' or 'bzip2'.
@@ -87,11 +89,13 @@ class NixServer(object):
         else:
             self._nar_extension = ".nar.xz"
 
+        self._pool = ThreadPoolExecutor(max_workers=max_workers)
+
         logging.info("Nix store path: {}".format(NIX_STORE_PATH))
         logging.info("Nix state path: {}".format(NIX_STATE_PATH))
         logging.info("Nix bin path: {}".format(NIX_BIN_PATH))
         logging.info("Compression type: {}".format(self._compression_type))
-
+        logging.info("Max workers: {}".format(max_workers))
 
         # Try to connect to the database, and use this information to
         # also initialze the path reference cache.
@@ -239,6 +243,8 @@ class NixServer(object):
     def build_nar(self, store_path, compression_type):
         """Start a build of a NAR (nix archive). The result is a
         future which will result in a NAR path."""
+        logging.info("Kicking off NAR build of {}, {} compression"
+                     .format(basename(store_path), compression_type))
         return self._pool.submit(NarInfo.build_nar, store_path,
                                  compression_type)
 
@@ -279,9 +285,9 @@ class NixServer(object):
             return make_response((narinfo.to_string(), 200,
                                  {"Content-Type": "application/octet-stream"}))
 
-        @app.route("/nar/<obj_hash>{}".format(self._nar_extension))
-        def serve_nar(obj_hash):
-            """Return the compressed binary from the nix store.
+        @app.route("/nar/<obj_hash>.nar.xz")
+        def serve_nar_xz(obj_hash):
+            """Return the compressed binary from the nix store (xz format).
 
             If the object isn't found, return a 404.
 
@@ -289,7 +295,20 @@ class NixServer(object):
             :type obj_hash: ``str``
             """
             store_path = self.store_path_from_hash(obj_hash)
-            nar_path = self.build_nar(store_path, self._compression_type).result()
+            nar_path = self.build_nar(store_path, "xz").result()
+            return send_file(nar_path, mimetype="application/octet-stream")
+
+        @app.route("/nar/<obj_hash>.nar.bz2")
+        def serve_nar_bz2(obj_hash):
+            """Return the compressed binary from the nix store (bz2 format).
+
+            If the object isn't found, return a 404.
+
+            :param obj_hash: First 32 characters of the object's store path.
+            :type obj_hash: ``str``
+            """
+            store_path = self.store_path_from_hash(obj_hash)
+            nar_path = self.build_nar(store_path, "bzip2").result()
             return send_file(nar_path, mimetype="application/octet-stream")
 
         @app.route("/query-paths")
@@ -421,15 +440,16 @@ def _get_args():
                             dest="compression_type",
                             help="Use {} compression for served NARs."
                                  .format(_resolve_compression_type(t)))
-    parser.add_argument("--debug", action="store_true", default=False,
-                        help="Enable interactive debugging on unknown errors.")
-    parser.add_argument("--log-level", help="Log messages level.",
-                        default=os.environ.get("LOG_LEVEL", "INFO"),
-                        choices=("CRITICAL", "ERROR", "INFO",
-                                 "WARNING", "DEBUG"))
+    for level in ("CRITICAL", "ERROR", "INFO", "WARNING", "DEBUG"):
+        parser.add_argument("--log-" + level.lower(), action="store_const",
+                            const=level, dest="log_level",
+                            help="Set log level to " + level + ".")
+    parser.add_argument("--max-workers", type=int, default=cpu_count(),
+                        help="Maximum concurrent NAR builder threads.")
     parser.add_argument("--no-db", action="store_false", dest="direct_db",
                         help="Disable direct-database mode.")
     parser.set_defaults(direct_db=os.getenv("NO_DIRECT_DB", "") == "",
+                        log_level=os.environ.get("LOG_LEVEL", "INFO"),
                         compression_type="xz")
     return parser.parse_args()
 
@@ -440,7 +460,8 @@ def main():
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(message)s")
     nixserver = NixServer(compression_type=args.compression_type,
-                          direct_db=args.direct_db)
+                          direct_db=args.direct_db,
+                          max_workers=args.max_workers)
     app = nixserver.make_app()
     app.run(port=args.port, host=args.host)
 

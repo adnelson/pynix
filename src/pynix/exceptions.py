@@ -75,6 +75,9 @@ class CouldNotUpdateHash(ServerError):
 class NixOperationError(RuntimeError):
     """When an error is encountered in a nix operation."""
     OPERATION = None
+    def __init__(self, nix_operation=None):
+        if nix_operation is not None:
+            self.OPERATION = nix_operation
 
 class NixImportFailed(BaseHTTPError, NixOperationError, CliError):
     """Raised when we couldn't import a store object."""
@@ -105,12 +108,12 @@ class NixBuildError(NixOperationError, CliError):
     OPERATION = "nix-build"
 
 class ObjectNotBuilt(NixOperationError, CliError):
+    OPERATION = "nix-store"
     def __init__(self, store_path):
         message = ("Expected store path {} to be built, but it wasn't"
                    .format(store_path))
         self.EXIT_MESSAGE = message
-        NixOperationError.__init__(self, nix_operation="nix-store",
-                                   message=message)
+        NixOperationError.__init__(self, nix_operation="nix-store")
         CliError.__init__(self)
         self.store_path = store_path
 

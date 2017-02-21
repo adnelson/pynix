@@ -518,10 +518,9 @@ class NixCacheClient(object):
         # and save a lot of effort and network traffic.
         try:
             url = self._endpoint + "/compute-fetch-order"
-            response = self._connect().get(url)
+            response = self._connect().get(url, data="\n".join(paths))
             response.raise_for_status()
             pairs = json.loads(decode_str(gzip.decompress(response.content)))
-            assert isinstance(pairs, list)
             # Server also returns the references for everything in the
             # list. We can store those in our cache.
             order = []
