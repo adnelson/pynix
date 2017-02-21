@@ -61,6 +61,10 @@ ENDPOINT_REGEX = re.compile(r"https?://([\w_-]+)(\.[\w_-]+)*(:\d+)?$")
 # Limit of how many paths to show, so the screen doesn't flood.
 SHOW_PATHS_LIMIT = int(os.environ.get("SHOW_PATHS_LIMIT", 25))
 
+# Maximum attempts to try a download, in case of e.g. a timed out
+# request, or something else ephemeral/flaky.
+MAX_FETCH_ATTEMPTS = int(os.getenv("MAX_FETCH_ATTEMPTS", 3))
+
 class NixCacheClient(object):
     """Wraps some state for sending store objects."""
     def __init__(self, endpoint, dry_run=False, username=None,
@@ -111,6 +115,8 @@ class NixCacheClient(object):
         self._db_con = sqlite3.connect(NIX_DB_PATH)
         # Caches nix path references.
         self._reference_cache = PathReferenceCache(db_con=self._db_con)
+        # How many times to retry a fetch.
+        self._max_fetch_attempts = 3
 
     def _update_narinfo_cache(self, narinfo, write_to_disk):
         """Write a narinfo entry to the cache.
@@ -577,7 +583,20 @@ class NixCacheClient(object):
         url = "{}/{}".format(self._endpoint, narinfo.url)
         logging.debug("Requesting {} from {}..."
                      .format(basename(path), self._endpoint))
-        response = self._connect().get(url)
+        attempts = 0
+        while True:
+            try:
+                response = self._connect().get(url)
+                break
+            except Exception as e:
+                if attempts > self.max_fetch_attempts:
+                    raise
+                logging.exception(e)
+                logging.warn(
+                    "Fetch of {} failed ({}), have {} attempts remaining"
+                    .format(basename(path), e,
+                            self._max_fetch_attempts - attempts))
+                attempts += 1
         response.raise_for_status()
 
         # Figure out how to extract the content.
