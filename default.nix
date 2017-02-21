@@ -36,6 +36,7 @@ pythonPackages.buildPythonPackage rec {
   ] ++ (if isPy3 then [] else [
     pythonPackages.futures
     pythonPackages.backports_lzma
+    pythonPackages.repoze_lru
   ]);
   checkPhase = ''
     # HACK: try to detect this failure case at runtime

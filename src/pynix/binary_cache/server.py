@@ -1,6 +1,5 @@
 """Serve nix store objects over HTTP."""
 import argparse
-import functools
 import json
 import logging
 import os
@@ -28,6 +27,14 @@ except ImportError as err:
 
 from flask import Flask, make_response, send_file, request, jsonify
 import six
+import sys
+
+# Have to use a third-party library for LRU cache if not python3
+if sys.version_info >= (3, 0):
+    from functools import lru_cache
+else:
+    from repoze.lru import lru_cache
+
 
 from pynix import __version__
 from pynix.binary_cache.nix_info_caches import PathReferenceCache
@@ -239,7 +246,7 @@ class NixServer(object):
             self._known_store_paths.add(store_path)
         return in_store
 
-    @functools.lru_cache(maxsize=_NAR_CACHE_SIZE)
+    @lru_cache(maxsize=_NAR_CACHE_SIZE)
     def build_nar(self, store_path, compression_type):
         """Start a build of a NAR (nix archive). The result is a
         future which will result in a NAR path."""

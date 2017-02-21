@@ -103,8 +103,10 @@ class NixCacheClient(object):
         # thread, and we use this dictionary to make sure that a fetch
         # only happens once.
         self._fetch_futures = {}
-        # A lock which syncronizes access to the fetch_futures dictionary.
+        # A lock which syncronizes access to the fetch state.
         self._fetch_lock = RLock()
+        # Will be set to a non-None value when fetching.
+        self._fetch_total = None
         # Connection to the nix state database.
         self._db_con = sqlite3.connect(NIX_DB_PATH)
         # Caches nix path references.
@@ -548,10 +550,17 @@ class NixCacheClient(object):
             return order
 
     def _fetch_ordered_paths(self, store_paths):
+        """Given an ordered list of paths, fetch all from a cache."""
+        logging.info("Beginning fetches. Total of {} to fetch."
+                     .format(tell_size(store_paths, "store object")))
         for path in store_paths:
             self._start_fetching(path)
-        for path in store_paths:
-             self._finish_fetching(path)
+        for i, path in enumerate(store_paths):
+            logging.info("{}/{} ({})"
+                         .format(i + 1, len(store_paths), basename(path)))
+            self._finish_fetching(path)
+        logging.info("Finished fetching {}".format(
+            tell_size(store_paths, "path")))
 
     def _fetch_single(self, path):
         """Fetch a single path."""
@@ -566,7 +575,7 @@ class NixCacheClient(object):
 
         # Use the URL in the narinfo to fetch the object.
         url = "{}/{}".format(self._endpoint, narinfo.url)
-        logging.info("Requesting {} from {}..."
+        logging.debug("Requesting {} from {}..."
                      .format(basename(path), self._endpoint))
         response = self._connect().get(url)
         response.raise_for_status()
@@ -584,7 +593,6 @@ class NixCacheClient(object):
         # Once extracted, convert it into a nix export object and import.
         export = narinfo.nar_to_export(data)
         imported_path = export.import_to_store()
-        logging.info("Imported {}".format(imported_path))
         self._register_as_fetched(path)
 
     def _register_as_fetched(self, path):
@@ -687,23 +695,21 @@ class NixCacheClient(object):
                                   show_trace=show_trace)
         derivs_to_outputs = parse_deriv_paths(deriv_paths)
         need_to_build, need_to_fetch = self.preview_build(deriv_paths)
-        self.print_preview(need_to_build, need_to_fetch, verbose)
         if self._dry_run is True:
+            self.print_preview(need_to_build, need_to_fetch, verbose)
             return
         # Build the list of paths to fetch from the remote store.
         paths_to_fetch = []
         for deriv, outputs in need_to_fetch.items():
             for output in outputs:
                 paths_to_fetch.append(deriv.output_path(output))
-        # Figure out the order to fetch them in.
-        logging.info("Computing fetch order...")
-        fetch_order = self._compute_fetch_order(paths_to_fetch)
-        logging.info("Beginning fetches. Total of {} to fetch."
-                     .format(tell_size(fetch_order, "store object")))
-        # Perform the fetches.
-        self._fetch_ordered_paths(fetch_order)
-        logging.info("Finished fetching from remote server. Verifying...")
-        self._verify(need_to_fetch)
+        if len(paths_to_fetch) > 0:
+            # Figure out the order to fetch them in.
+            logging.info("Computing fetch order...")
+            fetch_order = self._compute_fetch_order(paths_to_fetch)
+            # Perform the fetches.
+            self._fetch_ordered_paths(fetch_order)
+            self._verify(need_to_fetch)
         # Build up the command for nix store to build the remaining paths.
         if len(need_to_build) > 0:
             args = ["--max-jobs", str(self._max_jobs), "--no-gc-warning",
@@ -733,10 +739,12 @@ class NixCacheClient(object):
 
     def _verify(self, derivs_to_outputs):
         """Given a derivation-output mapping, verify all paths."""
+        logging.info("Verifying that we successfully created {}"
+                     .format(tell_size(derivs_to_outputs, "store path")))
         for deriv, outputs in derivs_to_outputs.items():
             for output in outputs:
                 path = deriv.output_path(output)
-                logging.info("Verifying {}".format(path))
+                logging.debug("Verifying path {}".format(basename(path)))
                 if not is_path_in_store(path, db_con=self._db_con):
                     raise ObjectNotBuilt(path)
 
