@@ -5,6 +5,8 @@
 }:
 
 let
+  inherit (builtins) replaceStrings readFile;
+  version = replaceStrings ["\n"] [""] (readFile ./version.txt);
   rtyaml = pythonPackages.buildPythonPackage {
     name = "rtyaml-0.0.3";
     src = pkgs.fetchurl {
@@ -13,27 +15,36 @@ let
     };
     propagatedBuildInputs = [pythonPackages.pyyaml];
   };
-  # Use .out so we have the binaries callable
-  inherit (builtins) replaceStrings readFile;
-  version = replaceStrings ["\n"] [""] (readFile ./version.txt);
+  isPy3 = pythonPackages.isPy3k or false;
 in
 
 pythonPackages.buildPythonPackage rec {
   name = "pynix-${version}";
-  buildInputs = [pythonPackages.ipython];
-  propagatedBuildInputs = [
+  buildInputs = with pythonPackages; [ipython nose mock];
+  propagatedBuildInputs = with pythonPackages; [
     pkgs.coreutils
     pkgs.gzip
     pkgs.nix.out
     pkgs.pv
     pkgs.which
-    pythonPackages.flask
-    pythonPackages.requests2
-    pythonPackages.ipdb
-    pythonPackages.six
-    pythonPackages.datadiff
+    flask
+    requests2
+    ipdb
+    six
+    datadiff
     rtyaml
-  ];
+  ] ++ (if isPy3 then [] else [
+    pythonPackages.futures
+    pythonPackages.backports_lzma
+    pythonPackages.repoze_lru
+  ]);
+  checkPhase = ''
+    # HACK: try to detect this failure case at runtime
+    if ! nix-store -q --hash ${pkgs.nix} >/dev/null 2>&1; then
+      export NIX_REMOTE=daemon
+    fi
+    nosetests tests
+  '';
   src = ./.;
   makeWrapperArgs = [
     "--set NIX_BIN_PATH ${pkgs.lib.makeBinPath [pkgs.nix.out]}"

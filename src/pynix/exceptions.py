@@ -1,4 +1,5 @@
 """Exceptions specific to pynix."""
+import sys
 
 class BaseHTTPError(Exception):
     """Base class for all HTTP errors."""
@@ -20,6 +21,20 @@ class BaseHTTPError(Exception):
         """Render error as a dictionary."""
         return {"message": self.message}
 
+class CliError(Exception):
+    """Base class for errors thrown from a CLI.
+
+    Has an exit function which exits the process with a message and status.
+    """
+    EXIT_MESSAGE = None
+    RETURN_CODE = 1
+    def exit(self):
+        _name = type(self).__name__
+        if self.EXIT_MESSAGE is not None:
+            sys.stderr.write(_name + ": " + self.EXIT_MESSAGE + "\n")
+        else:
+            sys.stderr.write(_name + "\n")
+        raise SystemExit(self.RETURN_CODE)
 
 class ClientError(BaseHTTPError):
     """Base class for errors on the client side."""
@@ -57,12 +72,50 @@ class CouldNotUpdateHash(ServerError):
                    .format(path, stored_hash, valid_hash, message))
         ServerError.__init__(self, message=message)
 
+class NixOperationError(RuntimeError):
+    """When an error is encountered in a nix operation."""
+    OPERATION = None
+    def __init__(self, nix_operation=None):
+        if nix_operation is not None:
+            self.OPERATION = nix_operation
 
-class NixImportFailed(BaseHTTPError):
+class NixImportFailed(BaseHTTPError, NixOperationError, CliError):
     """Raised when we couldn't import a store object."""
+    OPERATION = "nix-store --import"
     def __init__(self, err_message):
         message = "Couldn't perform the import: {}".format(err_message)
         BaseHTTPError.__init__(self, message=message)
+        self.EXIT_MESSAGE = message
+
+class NixInstantiationError(NixOperationError, CliError):
+    """Raised when nix-instantiate fails."""
+    OPERATION = "nix-instantiate"
+    def __init__(self, nix_file, attributes):
+        self.nix_file = nix_file
+        self.attributes = attributes
+        if len(attributes) == 0:
+            message = "Couldn't evaluate file {}".format(nix_file)
+        elif len(attributes) == 1:
+            message = ("Couldn't evaluate attribute {} from file {}"
+                       .format(attributes[0], nix_file))
+        else:
+            message = ("Couldn't evaluate attributes {} from file {}"
+                       .format(", ".join(attributes), nix_file))
+        self.EXIT_MESSAGE = message
+
+class NixBuildError(NixOperationError, CliError):
+    """Raised when building a nix expression fails."""
+    OPERATION = "nix-build"
+
+class ObjectNotBuilt(NixOperationError, CliError):
+    OPERATION = "nix-store"
+    def __init__(self, store_path):
+        message = ("Expected store path {} to be built, but it wasn't"
+                   .format(store_path))
+        self.EXIT_MESSAGE = message
+        NixOperationError.__init__(self, nix_operation="nix-store")
+        CliError.__init__(self)
+        self.store_path = store_path
 
 class CouldNotConnect(Exception):
     def __init__(self, endpoint, status_code, content):

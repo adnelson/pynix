@@ -11,7 +11,7 @@ import rtyaml
 
 class Derivation(object):
     """A Python representation of a derivation."""
-    # Cache of parsed derivations, to avoid duplicat parsing.
+    # Cache of parsed derivations, to avoid duplicate parsing.
     CACHE = {}
 
     def __init__(self, path, raw, outputs, input_derivations,
@@ -151,6 +151,19 @@ class Derivation(object):
             self._as_dict = res
         return self._as_dict
 
+    def link_path(self, output_name):
+        """Return the default path for a symlink created to this output."""
+        path = os.path.join(os.getcwd(), self.name)
+        if output_name != "out":
+            path += "-" + output_name
+        return path
+
+    def output_path(self, output_name):
+        """Get the path to an output with the given name."""
+        if output_name not in self.output_mapping:
+            raise ValueError("No output named {}".format(output_name))
+        return self.output_mapping[output_name]
+
     def __eq__(self, other):
         """Test if one derivation is equal to another."""
         if isinstance(other, str):
@@ -175,26 +188,28 @@ class Derivation(object):
         otherdict["outputs"] = list(sorted(otherdict["outputs"].keys()))
         return datadiff.diff(selfdict, otherdict)
 
-    def display(self, attribute=None, env_var=None, output=None,
-                format="json", pretty=False):
+    def display(self, attribute=None, env_vars=None, output=None,
+                format=None, pretty=False):
         """Return a string representation in the given format.
 
         :param attribute: If given, only show that attribute.
         :type attribute: ``str`` or ``NoneType``
-        :param env_var: If given, only show that environment variable.
-        :type env_var: ``str`` or ``NoneType``
+        :param env_vars: If given, only show these environment variables.
+        :type env_vars: (``list`` of ``str``) or ``NoneType``
         :param output: If given, show the output path of that output.
         :type output: ``str``
         :param format: The output format. Valid options are 'string',
                        'json' and 'yaml'. 'string' is limited in that it can
-                       only show strings and lists of strings.
+                       only show strings and lists of strings. If
+                       unspecified, printing a dict will use JSON
+                       format, and other things will use 'string'.
         :type format: ``str``
         :param pretty: Pretty-print.
         :type pretty: ``bool``
 
         :rtype: ``str``
         """
-        if attribute is None and env_var is None and output is None:
+        if attribute is None and env_vars is None and output is None:
             to_print = self.raw if format == "string" else self.as_dict
         elif attribute is not None:
             to_print = getattr(self, attribute)
@@ -202,8 +217,20 @@ class Derivation(object):
                 to_print = list(sorted(to_print))
         elif output is not None:
             to_print = self.output_mapping[output]
+        elif env_vars is not None:
+            if len(env_vars) == 1:
+                to_print = self.environment[env_vars[0]]
+            else:
+                to_print = {var: self.environment[var] for var in env_vars}
         else:
-            to_print = self.environment[env_var]
+            raise ValueError("I don't know what to print...")
+        # Now that we know what we want to print, decide the default
+        # format (unless it's given explicitly)
+        if format is None:
+            if isinstance(to_print, dict):
+                format = "json"
+            else:
+                format = "string"
         if format == "string":
             if isinstance(to_print, str):
                 return to_print

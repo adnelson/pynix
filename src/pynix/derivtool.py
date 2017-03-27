@@ -4,12 +4,14 @@ import argparse
 import os
 import sys
 
+from pynix import __version__
 from pynix.derivation import Derivation
-from pynix.build import print_preview
+from pynix.binary_cache.client import NixCacheClient
 
 def get_args():
     """Parse command-line arguments."""
     p_root = argparse.ArgumentParser(description="Derivation Utilities")
+    p_root.add_argument("--version", action="version", version=__version__)
     subparsers = p_root.add_subparsers(title="Command", dest="command")
     subparsers.required = True
 
@@ -20,14 +22,15 @@ def get_args():
                         dest="format", help="JSON format.")
     p_show.add_argument("--yaml", action="store_const", const="yaml",
                         dest="format", help="YAML format.")
+    p_show.add_argument("--string", action="store_const", const="string",
+                        dest="format", help="Raw derivation format.")
     p_show.add_argument("-p", "--pretty", action="store_true", default=False,
                         help="Pretty-print.")
     p_show.add_argument("-A", "--attribute", help="Attribute to show.")
-    p_show.add_argument("-e", "--env-var",
+    p_show.add_argument("-e", "--env-vars", nargs="+",
                         help="Environmant variable to show.")
     p_show.add_argument("-o", "--output",
                         help="Show the path of the given output.")
-    p_show.set_defaults(format="string")
 
     # 'diff' command
     p_diff = subparsers.add_parser("diff", help="Diff two derivations.")
@@ -63,7 +66,7 @@ def main():
         deriv = Derivation.parse_derivation_file(path)
         print(deriv.display(
             attribute=args.attribute,
-            env_var=args.env_var,
+            env_vars=args.env_vars,
             output=args.output,
             format=args.format,
             pretty=args.pretty))

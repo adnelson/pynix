@@ -1,11 +1,14 @@
 """Serve nix store objects over HTTP."""
 import argparse
+import json
 import logging
 import os
-from os.path import exists, isdir, join, basename, dirname
+from os.path import exists, isdir, isabs, join, basename, dirname
 import re
-from subprocess import check_output, Popen, PIPE, CalledProcessError
-from threading import Thread
+import gzip
+from subprocess import Popen, PIPE, CalledProcessError
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import cpu_count
 # Special-case here to address a runtime bug I've encountered.
 # Essentially having python libraries other than those
 # specifically built for this library in a PYTHONPATH can cause a
@@ -24,41 +27,67 @@ except ImportError as err:
 
 from flask import Flask, make_response, send_file, request, jsonify
 import six
+import sys
+
+# Have to use a third-party library for LRU cache if not python3
+if sys.version_info >= (3, 0):
+    from functools import lru_cache
+else:
+    from repoze.lru import lru_cache
+
 
 from pynix import __version__
-from pynix.utils import decode_str, strip_output, find_nix_paths, decompress
+from pynix.binary_cache.nix_info_caches import PathReferenceCache
+from pynix.utils import (decode_str, strip_output, query_store, tell_size,
+                         NIX_STORE_PATH, NIX_STATE_PATH, NIX_BIN_PATH,
+                         NIX_DB_PATH, is_path_in_store)
+from pynix.narinfo import NarInfo
 from pynix.exceptions import (NoSuchObject, NoNarGenerated,
                               BaseHTTPError, NixImportFailed,
                               CouldNotUpdateHash, ClientError)
 
 _HASH_REGEX=re.compile(r"[a-z0-9]{32}")
 _PATH_REGEX=re.compile(r"([a-z0-9]{32})-[^' \n/]*$")
+# Matches valid nix store paths.
+_STORE_PATH_REGEX = re.compile(
+    join(NIX_STORE_PATH, _PATH_REGEX.pattern))
 
-class NixServer(Flask):
+_NAR_CACHE_SIZE = int(os.getenv("NAR_CACHE_SIZE", 2048))
+COMPRESSION_TYPES = ("xz", "bzip2")
+COMPRESSION_TYPE_ALIASES = {"xzip": "xz", "bz2": "bzip2"}
+
+def _resolve_compression_type(compression_type):
+    if compression_type in COMPRESSION_TYPE_ALIASES:
+        return COMPRESSION_TYPE_ALIASES[compression_type]
+    elif compression_type in COMPRESSION_TYPES:
+        return compression_type
+    else:
+        raise ValueError("Invalid compression type: {}"
+                         .format(compression_type))
+
+class NixServer(object):
     """Serves nix packages."""
-    def __init__(self, nix_store_path, nix_bin_path, nix_state_path,
-                 compression_type, debug):
-        # Path to the local nix store.
-        self._nix_store_path = nix_store_path
-        # Path to the local nix state directory.
-        self._nix_state_path = nix_state_path
-        # Path to the folder containing nix binaries.
-        self._nix_bin_path = nix_bin_path
-        # Matches valid nix store paths (local to this store)
-        self._full_store_path_regex = re.compile(
-            join(self._nix_store_path, _PATH_REGEX.pattern))
-        self._compression_type = compression_type
+    def __init__(self, compression_type="xz", direct_db=True,
+                 max_workers=cpu_count()):
+        """Initializer.
+
+        :param compression_type: How to compress NARs. Either 'xz' or 'bzip2'.
+        :type compression_type: ``str``
+        :param direct_db: Try to connect directly to the nix DB, to
+                          speed up queries. Might not be possible, due
+                          to permissions (e.g. on nixos).
+        :type direct_db: ``bool``
+        """
+        self._compression_type = _resolve_compression_type(compression_type)
         # Cache mapping object hashes to store paths.
         self._hashes_to_paths = {}
         # Cache mapping object hashes to store paths which have been validated.
         self._hashes_to_valid_paths = {}
-        # Cache mapping store paths to object info.
-        self._paths_to_info = {}
         # Set of known store paths.
         self._known_store_paths = set()
         # A static string telling a nix client what this store serves.
         self._cache_info = "\n".join([
-            "StoreDir: {}".format(self._nix_store_path),
+            "StoreDir: {}".format(NIX_STORE_PATH),
             "WantMassQuery: 1",
             "Priority: 30"
         ]) + "\n"
@@ -66,23 +95,38 @@ class NixServer(Flask):
             self._nar_extension = ".nar.bz2"
         else:
             self._nar_extension = ".nar.xz"
-        # Enable interactive debugging on unknown errors.
-        self._debug = debug
-        # Test connect to the nix database; if successful, then we
-        # will use a direct connection to the database rather than
-        # using nix-store. This is much faster, but is unavailable on
-        # some systems.
-        try:
-            db_path = join(nix_state_path, "nix", "db", "db.sqlite")
-            query = "select * from ValidPaths limit 1"
-            db_con = sqlite3.connect(db_path)
-            db_con.execute(query).fetchall()
-            # If this succeeds, assign the db_con attribute.
-            self._db_con = db_con
-        except Exception as err:
-            logging.warn("Couldn't connect to the database ({}). Can't "
-                         "operate in direct-database mode :(".format(err))
+
+        self._pool = ThreadPoolExecutor(max_workers=max_workers)
+
+        logging.info("Nix store path: {}".format(NIX_STORE_PATH))
+        logging.info("Nix state path: {}".format(NIX_STATE_PATH))
+        logging.info("Nix bin path: {}".format(NIX_BIN_PATH))
+        logging.info("Compression type: {}".format(self._compression_type))
+        logging.info("Max workers: {}".format(max_workers))
+
+        # Try to connect to the database, and use this information to
+        # also initialze the path reference cache.
+        if direct_db is False:
             self._db_con = None
+            self._reference_cache = PathReferenceCache(direct_db=False)
+        else:
+            # Test connect to the nix database; if successful, then we
+            # will use a direct connection to the database rather than
+            # using nix-store. This is much faster, but is unavailable on
+            # some systems.
+            try:
+                query = "select * from ValidPaths limit 1"
+                db_con = sqlite3.connect(NIX_DB_PATH)
+                db_con.execute(query).fetchall()
+                # If this succeeds, assign the db_con attribute.
+                self._db_con = db_con
+                self._reference_cache = PathReferenceCache(db_con=db_con,
+                                                           location=None)
+            except Exception as err:
+                logging.warn("Couldn't connect to the database ({}). Can't "
+                             "operate in direct-database mode :(".format(err))
+                self._db_con = None
+                self._reference_cache = PathReferenceCache(direct_db=False)
 
     def store_path_from_hash(self, store_object_hash):
         """Look up a store path using its hash.
@@ -119,7 +163,7 @@ class NixServer(Flask):
             # If we have a direct database connection, use this to check
             # path existence.
             query = "select path from ValidPaths where path like ?"
-            path_prefix = join(self._nix_store_path, store_object_hash) + "%"
+            path_prefix = join(NIX_STORE_PATH, store_object_hash) + "%"
             with self._db_con:
                 paths = self._db_con.execute(query, (path_prefix,)).fetchall()
             if len(paths) > 0:
@@ -130,11 +174,11 @@ class NixServer(Flask):
             # Get the list of store objects by listing the directory.
             # Iterate through them until a matching hash is found, or
             # we've exhausted all paths, in which case we error.
-            for path in map(decode_str, os.listdir(self._nix_store_path)):
+            for path in map(decode_str, os.listdir(NIX_STORE_PATH)):
                 match = _PATH_REGEX.match(path)
                 if match is None:
                     continue
-                path = join(self._nix_store_path, path)
+                path = join(NIX_STORE_PATH, path)
                 prefix = match.group(1)
                 # Add every path seen to the _hashes_to_paths cache.
                 self._hashes_to_paths[prefix] = path
@@ -148,6 +192,38 @@ class NixServer(Flask):
         # If we've gotten here, then the hash doesn't match any path.
         raise NoSuchObject("No object with hash {} was found."
                            .format(store_object_hash))
+
+    def _compute_fetch_order(self, paths):
+        """Given a list of paths, compute an order to fetch them in.
+
+        The returned order will respect the dependency tree; no child
+        will appear before its parent in the list. In addition, the
+        returned list may be larger as some dependencies of input
+        paths might not be in the original list.
+
+        :param paths: A list of store paths.
+        :type paths: ``list`` of ``str``
+
+        :return: A list of tuples of (paths, refs) in dependency-first order.
+        :rtype: ``list`` of (``str``, ``list`` of ``str``)
+        """
+        order = []
+        order_set = set()
+        def _order(path):
+            if path not in order_set:
+                refs = self._reference_cache.get_references(path)
+                for ref in refs:
+                    _order(ref)
+                order.append((path, refs))
+                order_set.add(path)
+        logging.debug("Computing a fetch order for {}"
+                      .format(tell_size(paths, "path")))
+        for path in paths:
+            if not isabs(path):
+                path = os.path.join(NIX_STORE_PATH, path)
+            _order(path)
+        logging.debug("Finished computing fetch order.")
+        return order
 
     def check_in_store(self, store_path):
         """Check that a store path exists in the nix store.
@@ -165,111 +241,19 @@ class NixServer(Flask):
             # If the path isn't in the filesystem, it definitely is
             # not a valid path.
             return False
-        # If it is on the filesystem, it doesn't necessarily mean
-        # that it's a registered path in the store. Check that
-        # here.
-        # If we have a connection to the database, all we have to
-        # do is look in the database.
-        if self._db_con is not None:
-            query = "select path from ValidPaths where path = ?"
-            with self._db_con:
-                results = self._db_con.execute(query, (store_path,)).fetchall()
-            if len(results) > 0:
-                self._known_store_paths.add(store_path)
-                return True
-            else:
-                return False
-        else:
-            # Otherwise we have to use the slower method :(
-            try:
-                self.query_store(store_path, "--hash", hide_stderr=True)
-                self._known_store_paths.add(store_path)
-                return True
-            except CalledProcessError:
-                return False
+        in_store = is_path_in_store(store_path, db_con=self._db_con)
+        if in_store is True:
+            self._known_store_paths.add(store_path)
+        return in_store
 
-    def query_store(self, store_path, query, hide_stderr=False):
-        """Given a query (e.g. --hash or --size), perform the query.
-
-        :param store_path: The store path to query.
-        :type store_path: ``str``
-        :param query: The query to perform. Must be a valid nix-store query.
-        :type query: ``str``
-        :param hide_stderr: If true, stderr will be hidden.
-        :type hide_stderr: ``bool``
-
-        :return: The result of the query.
-        :rtype: ``str``
-        """
-        nix_store = join(self._nix_bin_path, "nix-store")
-        command = [nix_store, "-q", query, store_path]
-        result = strip_output(command, shell=False, hide_stderr=hide_stderr)
-        return result
-
-    def get_object_info(self, store_path):
-        """Given a store path, get some information about the path.
-
-        :param store_path: Path to the object in the store. The path is assumed
-            to exist in the store and in the SQLite database. The path must
-            conform to the path regex.
-        :type store_path: ``str``
-
-        :return: A dictionary of store object information.
-        :rtype: ``dict``
-        """
-        if store_path in self._paths_to_info:
-            return self._paths_to_info[store_path]
-        # Build the compressed version. Compute its hash and size.
-        nar_path = self.build_nar(store_path)
-        du = strip_output("du -sb {}".format(nar_path))
-        file_size = int(du.split()[0])
-        file_hash = strip_output("nix-hash --type sha256 --base32 --flat {}"
-                                 .format(nar_path))
-        nar_size = self.query_store(store_path, "--size")
-        nar_hash = self.query_store(store_path, "--hash")
-        references = self.query_store(store_path, "--references").split()
-        deriver = self.query_store(store_path, "--deriver")
-        info = {
-            "StorePath": store_path,
-            "NarHash": nar_hash,
-            "NarSize": nar_size,
-            "FileSize": str(file_size),
-            "FileHash": "sha256:{}".format(file_hash)
-        }
-        if references != []:
-            info["References"] = " ".join(basename(ref) for ref in references)
-        if deriver != "unknown-deriver":
-            info["Deriver"] = basename(deriver)
-        self._paths_to_info[store_path] = info
-        return info
-
-    def build_nar(self, store_path):
-        """Build a nix archive (nar) and return the resulting path."""
-        if isinstance(store_path, tuple):
-            store_path = store_path[0]
-
-        # Construct a nix expression which will produce a nar.
-        nar_expr = "".join([
-            "(import <nix/nar.nix> {",
-            'storePath = "{}";'.format(store_path),
-            'hashAlgo = "sha256";',
-            'compressionType = "{}";'.format(self._compression_type),
-            "})"])
-
-        # Nix-build this expression, resulting in a store object.
-        compressed_path = strip_output([
-            join(self._nix_bin_path, "nix-build"),
-            "--expr", nar_expr, "--no-out-link"
-        ], shell=False)
-
-        # This path will contain a compressed file; return its path.
-        contents = map(decode_str, os.listdir(compressed_path))
-        for filename in contents:
-            if filename.endswith(self._nar_extension):
-                return join(compressed_path, filename)
-        # This might happen if we run out of disk space or something
-        # else terrible.
-        raise NoNarGenerated(compressed_path, self._nar_extension)
+    @lru_cache(maxsize=_NAR_CACHE_SIZE)
+    def build_nar(self, store_path, compression_type):
+        """Start a build of a NAR (nix archive). The result is a
+        future which will result in a NAR path."""
+        logging.info("Kicking off NAR build of {}, {} compression"
+                     .format(basename(store_path), compression_type))
+        return self._pool.submit(NarInfo.build_nar, store_path,
+                                 compression_type)
 
     def make_app(self):
         """Create a flask app and set up routes on it.
@@ -302,21 +286,15 @@ class NixServer(Flask):
                 raise ClientError("Hash {} must match {}"
                                   .format(obj_hash, _HASH_REGEX.pattern), 400)
             store_path = self.store_path_from_hash(obj_hash)
-            # TODO: use NarInfo class here
-            store_info = self.get_object_info(store_path)
-            # Add a few more keys to the store object, specific to the
-            # compression type we're serving.
-            store_info["URL"] = "nar/{}{}".format(obj_hash,
-                                                  self._nar_extension)
-            store_info["Compression"] = self._compression_type
-            info_string = "\n".join("{}: {}".format(k, v)
-                             for k, v in store_info.items()) + "\n"
-            return make_response((info_string, 200,
+            narinfo = NarInfo.from_store_path(
+                store_path,
+                compression_type=self._compression_type)
+            return make_response((narinfo.to_string(), 200,
                                  {"Content-Type": "application/octet-stream"}))
 
-        @app.route("/nar/<obj_hash>{}".format(self._nar_extension))
-        def serve_nar(obj_hash):
-            """Return the compressed binary from the nix store.
+        @app.route("/nar/<obj_hash>.nar.xz")
+        def serve_nar_xz(obj_hash):
+            """Return the compressed binary from the nix store (xz format).
 
             If the object isn't found, return a 404.
 
@@ -324,7 +302,20 @@ class NixServer(Flask):
             :type obj_hash: ``str``
             """
             store_path = self.store_path_from_hash(obj_hash)
-            nar_path = self.build_nar(store_path)
+            nar_path = self.build_nar(store_path, "xz").result()
+            return send_file(nar_path, mimetype="application/octet-stream")
+
+        @app.route("/nar/<obj_hash>.nar.bz2")
+        def serve_nar_bz2(obj_hash):
+            """Return the compressed binary from the nix store (bz2 format).
+
+            If the object isn't found, return a 404.
+
+            :param obj_hash: First 32 characters of the object's store path.
+            :type obj_hash: ``str``
+            """
+            store_path = self.store_path_from_hash(obj_hash)
+            nar_path = self.build_nar(store_path, "bzip2").result()
             return send_file(nar_path, mimetype="application/octet-stream")
 
         @app.route("/query-paths")
@@ -356,12 +347,12 @@ class NixServer(Flask):
             # Validate that all paths match the path regex; this will make
             # the SQL query we build correct and safe.
             for path in paths:
-                match = self._full_store_path_regex.match(path)
+                match = _STORE_PATH_REGEX.match(path)
                 if match is None:
                     raise ClientError(
                         "Encountered invalid store path '{}': does not match "
                         "pattern '{}'"
-                        .format(path, self._full_store_path_regex.pattern))
+                        .format(path, _STORE_PATH_REGEX.pattern))
                 if self.check_in_store(path):
                     path_results[path] = True
                     found += 1
@@ -371,6 +362,24 @@ class NixServer(Flask):
             logging.debug("{} of these paths were found, and {} were not."
                           .format(found, not_found))
             return jsonify(path_results)
+
+        @app.route("/compute-fetch-order")
+        def compute_fetch_order():
+            """Compute a fetch order for a client.
+
+            Input data should be a list of store paths separated by
+            newlines. Every store path in the list must exist on the
+            server or a 404 will be returned.
+
+            Returns a list in gzipped JSON. Each element of the list
+            is a length 2 list where the first element is a store path
+            and the second element is a list of references of that path.
+            """
+            paths = [p.decode("utf-8") for p in request.get_data().split()]
+            paths_j = json.dumps(self._compute_fetch_order(paths))
+            return make_response(gzip.compress(paths_j.encode("utf-8")), 200,
+                                 {"Content-Type": "application/octet-stream"})
+
 
         @app.route("/import-path", methods=["POST"])
         def import_path():
@@ -395,11 +404,11 @@ class NixServer(Flask):
             if content_type in (None, "", "application/octet-stream"):
                 data = request.data
             elif content_type == "application/x-gzip":
-                data = decompress("gzip -d", request.data)
+                data = gzip.decompress(request.data)
             else:
                 msg = "Unsupported content type '{}'".format(content_type)
                 raise ClientError(msg)
-            proc = Popen([join(self._nix_bin_path, "nix-store"), "--import"],
+            proc = Popen([join(NIX_BIN_PATH, "nix-store"), "--import"],
                          stdin=PIPE, stderr=PIPE, stdout=PIPE)
             # Get the request data and send it to the subprocess.
             out, err = proc.communicate(input=data)
@@ -409,7 +418,7 @@ class NixServer(Flask):
             result_path = decode_str(out).strip()
             # Spin off a thread to build a NAR of the path, to speed
             # up future fetches.
-            Thread(target=self.build_nar, args=(result_path,)).start()
+            self.build_nar(result_path, self._compression_type)
             # Return the path as an indicator of success.
             return (result_path, 200)
 
@@ -421,50 +430,45 @@ class NixServer(Flask):
             response = jsonify(error.to_dict())
             response.status_code = error.status_code
             return response
-
-        if self._debug is True:
-            @app.errorhandler(Exception)
-            def handle_unknown(error):
-                """If we encounter an unknown error, this will be triggered."""
-                logging.exception(error)
-                if sys.stdin.isatty():
-                    import ipdb
-                    ipdb.set_trace()
-                return ("An unknown error occurred", 500)
-
         return app
 
 
 def _get_args():
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(prog="servenix")
+    parser = argparse.ArgumentParser(prog="nix-server")
     parser.add_argument("--version", action="version", version=__version__)
-    parser.add_argument("--port", type=int, default=5000,
+    parser.add_argument("--port", type=int,
+                        default=int(os.getenv("PORT", 5000)),
                         help="Port to listen on.")
     parser.add_argument("--host", default="localhost",
                         help="Host to listen on.")
-    parser.add_argument("--compression-type", default="xz",
-                        choices=("xz", "bzip2"),
-                        help="How served objects should be compressed.")
-    parser.add_argument("--debug", action="store_true", default=False,
-                        help="Enable interactive debugging on unknown errors.")
-    parser.add_argument("--log-level", help="Log messages level.",
-                        default="INFO", choices=("CRITICAL", "ERROR", "INFO",
-                                                 "WARNING", "DEBUG"))
+    for t in sorted(list(COMPRESSION_TYPES) + list(COMPRESSION_TYPE_ALIASES)):
+        parser.add_argument("--" + t, action="store_const", const=t,
+                            dest="compression_type",
+                            help="Use {} compression for served NARs."
+                                 .format(_resolve_compression_type(t)))
+    for level in ("CRITICAL", "ERROR", "INFO", "WARNING", "DEBUG"):
+        parser.add_argument("--log-" + level.lower(), action="store_const",
+                            const=level, dest="log_level",
+                            help="Set log level to " + level + ".")
+    parser.add_argument("--max-workers", type=int, default=cpu_count(),
+                        help="Maximum concurrent NAR builder threads.")
+    parser.add_argument("--no-db", action="store_false", dest="direct_db",
+                        help="Disable direct-database mode.")
+    parser.set_defaults(direct_db=os.getenv("NO_DIRECT_DB", "") == "",
+                        log_level=os.environ.get("LOG_LEVEL", "INFO"),
+                        compression_type="xz")
     return parser.parse_args()
 
 
 def main():
     """Main entry point."""
-    nix_paths = find_nix_paths()
     args = _get_args()
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(message)s")
-    nixserver = NixServer(nix_store_path=nix_paths["nix_store_path"],
-                          nix_state_path=nix_paths["nix_state_path"],
-                          nix_bin_path=nix_paths["nix_bin_path"],
-                          compression_type=args.compression_type,
-                          debug=args.debug)
+    nixserver = NixServer(compression_type=args.compression_type,
+                          direct_db=args.direct_db,
+                          max_workers=args.max_workers)
     app = nixserver.make_app()
     app.run(port=args.port, host=args.host)
 

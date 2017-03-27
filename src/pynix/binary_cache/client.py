@@ -10,11 +10,21 @@ from os.path import (join, exists, isdir, isfile, expanduser, basename,
                      getmtime)
 import re
 import shutil
-from subprocess import Popen, PIPE, check_output, CalledProcessError
+from subprocess import (Popen, PIPE, check_output, CalledProcessError,
+                        check_call)
 import sys
 import tempfile
-from threading import Thread
+from threading import Thread, RLock, BoundedSemaphore
 from six.moves.urllib_parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, Future, wait, as_completed
+from multiprocessing import cpu_count
+import yaml
+if sys.version_info >= (3, 0):
+    import lzma
+else:
+    from backports import lzma
+import gzip
+import bz2
 
 # Special-case here to address a runtime bug I've encountered
 try:
@@ -32,10 +42,15 @@ import requests
 import six
 
 from pynix import __version__
-from pynix.utils import (strip_output, find_nix_paths, decode_str,
-                                decompress)
-from pynix.exceptions import CouldNotConnect, NixImportFailed
+from pynix.utils import (strip_output, decode_str, NIX_STORE_PATH,
+                         NIX_STATE_PATH, NIX_DB_PATH, nix_cmd,
+                         query_store, instantiate, tell_size,
+                         is_path_in_store)
+from pynix.exceptions import (CouldNotConnect, NixImportFailed, CliError,
+                              ObjectNotBuilt, NixBuildError, NoSuchObject)
+from pynix.binary_cache.nix_info_caches import PathReferenceCache
 from pynix.narinfo import NarInfo
+from pynix.build import needed_to_build_multi, parse_deriv_paths
 
 NIX_PATH_CACHE = os.environ.get("NIX_PATH_CACHE",
                                 expanduser("~/.nix-path-cache"))
@@ -50,12 +65,12 @@ class NixCacheClient(object):
     """Wraps some state for sending store objects."""
     def __init__(self, endpoint, dry_run=False, username=None,
                  password=None, cache_location=None, cache_enabled=True,
-                 nix_bin_path=None, nix_state_path=None, nix_store_path=None):
+                 max_jobs=cpu_count()):
         #: Server running servenix (string).
         self._endpoint = endpoint
         #: Base name of server (for caching).
         self._endpoint_server = urlparse(endpoint).netloc
-        #: If true, no actual paths will be sent.
+        #: If true, no actual paths will be sent/fetched/built.
         self._dry_run = dry_run
         #: If not none, will use to authenticate with the repo.
         if username is not None:
@@ -68,47 +83,34 @@ class NixCacheClient(object):
         self._password = password
         #: Set at a later point, if username is not None.
         self._auth = None
+        #: Used to avoid unnecessary overhead in handshakes etc.
+        self._session = None
         #: Set of paths known to exist on the server already (set of strings).
         self._objects_on_server = set()
         #: When sending objects, this can be used to count remaining.
         self._remaining_objects = None
-        #: Paths of crucial nix locations.
-        self._nix_bin_path = nix_bin_path if nix_bin_path is not None \
-                             else find_nix_paths()["nix_bin_path"]
-        self._nix_state_path = nix_state_path if nix_state_path is not None \
-                               else find_nix_paths()["nix_state_path"]
-        self._nix_store_path = nix_store_path if nix_store_path is not None \
-                               else find_nix_paths()["nix_store_path"]
-        #: Cache of direct path references (string -> strings). This
-        # is loaded asyncronously from an on-disk cache located in
-        # NIX_PATH_CACHE.
-        self._path_references = {}
-        # Start the cache loading thread but don't block on it; this
-        # prevents slow startup time due to the loading of a large
-        # cache.
-        self._cache_thread = Thread(target=self._load_path_cache)
-        self._cache_thread.start()
+        # A thread pool which handles queries for narinfo.
+        self._query_pool = ThreadPoolExecutor(max_workers=max_jobs)
+        # A thread pool which handles store object fetches.
+        self._fetch_pool = ThreadPoolExecutor(max_workers=max_jobs)
         #: Cache of narinfo objects requested from the server.
         self._narinfo_cache = {}
+        #: This will get filled up as we fetch paths; it lets avoid repeats.
         self._paths_fetched = set()
-
-    def _load_path_cache(self):
-        """Load the store reference path cache.
-        :return: A mapping from store paths to their references.
-        :rtype: ``dict`` of ``str`` to ``str``
-        """
-        if not isdir(NIX_PATH_CACHE):
-            return {}
-        logging.debug("Loading path cache...", file=sys.stderr)
-        store = self._nix_store_path
-        # path_cache = {}
-        for store_path in os.listdir(NIX_PATH_CACHE):
-            refs_dir = join(NIX_PATH_CACHE, store_path)
-            refs = [join(store, path) for path in os.listdir(refs_dir)
-                    if path != store_path]
-            self._path_references[join(store, store_path)] = refs
-        # logging.debug("Loaded references of {} paths".format(len(path_cache)))
-        # return path_cache
+        self._max_jobs = max_jobs
+        # A dictionary mapping nix store paths to futures fetching
+        # those paths from a cache. Each fetch happens in a different
+        # thread, and we use this dictionary to make sure that a fetch
+        # only happens once.
+        self._fetch_futures = {}
+        # A lock which syncronizes access to the fetch state.
+        self._fetch_lock = RLock()
+        # Will be set to a non-None value when fetching.
+        self._fetch_total = None
+        # Connection to the nix state database.
+        self._db_con = sqlite3.connect(NIX_DB_PATH)
+        # Caches nix path references.
+        self._reference_cache = PathReferenceCache(db_con=self._db_con)
 
     def _update_narinfo_cache(self, narinfo, write_to_disk):
         """Write a narinfo entry to the cache.
@@ -129,49 +131,10 @@ class NixCacheClient(object):
             os.makedirs(server_cache)
         if isfile(narinfo_path):
             return
-        tempfile_path = tempfile.mkstemp()[1]
-        with open(tempfile_path, "w") as f:
+        tempfile_fd, tempfile_path = tempfile.mkstemp()
+        with os.fdopen(tempfile_fd, "w") as f:
             f.write(json.dumps(narinfo.as_dict()))
         shutil.move(tempfile_path, narinfo_path)
-
-    def _update_reference_cache(self, store_path, references, write_to_disk):
-        """Given a store path and its references, write them to a cache.
-
-        Creates a directory for the base path of the store path, and
-        touches files corresponding to paths of its dependencies.
-        So for example, if /nix/store/xyz-foo depends on /nix/store/{a,b,c},
-        then we will create
-          NIX_PATH_CACHE/xyz-foo/a
-          NIX_PATH_CACHE/xyz-foo/b
-          NIX_PATH_CACHE/xyz-foo/c
-
-        :param store_path: A nix store path.
-        :type store_path: ``str``
-        :param references: A list of that path's references.
-        :type references: ``list`` of ``str``
-        :param write_to_disk: If true, write the entry to disk.
-        :type write_to_disk: ``bool``
-        """
-        self._path_references[store_path] = references
-        if write_to_disk is False:
-            return
-        if not isdir(NIX_PATH_CACHE):
-            os.makedirs(NIX_PATH_CACHE)
-        ref_dir = join(NIX_PATH_CACHE, basename(store_path))
-        if isdir(ref_dir):
-            # The cache already has this path; nothing to do.
-            return
-        # Create path directory in a tempdir to avoid inconsistent state.
-        tempdir = tempfile.mkdtemp()
-        for ref in references:
-            # Create an empty file with the name of the reference.
-            fname = join(tempdir, basename(ref))
-            with open(fname, 'a'):
-                os.utime(fname, (0, 0))
-        # Remove the directory just in case, and then move the tempdir
-        # to the target location.
-        shutil.rmtree(ref_dir, ignore_errors=True)
-        shutil.move(tempdir, ref_dir)
 
     def get_narinfo(self, path):
         """Request narinfo from a server. These are cached in memory.
@@ -187,16 +150,25 @@ class NixCacheClient(object):
             cache_path = join(NIX_NARINFO_CACHE, self._endpoint_server,
                               basename(path))
             if isfile(cache_path):
-                write_to_disk = False
-                with open(cache_path) as f:
-                    narinfo = NarInfo.from_dict(json.load(f))
+                try:
+                    logging.debug("Loading {} narinfo from on-disk cache"
+                                  .format(basename(path)))
+                    with open(cache_path) as f:
+                        narinfo = NarInfo.from_dict(json.load(f))
+                    write_to_disk = False
+                except json.decoder.JSONDecodeError:
+                    logging.debug("Invalid cache JSON: {}".format(cache_path))
+                    os.unlink(cache_path)
+                    return self.get_narinfo(path)
             else:
+                logging.debug("Requesting {} narinfo from server"
+                              .format(basename(path)))
                 prefix = basename(path).split("-")[0]
                 url = "{}/{}.narinfo".format(self._endpoint, prefix)
-                auth = self._get_auth()
-                print("hitting url {}...".format(url), end="")
-                response = requests.get(url, auth=auth)
-                print("ok")
+                logging.debug("hitting url {} (for path {})..."
+                              .format(url, path))
+                response = self._connect().get(url)
+                logging.debug("response arrived from {}".format(url))
                 response.raise_for_status()
                 narinfo = NarInfo.from_string(response.content)
             self._update_narinfo_cache(narinfo, write_to_disk)
@@ -205,7 +177,8 @@ class NixCacheClient(object):
     def get_references(self, path, query_server=False):
         """Get a path's direct references.
 
-        :param path: A nix store path. It must exist in the store.
+        :param path: A nix store path. It must either exist in the
+                     local nix store or be available in the binary cache.
         :type path: ``str``
         :param query_server: If true, will attempt to query the server
                              for the paths if not on disk. This is
@@ -214,32 +187,20 @@ class NixCacheClient(object):
 
         :return: A list of absolute paths that the path refers to directly.
         :rtype: ``list`` of ``str``
-
-        Side effects:
-        * Caches reference lists in `self._path_references`.
         """
-        if path not in self._path_references:
-            write_to_disk = True
-            # First see if it's in the on-disk cache.
-            if isdir(join(NIX_PATH_CACHE, basename(path))):
-                write_to_disk = False # Not necessary, already there.
-                refs_dir = join(NIX_PATH_CACHE, basename(path))
-                refs = [join(store, path) for path in os.listdir(refs_dir)
-                        if path != basename(path)]
-            # If it's not in the cache, try asking nix-store for it.
-            try:
-                refs = strip_output("nix-store --query --references {}"
-                                    .format(path), hide_stderr=query_server)
-                refs = [r for r in refs.split() if r != path]
-            # If nix-store gives an error and server querying is
-            # enabled, query the binary cache.
-            except CalledProcessError:
-                if query_server is False:
-                    raise
-                narinfo = self.get_narinfo(path)
-                refs = [r for r in narinfo.abs_references if r != path]
-            self._update_reference_cache(path, refs, write_to_disk)
-        return self._path_references[path]
+        try:
+            return self._reference_cache.get_references(
+                path, hide_stderr=query_server)
+        except NoSuchObject as err:
+            if query_server is False:
+                logging.error("Couldn't determine the references of {} "
+                              "locally, and can't query the server"
+                              .format(path))
+                raise
+            narinfo = self.get_narinfo(path)
+            refs = [r for r in narinfo.abs_references if r != path]
+            self._reference_cache.record_references(path, refs)
+            return refs
 
     def query_paths(self, paths):
         """Given a list of paths, see which the server has.
@@ -259,25 +220,44 @@ class NixCacheClient(object):
         data = json.dumps(paths)
         headers = {"Content-Type": "application/json"}
         logging.debug("Asking the server about {} paths.".format(len(paths)))
-        auth = self._get_auth()
         try:
-            response = requests.get(url, headers=headers, data=data, auth=auth)
+            response = self._connect().get(url, headers=headers, data=data)
             response.raise_for_status()
             return response.json()
         except requests.HTTPError as err:
             if err.response.status_code != 404:
                 raise
-            logging.debug("Endpoint {} does not support the /query-paths "
-                          "route. Querying paths individually."
-                          .format(self._endpoint))
-            result = {}
-            for path in paths:
-                logging.debug("Querying for path {}".format(path))
-                prefix = basename(path).split("-")[0]
-                url = "{}/{}.narinfo".format(self._endpoint, prefix)
-                resp = requests.get(url, auth=auth)
-                result[path] = resp.status_code == 200
+            logging.warn("Endpoint {} does not support the /query-paths "
+                         "route. Querying paths individually."
+                         .format(self._endpoint))
+            futures = {
+                path: self._query_pool.submit(self.query_path_individually,
+                                              path)
+                for path in paths
+            }
+            result = {path: fut.result() for path, fut in futures.items()}
             return result
+
+    def query_path_individually(self, path):
+        """Send an individual query (.narinfo) for a store path.
+
+        :param path: A store path, to ask a binary cache about.
+        :type path: ``str``
+
+        :return: True if the server has the path, and otherwise false.
+        :rtype: ``bool``
+        """
+        logging.debug("Querying for path {}".format(path))
+        prefix = basename(path).split("-")[0]
+        url = "{}/{}.narinfo".format(self._endpoint, prefix)
+        resp = self._connect().get(url)
+        has_path = resp.status_code == 200
+        if has_path:
+            logging.debug("{} has path {}".format(self._endpoint, path))
+        else:
+            logging.debug("{} does not have path {}"
+                          .format(self._endpoint, path))
+        return has_path
 
     def query_path_closures(self, paths):
         """Given a list of paths, compute their whole closure and ask
@@ -292,7 +272,7 @@ class NixCacheClient(object):
         Side effects:
         * Adds 0 or more paths to `self._objects_on_server`.
         """
-        paths = [os.path.join(self._nix_store_path, p) for p in paths]
+        paths = [os.path.join(NIX_STORE_PATH, p) for p in paths]
         total = len(paths)
         step = max(total // 10, 1)
         full_path_set = set()
@@ -329,8 +309,12 @@ class NixCacheClient(object):
                 to_send.add(path)
         return to_send
 
-    def _get_auth(self, first_time=True):
-        """Return HTTP basic auth, if username is set (else None).
+    def _connect(self, first_time=True):
+        """Connect to a binary cache.
+
+        Serves two purposes: verifying that the client can
+        authenticate with the cache, and that the binary cache store
+        directory matches the client's.
 
         If password isn't set, reads the NIX_BINARY_CACHE_PASSWORD
         variable for the password. If it is not set, the user will
@@ -340,17 +324,17 @@ class NixCacheClient(object):
             called, so that we can tailor the error messaging.
         :type first_time: ``bool``
 
-        :return: Either None or an Auth object.
-        :rtype: ``NoneType`` or :py:class:`requests.auth.HTTPBasicAuth`
+        :return: Either None or a Session object.
+        :rtype: ``NoneType`` or :py:class:`requests.sessions.Session`
 
         :raises: :py:class:`CouldNotConnect` if authentication fails.
 
         Side effects:
         * Will set the NIX_BINARY_CACHE_{USERNAME,PASSWORD} variables.
         """
-        if self._auth is not None:
-            # Cache auth to avoid repeated prompts
-            return self._auth
+        if self._session is not None:
+            # Cache to avoid repeated prompts
+            return self._session
         if self._password is not None:
             password = self._password
         elif self._username is None:
@@ -373,16 +357,26 @@ class NixCacheClient(object):
             auth = requests.auth.HTTPBasicAuth(self._username, password)
         else:
             auth = None
+        # Create a session. Don't set it on the object yet.
+        session = requests.Session()
         # Perform the actual request. See if we get a 200 back.
         url = "{}/nix-cache-info".format(self._endpoint)
-        resp = requests.get(url, auth=auth)
+        resp = session.get(url, auth=auth)
         if resp.status_code == 200:
+            nix_cache_info = yaml.load(resp.content)
+            cache_store_dir = nix_cache_info["StoreDir"]
+            if cache_store_dir != NIX_STORE_PATH:
+                raise ValueError("This binary cache serves packages from "
+                                 "store directory {}, but this client is "
+                                 "using {}"
+                                 .format(cache_store_dir, NIX_STORE_PATH))
             logging.info("Successfully connected to {}".format(self._endpoint))
             self._password = password
             if password is not None:
                 os.environ["NIX_BINARY_CACHE_PASSWORD"] = password
-            self._auth = auth
-            return self._auth
+            self._auth = session.auth = auth
+            self._session = session
+            return self._session
         elif resp.status_code == 401 and sys.stdin.isatty():
             # Authorization failed. Give the user a chance to set new auth.
             msg = "\033[31mAuthorization failed!\033[0m\n" \
@@ -400,9 +394,9 @@ class NixCacheClient(object):
                 os.environ.pop("NIX_BINARY_CACHE_PASSWORD", None)
                 self._password = None
             except (KeyboardInterrupt, EOFError):
-                print("\nBye!")
+                logging.info("\nBye!")
                 sys.exit()
-            return self._get_auth(first_time=False)
+            return self._connect(first_time=False)
         else:
             raise CouldNotConnect(self._endpoint, resp.status_code,
                                   resp.content)
@@ -429,8 +423,8 @@ class NixCacheClient(object):
         # streaming because it's not entirely clear that this is
         # possible with current requests, or indeed possible in
         # general without knowing the file size.
-        auth = self._get_auth()
-        export = check_output("nix-store --export {}".format(path), shell=True)
+        session = self._connect()
+        export = check_output(nix_cmd("nix-store", ["--export", path]))
         # For large files, show progress when compressing
         if len(export) > 1000000:
             logging.info("Compressing {}".format(basename(path)))
@@ -444,7 +438,7 @@ class NixCacheClient(object):
         try:
             logging.info("Sending {} ({} remaining)"
                          .format(basename(path), len(remaining_objects)))
-            response = requests.post(url, data=data, headers=headers, auth=auth)
+            response = session.post(url, data=data, headers=headers)
             response.raise_for_status()
         except requests.exceptions.HTTPError as err:
             try:
@@ -487,7 +481,7 @@ class NixCacheClient(object):
             for path in to_send:
                 logging.info(basename(path))
 
-    def have_fetched(self, path):
+    def _have_fetched(self, path):
         """Checks if we've fetched a given path, or if it exists on disk.
 
         :param path: The path to the store object to check.
@@ -507,61 +501,127 @@ class NixCacheClient(object):
         else:
             return False
 
-    def fetch_object(self, path):
-        """Fetch a store object from a nix server.
+    def _compute_fetch_order(self, paths):
+        """Given a list of paths, compute an order to fetch them in.
 
-        This is obviously the inverse of a send, and quite a similar
-        algorithm (first fetch parents, and then fetch the
-        object). But it's a little different because although with a
-        send you already know (or can derive) the references of the
-        object, with fetching you need to ask the server for the
-        references.
+        The returned order will respect the dependency tree; no child
+        will appear before its parent in the list. In addition, the
+        returned list may be larger as some dependencies of input
+        paths might not be in the original list.
 
-        :param path: The path to the store object to fetch.
-        :type path: ``str``
+        :param paths: A list of store paths.
+        :type paths: ``list`` of ``str``
 
-        Side effects:
-        * Adds 0 or 1 paths to `self._paths_fetched`.
-
-        This function should be thread safe, since a nix-store import
-        is idempotent.
+        :return: A list of paths in dependency-first order.
+        :rtype: ``list`` of ``str``
         """
-        # Check if the object has already been fetched; if so we can stop.
-        if self.have_fetched(path):
-            logging.info("{} has already been fetched.".format(path))
+        # Start by seeing if the server supports the
+        # compute-fetch-order route. If it does, we can just use that
+        # and save a lot of effort and network traffic.
+        try:
+            url = self._endpoint + "/compute-fetch-order"
+            response = self._connect().get(url, data="\n".join(paths))
+            response.raise_for_status()
+            pairs = json.loads(decode_str(gzip.decompress(response.content)))
+            # Server also returns the references for everything in the
+            # list. We can store those in our cache.
+            order = []
+            for item in pairs:
+                path, refs = item[0], item[1]
+                self._reference_cache.record_references(path, refs)
+                order.append(path)
+            return order
+        except (requests.HTTPError, AssertionError) as err:
+            logging.info("Server doesn't support compute-fetch-order "
+                         "route. Have to do it ourselves...")
+            order = []
+            order_set = set()
+            def _order(path):
+                if path not in order_set:
+                    for ref in self.get_references(path, query_server=True):
+                        _order(ref)
+                    order.append(path)
+                    order_set.add(path)
+            logging.debug("Computing a fetch order for {}"
+                          .format(tell_size(paths, "path")))
+            for path in paths:
+                _order(path)
+            logging.debug("Finished computing fetch order.")
+            return order
+
+    def _fetch_ordered_paths(self, store_paths):
+        """Given an ordered list of paths, fetch all from a cache."""
+        logging.info("Beginning fetches. Total of {} to fetch."
+                     .format(tell_size(store_paths, "store object")))
+        for path in store_paths:
+            self._start_fetching(path)
+        for i, path in enumerate(store_paths):
+            logging.info("{}/{} ({})"
+                         .format(i + 1, len(store_paths), basename(path)))
+            self._finish_fetching(path)
+        logging.info("Finished fetching {}".format(
+            tell_size(store_paths, "path")))
+
+    def _fetch_single(self, path):
+        """Fetch a single path."""
+        # Return if the path has already been fetched, or already exists.
+        if self._have_fetched(path):
             return
-        # First fetch all of the object's references.
-        for ref in self.get_references(path, query_server=True):
-            self.fetch_object(ref)
-        # Now we can fetch the object itself. Get its info first.
+        # First ensure that all referenced paths have been fetched.
+        for ref in self.get_references(path):
+            self._finish_fetching(ref)
+        # Get the info of the store path.
         narinfo = self.get_narinfo(path)
 
         # Use the URL in the narinfo to fetch the object.
         url = "{}/{}".format(self._endpoint, narinfo.url)
-
-        response = requests.get(url, auth=self._get_auth())
+        logging.debug("Requesting {} from {}..."
+                     .format(basename(path), self._endpoint))
+        response = self._connect().get(url)
         response.raise_for_status()
 
         # Figure out how to extract the content.
         if narinfo.compression.lower() in ("xz", "xzip"):
-            data = decompress("xz -d", response.content)
+            data = lzma.decompress(response.content)
         elif narinfo.compression.lower() in ("bz2", "bzip2"):
-            data = decompress("bzip2 -d", response.content)
+            data = bz2.decompress(response.content)
         elif narinfo.compression.lower() in ("gzip", "gz"):
-            data = decompress("gzip -d", response.content)
+            data = gzip.decompress(response.content)
         else:
             raise ValueError("Unsupported narinfo compression type {}"
                              .format(narinfo.compression))
-        # Once extracted, convert it into a nix export object and pass
-        # it into the nix-store --import command.
-        proc = Popen([join(self._nix_bin_path, "nix-store"), "--import"],
-                     stdin=PIPE, stderr=PIPE, stdout=PIPE)
+        # Once extracted, convert it into a nix export object and import.
         export = narinfo.nar_to_export(data)
-        out, err = proc.communicate(input=export.to_bytes())
-        if proc.wait() != 0:
-            raise NixImportFailed(decode_str(err))
-        logging.info("Imported path {}".format(out.decode("utf-8")))
+        imported_path = export.import_to_store()
+        self._register_as_fetched(path)
+
+    def _register_as_fetched(self, path):
+        """Register that a store path has been fetched."""
         self._paths_fetched.add(path)
+
+    def _start_fetching(self, path):
+        """Start a fetch thread. Syncronized so that a fetch of a
+        single path will only happen once."""
+        with self._fetch_lock:
+            if path not in self._fetch_futures:
+                future = self._fetch_pool.submit(self._fetch_single, path)
+                logging.debug("Putting fetch of path {} in future {}"
+                              .format(path, future))
+                self._fetch_futures[path] = future
+                return future
+            else:
+                return self._fetch_futures[path]
+
+    def _finish_fetching(self, path):
+        """Given a path, wait until that path's fetch has finished. It
+        must already have been started."""
+        with self._fetch_lock:
+            if path not in self._fetch_futures:
+                raise RuntimeError("Fetch of path {} has not been started."
+                                   .format(path))
+            future = self._fetch_futures[path]
+        # Now that we have the future, wait for it to finish before returning.
+        future.result()
 
     def watch_store(self, ignore):
         """Watch the nix store's timestamp and sync whenever it changes.
@@ -574,7 +634,7 @@ class NixCacheClient(object):
         try:
             while True:
                 # Parse the timestamp of the nix store into a datetime
-                stamp = datetime.fromtimestamp(getmtime(self._nix_store_path))
+                stamp = datetime.fromtimestamp(getmtime(NIX_STORE_PATH))
                 # If it's changed since last time, run a sync.
                 if stamp == prev_stamp:
                     logging.debug("Store hasn't updated since last check ({})"
@@ -595,7 +655,6 @@ class NixCacheClient(object):
             exit("Successfully syncronized with {} {} times."
                  .format(self._endpoint, num_syncs))
 
-
     def sync_store(self, ignore):
         """Syncronize the local nix store to the endpoint.
 
@@ -606,10 +665,9 @@ class NixCacheClient(object):
         :param ignore: A list of regexes of objects to ignore.
         :type ignore: ``list`` of (``str`` or ``regex``)
         """
-        db_path = os.path.join(self._nix_state_path, "nix", "db", "db.sqlite")
         ignore = [re.compile(r) for r in ignore]
         paths = []
-        with sqlite3.connect(db_path) as con:
+        with self._db_con:
             query = con.execute("SELECT path FROM ValidPaths")
             for result in query.fetchall():
                 path = result[0]
@@ -621,10 +679,183 @@ class NixCacheClient(object):
         logging.info("Found {} paths in the store.".format(len(paths)))
         self.send_objects(paths)
 
+    def build_fetch(self, nix_file, attributes, verbose=False, show_trace=True,
+                    keep_going=True, create_links=False, use_deriv_name=True):
+        """Given a nix file, instantiate the given attributes within the file,
+        query the server for which files can be fetched, and then
+        build/fetch everything.
+
+        :return: A dictionary mapping derivations to outputs that were built.
+        :rtype: ``dict``
+        """
+        logging.info("Instantiating attribute{} {} from path {}"
+                     .format("s" if len(attributes) > 1 else "",
+                             ", ".join(attributes), nix_file))
+        deriv_paths = instantiate(nix_file, attributes=attributes,
+                                  show_trace=show_trace)
+        derivs_to_outputs = parse_deriv_paths(deriv_paths)
+        need_to_build, need_to_fetch = self.preview_build(deriv_paths)
+        if self._dry_run is True:
+            self.print_preview(need_to_build, need_to_fetch, verbose)
+            return
+        # Build the list of paths to fetch from the remote store.
+        paths_to_fetch = []
+        for deriv, outputs in need_to_fetch.items():
+            for output in outputs:
+                paths_to_fetch.append(deriv.output_path(output))
+        if len(paths_to_fetch) > 0:
+            # Figure out the order to fetch them in.
+            logging.info("Computing fetch order...")
+            fetch_order = self._compute_fetch_order(paths_to_fetch)
+            # Perform the fetches.
+            self._fetch_ordered_paths(fetch_order)
+            self._verify(need_to_fetch)
+        # Build up the command for nix store to build the remaining paths.
+        if len(need_to_build) > 0:
+            args = ["--max-jobs", str(self._max_jobs), "--no-gc-warning",
+                    "--realise"]
+            args.extend(d.path for d in need_to_build)
+            if keep_going is True:
+                args.append("--keep-going")
+            logging.info("Building {} locally"
+                         .format(tell_size(need_to_build, "derivation")))
+            cmd = nix_cmd("nix-store", args)
+            try:
+                strip_output(cmd).split()
+            except CalledProcessError as err:
+                self._handle_build_failure(need_to_build)
+        else:
+            logging.info("No derivations needed to be built locally")
+        if create_links is True:
+            self._create_symlinks(derivs_to_outputs, use_deriv_name)
+        return derivs_to_outputs
+
+    def _handle_build_failure(self, derivs_to_outputs):
+        """In a failure situation, report which derivations succeeded and
+        which failed.
+        """
+        # TODO: report exactly which derivations succeeded/failed.
+        raise NixBuildError()
+
+    def _verify(self, derivs_to_outputs):
+        """Given a derivation-output mapping, verify all paths."""
+        logging.info("Verifying that we successfully created {}"
+                     .format(tell_size(derivs_to_outputs, "store path")))
+        for deriv, outputs in derivs_to_outputs.items():
+            for output in outputs:
+                path = deriv.output_path(output)
+                logging.debug("Verifying path {}".format(basename(path)))
+                if not is_path_in_store(path, db_con=self._db_con):
+                    raise ObjectNotBuilt(path)
+
+    def _create_symlinks(self, derivs_to_outputs, use_deriv_name):
+        """Create symlinks to all built derivations.
+
+        :param derivs_to_outputs: Maps derivations to sets of output names.
+        :type derivs_to_outputs:
+            ``dict`` of ``Derivation`` to ``set`` of ``str``
+        :param use_deriv_name: If true, the symlink names will be
+                               generated from derivation names.
+                               Otherwise, `result` will be used.
+        :type use_deriv_name: ``bool``
+        """
+        count = 0
+        for deriv, outputs in derivs_to_outputs.items():
+            for output in outputs:
+                path = deriv.output_path(output)
+                if use_deriv_name:
+                    link_path = deriv.link_path(output)
+                else:
+                    link_path = join(os.getcwd(), "result")
+                    if output != "out":
+                        link_path += "-" + output
+                    if count > 0:
+                        link_path += "-" + str(count)
+                args = ["--realise", path, "--add-root", link_path,
+                        "--indirect"]
+                check_output(nix_cmd("nix-store", args))
+                count += 1
+
+    def preview_build(self, paths):
+        """Given some derivation paths, generate two sets:
+
+        * Set of derivations which need to be built from scratch
+        * Set of derivations which can be fetched from a binary cache
+
+        Of course, the second set will be empty if no binary cache is given.
+        """
+        if isinstance(paths, dict):
+            derivs_outs = paths
+        else:
+            derivs_outs = parse_deriv_paths(paths)
+        existing = {}
+        # Run the first time with no on_server argument.
+        needed, need_fetch = needed_to_build_multi(derivs_outs, existing=existing)
+        if len(needed) > 0:
+            logging.info("{} were not in the local nix store. Querying {} to "
+                         "see which paths it has..."
+                         .format(tell_size(needed, "needed object"),
+                                 self._endpoint))
+            on_server = {}
+            # Query the server for missing paths. Start by trying a
+            # multi-query because it's faster; if the server doesn't
+            # implement that behavior then try individual queries.
+            paths_to_ask = []
+            # Make a dictionary mapping paths back to the
+            # derivations/outputs they came from.
+            path_mapping = {}
+            for deriv, outs in needed.items():
+                for out in outs:
+                    path = deriv.output_path(out)
+                    paths_to_ask.append(path)
+                    path_mapping[path] = (deriv, out)
+            query_result = self.query_paths(paths_to_ask)
+            for path, is_on_server in query_result.items():
+                if is_on_server is not True:
+                    continue
+                deriv, out_name = path_mapping[path]
+                # First, remove these from the `needed` set, because
+                # we can fetch them from the server.
+                needed[deriv].remove(out_name)
+                if len(needed[deriv]) == 0:
+                    del needed[deriv]
+                # Then add them to the `on_server` set.
+                if deriv not in on_server:
+                    on_server[deriv] = set()
+                on_server[deriv].add(out_name)
+            if len(on_server) > 0:
+                # Run the check again, this time using the information
+                # collected from the server.
+                needed, need_fetch = needed_to_build_multi(derivs_outs,
+                                                           on_server=on_server,
+                                                           existing=existing)
+        return needed, need_fetch
+
+    def print_preview(self, need_to_build, need_to_fetch, verbose=False):
+        """Print the result of a `preview_build` operation."""
+        if len(need_to_build) == 0 and len(need_to_fetch) == 0:
+            logging.info("All paths have already been built.")
+        if len(need_to_build) > 0:
+            verbose_ = verbose or len(need_to_build) < SHOW_PATHS_LIMIT
+            msg = (("{} will be built" + (":" if verbose_ else "."))
+                   .format(tell_size(need_to_build, "derivation")))
+            if verbose_:
+                for deriv in need_to_build:
+                    msg += "\n  " + deriv.path
+            logging.info(msg)
+        if len(need_to_fetch) > 0:
+            verbose_ = verbose or len(need_to_fetch) < SHOW_PATHS_LIMIT
+            msg = (("{} will be fetched from {}" + (":" if verbose_ else "."))
+                   .format(tell_size(need_to_fetch, "path"), self._endpoint))
+            if verbose_:
+                for deriv, outs in need_to_fetch.items():
+                    for out in outs:
+                        msg += "\n  " + deriv.output_path(out)
+            logging.info(msg)
 
 def _get_args():
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(prog="sendnix")
+    parser = argparse.ArgumentParser(prog="nix-client")
     parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(title="Command", dest="command")
     subparsers.required = True
@@ -639,27 +870,47 @@ def _get_args():
     fetch = subparsers.add_parser("fetch",
                                    help="Fetch objects from a nix server.")
     fetch.add_argument("paths", nargs="+", help="Paths to fetch.")
-    for subparser in (send, sync, daemon, fetch):
+    build = subparsers.add_parser("build",
+        help="Build a nix expression, using the server as a binary cache.")
+    build.add_argument("-P", "--path", default=os.getcwd(),
+                       help="Base path to evaluate.")
+    build.add_argument("attributes", nargs="*",
+                       help="Expressions to evaluate.")
+    build.add_argument("-v", "--verbose", action="store_true", default=False,
+                       help="Show verbose output.")
+    build.add_argument("--no-trace", action="store_false", dest="show_trace",
+                       help="Hide stack trace on instantiation error.")
+    build.add_argument("-S", "--stop-on-failure", action="store_false",
+                       dest="keep_going",
+                       help="Stop all builders if any builder fails.")
+    build.add_argument("--hide-paths", action="store_false",
+                       dest="print_paths",
+                       help="Don't print built paths to stdout")
+    build.add_argument("-C", "--create-links", action="store_true",
+                       default=False, help="Create symlinks to built objects.")
+    build.add_argument("-g", "--generic-link-name", action="store_true",
+                       default=False,
+                       help="Use generic `result` name for symlinks.")
+    build.add_argument("-1", "--one", action="store_true", default=False,
+                       help="Alias for '--max-jobs=1 --stop-on-failure'")
+    build.set_defaults(show_trace=True, keep_going=True, print_paths=True)
+    for subparser in (send, sync, daemon, fetch, build):
         subparser.add_argument("-e", "--endpoint",
                                default=os.environ.get("NIX_REPO_HTTP"),
                                help="Endpoint of nix server to send to.")
-        subparser.add_argument("--log-level", help="Log messages level.",
-                               default="INFO", choices=("CRITICAL", "ERROR",
-                                                        "WARNING", "INFO",
-                                                        "DEBUG"))
+        subparser.set_defaults(log_level=os.getenv("LOG_LEVEL", "INFO"))
+        for level in ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"):
+            subparser.add_argument("--" + level.lower(), dest="log_level",
+                                   action="store_const", const=level)
         subparser.add_argument("-u", "--username",
             default=os.environ.get("NIX_BINARY_CACHE_USERNAME"),
             help="User to authenticate to the cache as.")
-        subparser.add_argument("--nix-state-path",
-                               help="Location of nix state directory.")
-        subparser.add_argument("--nix-store-path",
-                               help="Location of nix store directory.")
-        subparser.add_argument("--nix-bin-path",
-                               help="Location of nix binary directory.")
+        subparser.add_argument("--max-jobs", type=int, default=cpu_count(),
+                               help="For concurrency, max workers.")
         subparser.add_argument("-D", "--dry-run", action="store_true",
                                default=False,
                                help="If true, reports which paths would "
-                                    "be sent.")
+                                    "be sent/fetched/built.")
     for subparser in (sync, daemon):
         subparser.add_argument("--ignore", nargs="*", default=[],
                                help="Regexes of store paths to ignore.")
@@ -675,23 +926,35 @@ def main():
     elif ENDPOINT_REGEX.match(args.endpoint) is None:
         exit("Invalid endpoint: '{}' does not match '{}'."
              .format(args.endpoint, ENDPOINT_REGEX.pattern))
-    logging.basicConfig(level=getattr(logging, args.log_level),
-                        format="%(message)s")
+    log_level = getattr(logging, args.log_level.upper())
+    logging.basicConfig(level=log_level, format="%(message)s")
     # Hide noisy logging of some external libs
     for name in ("requests", "urllib", "urllib2", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
-    client = NixCacheClient(
-        nix_bin_path=args.nix_bin_path, nix_state_path=args.nix_state_path,
-        nix_store_path=args.nix_store_path,
-        endpoint=args.endpoint, dry_run=args.dry_run, username=args.username)
-    if args.command == "send":
-        client.send_objects(args.paths)
-    elif args.command == "sync":
-        client.sync_store(args.ignore)
-    elif args.command == "daemon":
-        client.watch_store(args.ignore)
-    elif args.command == "fetch":
-        for path in args.paths:
-            client.fetch_object(path)
-    else:
-        exit("Unknown command '{}'".format(args.command))
+    max_jobs = 1 if args.one else args.max_jobs
+    client = NixCacheClient(endpoint=args.endpoint, dry_run=args.dry_run,
+                            username=args.username, max_jobs=max_jobs)
+    try:
+        if args.command == "send":
+            client.send_objects(args.paths)
+        elif args.command == "sync":
+            client.sync_store(args.ignore)
+        elif args.command == "daemon":
+            client.watch_store(args.ignore)
+        elif args.command == "fetch":
+            wait(list(client.fetch_objects(args.paths).values()))
+        elif args.command == "build":
+            keep_going = False if args.one else args.keep_going
+            result_derivs = client.build_fetch(
+                nix_file=args.path, attributes=args.attributes,
+                verbose=args.verbose, show_trace=args.show_trace,
+                keep_going=keep_going, create_links=args.create_links,
+                use_deriv_name=not args.generic_link_name)
+            if args.dry_run is False and args.print_paths is True:
+                for deriv, outputs in result_derivs.items():
+                    for output in outputs:
+                        print(deriv.output_path(output))
+        else:
+            exit("Unknown command '{}'".format(args.command))
+    except CliError as err:
+        err.exit()
