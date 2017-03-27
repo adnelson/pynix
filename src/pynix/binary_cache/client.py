@@ -65,7 +65,7 @@ class NixCacheClient(object):
     """Wraps some state for sending store objects."""
     def __init__(self, endpoint, dry_run=False, username=None,
                  password=None, cache_location=None, cache_enabled=True,
-                 max_jobs=cpu_count()):
+                 max_jobs=cpu_count(), max_fetch_attempts=3):
         #: Server running servenix (string).
         self._endpoint = endpoint
         #: Base name of server (for caching).
@@ -111,6 +111,8 @@ class NixCacheClient(object):
         self._db_con = sqlite3.connect(NIX_DB_PATH)
         # Caches nix path references.
         self._reference_cache = PathReferenceCache(db_con=self._db_con)
+        # How many times to attempt fetching a package
+        self._max_fetch_attempts = max_fetch_attempts
 
     def _update_narinfo_cache(self, narinfo, write_to_disk):
         """Write a narinfo entry to the cache.
@@ -577,8 +579,23 @@ class NixCacheClient(object):
         url = "{}/{}".format(self._endpoint, narinfo.url)
         logging.debug("Requesting {} from {}..."
                      .format(basename(path), self._endpoint))
-        response = self._connect().get(url)
-        response.raise_for_status()
+        attempt = 1
+        while True:
+            try:
+                response = self._connect().get(url)
+                response.raise_for_status()
+                break
+            except requests.HTTPError as err:
+                if self._max_fetch_attempts is not None and \
+                   attempt >= self._max_fetch_attempts:
+                    raise
+                else:
+                    logging.warn("Received an error response ({}) from the "
+                                 "server. Retrying (attempt {} out of {})"
+                                 .format(attempt, self._max_fetch_attempts))
+                    attempt += 1
+        else:
+            raise
 
         # Figure out how to extract the content.
         if narinfo.compression.lower() in ("xz", "xzip"):
