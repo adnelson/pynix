@@ -169,9 +169,8 @@ class NixCacheClient(object):
                 url = "{}/{}.narinfo".format(self._endpoint, prefix)
                 logging.debug("hitting url {} (for path {})..."
                               .format(url, path))
-                response = self._connect().get(url)
+                response = self._request_get(url)
                 logging.debug("response arrived from {}".format(url))
-                response.raise_for_status()
                 narinfo = NarInfo.from_string(response.content)
             self._update_narinfo_cache(narinfo, write_to_disk)
         return self._narinfo_cache[path]
@@ -564,6 +563,28 @@ class NixCacheClient(object):
         logging.info("Finished fetching {}".format(
             tell_size(store_paths, "path")))
 
+    def _request_get(self, url):
+        """Make a request, with retry logic."""
+        attempt = 1
+        while True:
+            try:
+                response = self._connect().get(url)
+                response.raise_for_status()
+                return response
+            except requests.HTTPError as err:
+                if self._max_fetch_attempts is not None and \
+                   attempt >= self._max_fetch_attempts:
+                    raise
+                else:
+                    logging.warn("Received an error response ({}) from the "
+                                 "server. Retrying (attempt {} out of {})"
+                                 .format(attempt, self._max_fetch_attempts))
+                    attempt += 1
+            except requests.ConnectionError as cerr:
+                logging.warn("Encountered connection error {}. Reinitializing "
+                             "connection".format(cerr))
+                self._session = None
+
     def _fetch_single(self, path):
         """Fetch a single path."""
         # Return if the path has already been fetched, or already exists.
@@ -579,23 +600,7 @@ class NixCacheClient(object):
         url = "{}/{}".format(self._endpoint, narinfo.url)
         logging.debug("Requesting {} from {}..."
                      .format(basename(path), self._endpoint))
-        attempt = 1
-        while True:
-            try:
-                response = self._connect().get(url)
-                response.raise_for_status()
-                break
-            except requests.HTTPError as err:
-                if self._max_fetch_attempts is not None and \
-                   attempt >= self._max_fetch_attempts:
-                    raise
-                else:
-                    logging.warn("Received an error response ({}) from the "
-                                 "server. Retrying (attempt {} out of {})"
-                                 .format(attempt, self._max_fetch_attempts))
-                    attempt += 1
-        else:
-            raise
+        response = self._request_get(url)
 
         # Figure out how to extract the content.
         if narinfo.compression.lower() in ("xz", "xzip"):
@@ -696,8 +701,7 @@ class NixCacheClient(object):
         logging.info("Found {} paths in the store.".format(len(paths)))
         self.send_objects(paths)
 
-    def build_fetch(self, nix_file, attributes, verbose=False, show_trace=True,
-                    keep_going=True, create_links=False, use_deriv_name=True):
+    def build_fetch(self, nix_file, attributes, show_trace=True, **kwargs):
         """Given a nix file, instantiate the given attributes within the file,
         query the server for which files can be fetched, and then
         build/fetch everything.
@@ -710,6 +714,15 @@ class NixCacheClient(object):
                              ", ".join(attributes), nix_file))
         deriv_paths = instantiate(nix_file, attributes=attributes,
                                   show_trace=show_trace)
+        logging.info("Building {}".format(tell_size(deriv_paths, "derivation")))
+        return self.build_derivations(deriv_paths, **kwargs)
+
+    def build_derivations(self, deriv_paths, verbose=False, keep_going=True,
+                          create_links=False, use_deriv_name=True):
+        """Given one or more derivation paths, build the derivations."""
+        if len(deriv_paths) == 0:
+            logging.info("No paths given, nothing to build.")
+            return
         derivs_to_outputs = parse_deriv_paths(deriv_paths)
         need_to_build, need_to_fetch = self.preview_build(deriv_paths)
         if self._dry_run is True:
@@ -893,25 +906,34 @@ def _get_args():
                        help="Base path to evaluate.")
     build.add_argument("attributes", nargs="*",
                        help="Expressions to evaluate.")
-    build.add_argument("-v", "--verbose", action="store_true", default=False,
-                       help="Show verbose output.")
     build.add_argument("--no-trace", action="store_false", dest="show_trace",
                        help="Hide stack trace on instantiation error.")
-    build.add_argument("-S", "--stop-on-failure", action="store_false",
+    build.set_defaults(show_trace=True)
+    build_derivations = subparsers.add_parser("build-derivations",
+        help="Build one or more derivations.")
+    build_derivations.add_argument("derivations", nargs="*",
+                                   help="Paths of derivation files")
+    build_derivations.add_argument("-f", "--from-file",
+                                   help="Read paths from the given file")
+    for p in (build, build_derivations):
+        p.add_argument("-v", "--verbose", action="store_true", default=False,
+                       help="Show verbose output.")
+        p.add_argument("-S", "--stop-on-failure", action="store_false",
                        dest="keep_going",
                        help="Stop all builders if any builder fails.")
-    build.add_argument("--hide-paths", action="store_false",
+        p.add_argument("--hide-paths", action="store_false",
                        dest="print_paths",
                        help="Don't print built paths to stdout")
-    build.add_argument("-C", "--create-links", action="store_true",
+        p.add_argument("-C", "--create-links", action="store_true",
                        default=False, help="Create symlinks to built objects.")
-    build.add_argument("-g", "--generic-link-name", action="store_true",
+        p.add_argument("-g", "--generic-link-name", action="store_true",
                        default=False,
                        help="Use generic `result` name for symlinks.")
-    build.add_argument("-1", "--one", action="store_true", default=False,
+        p.add_argument("-1", "--one", action="store_true", default=False,
                        help="Alias for '--max-jobs=1 --stop-on-failure'")
-    build.set_defaults(show_trace=True, keep_going=True, print_paths=True)
-    for subparser in (send, sync, daemon, fetch, build):
+        p.set_defaults(show_trace=True, keep_going=True, print_paths=True)
+
+    for subparser in (send, sync, daemon, fetch, build, build_derivations):
         subparser.add_argument("-e", "--endpoint",
                                default=os.environ.get("NIX_REPO_HTTP"),
                                help="Endpoint of nix server to send to.")
@@ -966,6 +988,21 @@ def main():
                 nix_file=args.path, attributes=args.attributes,
                 verbose=args.verbose, show_trace=args.show_trace,
                 keep_going=keep_going, create_links=args.create_links,
+                use_deriv_name=not args.generic_link_name)
+            if args.dry_run is False and args.print_paths is True:
+                for deriv, outputs in result_derivs.items():
+                    for output in outputs:
+                        print(deriv.output_path(output))
+        elif args.command == "build-derivations":
+            keep_going = False if args.one else args.keep_going
+            deriv_paths = args.derivations
+            if args.from_file is not None:
+                with open(args.from_file) as f:
+                    deriv_paths.extend(f.read().split())
+            result_derivs = client.build_derivations(
+                deriv_paths=deriv_paths,
+                verbose=args.verbose, keep_going=keep_going,
+                create_links=args.create_links,
                 use_deriv_name=not args.generic_link_name)
             if args.dry_run is False and args.print_paths is True:
                 for deriv, outputs in result_derivs.items():
