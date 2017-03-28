@@ -125,7 +125,7 @@ def parse_deriv_paths(paths):
             outputs = None
         deriv = Derivation.parse_derivation_file(path)
         if outputs is None:
-            outputs = deriv.outputs.keys()
+            outputs = [deriv.default_output]
         if deriv not in result:
             result[deriv] = set()
         for output in outputs:
