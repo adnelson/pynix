@@ -74,7 +74,15 @@ class Derivation(object):
     @property
     def default_output(self):
         """Name of the output that is built by default (usually 'out')."""
-        return self.environment["outputs"].split()[0]
+        if len(self.outputs) == 1:
+            return list(self.outputs.keys())[0]
+        elif "outputs" in self.environment:
+            return self.environment["outputs"].split()[0]
+        elif "out" in self.outputs:
+            return "out"
+        else:
+            raise ValueError("Can't determine default output of derivation {}."
+                             .format(self))
 
     @property
     def output_mapping(self):
