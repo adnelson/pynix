@@ -457,7 +457,7 @@ def _get_args():
                         help="Disable direct-database mode.")
     parser.set_defaults(direct_db=os.getenv("NO_DIRECT_DB", "") == "",
                         log_level=os.environ.get("LOG_LEVEL", "INFO"),
-                        compression_type="xz")
+                        compression_type=os.getenv("COMPRESSION_TYPE", "xz"))
     return parser.parse_args()
 
 
