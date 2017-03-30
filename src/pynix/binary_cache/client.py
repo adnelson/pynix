@@ -39,6 +39,7 @@ except ImportError as err:
         raise
 import time
 
+import magic
 import requests
 import six
 
@@ -63,11 +64,15 @@ ENDPOINT_REGEX = re.compile(r"https?://([\w_-]+)(\.[\w_-]+)*(:\d+)?$")
 # Limit of how many paths to show, so the screen doesn't flood.
 SHOW_PATHS_LIMIT = int(os.environ.get("SHOW_PATHS_LIMIT", 25))
 
+# Mimetypes of tarball files
+TARBALL_MIMETYPES = set(['application/x-gzip', 'application/x-xz',
+                         'application/x-bzip2', 'application/zip'])
+
 class NixCacheClient(object):
     """Wraps some state for sending store objects."""
     def __init__(self, endpoint, dry_run=False, username=None,
                  password=None, cache_location=None, cache_enabled=True,
-                 max_jobs=cpu_count(), max_fetch_attempts=3):
+                 max_jobs=cpu_count(), max_attempts=3):
         #: Server running servenix (string).
         self._endpoint = endpoint
         #: Base name of server (for caching).
@@ -114,7 +119,7 @@ class NixCacheClient(object):
         # Caches nix path references.
         self._reference_cache = PathReferenceCache(db_con=self._db_con)
         # How many times to attempt fetching a package
-        self._max_fetch_attempts = max_fetch_attempts
+        self._max_attempts = max_attempts
 
     def _update_narinfo_cache(self, narinfo, write_to_disk):
         """Write a narinfo entry to the cache.
@@ -171,7 +176,7 @@ class NixCacheClient(object):
                 url = "{}/{}.narinfo".format(self._endpoint, prefix)
                 logging.debug("hitting url {} (for path {})..."
                               .format(url, path))
-                response = self._request_get(url)
+                response = self._request(url)
                 logging.debug("response arrived from {}".format(url))
                 narinfo = NarInfo.from_string(response.content)
             self._update_narinfo_cache(narinfo, write_to_disk)
@@ -477,8 +482,8 @@ class NixCacheClient(object):
             if remaining_objects is not None:
                 msg += " ({} remaining)".format(len(remaining_objects))
             logging.info(msg)
-            response = session.post(url, data=data, headers=headers)
-            response.raise_for_status()
+            response = self._request(url, method="post", data=data,
+                                     headers=headers)
         except requests.exceptions.HTTPError as err:
             try:
                 msg = json.loads(decode_str(response.content))["message"]
@@ -630,22 +635,22 @@ class NixCacheClient(object):
         logging.info("Finished fetching {}".format(
             tell_size(store_paths, "path")))
 
-    def _request_get(self, url):
+    def _request(self, url, method="get", **kwargs):
         """Make a request, with retry logic."""
         attempt = 1
         while True:
             try:
-                response = self._connect().get(url)
+                response = getattr(self._connect(), method)(url, **kwargs)
                 response.raise_for_status()
                 return response
             except requests.HTTPError as err:
-                if self._max_fetch_attempts is not None and \
-                   attempt >= self._max_fetch_attempts:
+                if self._max_attempts is not None and \
+                   attempt >= self._max_attempts:
                     raise
                 else:
                     logging.warn("Received an error response ({}) from the "
                                  "server. Retrying (attempt {} out of {})"
-                                 .format(attempt, self._max_fetch_attempts))
+                                 .format(attempt, self._max_attempts))
                     attempt += 1
             except requests.ConnectionError as cerr:
                 logging.warn("Encountered connection error {}. Reinitializing "
@@ -667,7 +672,7 @@ class NixCacheClient(object):
         url = "{}/{}".format(self._endpoint, narinfo.url)
         logging.debug("Requesting {} from {}..."
                      .format(basename(path), self._endpoint))
-        response = self._request_get(url)
+        response = self._request(url)
 
         # Figure out how to extract the content.
         if narinfo.compression.lower() in ("xz", "xzip"):
@@ -712,14 +717,17 @@ class NixCacheClient(object):
         # Now that we have the future, wait for it to finish before returning.
         future.result()
 
-    def watch_store(self, ignore, ignore_drvs=True, send_nars=False,
-                    compression_type="xz"):
+    def watch_store(self, ignore, ignore_drvs=True, ignore_tarballs=True,
+                    send_nars=False, compression_type="xz"):
         """Watch the nix store's timestamp and sync whenever it changes.
 
         :param ignore: A list of regexes of objects to ignore when syncing.
         :type ignore: ``list`` of (``str`` or ``regex``)
         :param ignore_drvs: If true, ignore any nix derivation files.
         :type ignore_drvs: ``bool``
+        :param ignore_tarballs: If true, ignore files which appear to
+                                be tarballs or zip files.
+        :type ignore_tarballs: ``bool``
         :param send_nars: If true, also create and send object NARs.
         :type send_nars: ``bool``
         :param compression_type: The type of compression to use for the NAR.
@@ -742,6 +750,7 @@ class NixCacheClient(object):
                                  .format(stamp.strftime("%H:%M:%S")))
                 try:
                     self.sync_store(ignore=ignore, ignore_drvs=ignore_drvs,
+                                    ignore_tarballs=ignore_tarballs,
                                     send_nars=send_nars)
                     prev_stamp = stamp
                     num_syncs += 1
@@ -752,8 +761,8 @@ class NixCacheClient(object):
             exit("Successfully syncronized with {} {} times."
                  .format(self._endpoint, num_syncs))
 
-    def sync_store(self, ignore, ignore_drvs=True, send_nars=False,
-                   compression_type="xz"):
+    def sync_store(self, ignore, ignore_drvs=True, ignore_tarballs=True,
+                   send_nars=False, compression_type="xz"):
         """Syncronize the local nix store to the endpoint.
 
         Reads all of the known paths in the nix SQLite database which
@@ -764,6 +773,9 @@ class NixCacheClient(object):
         :type ignore: ``list`` of (``str`` or ``regex``)
         :param ignore_drvs: If true, ignore any nix derivation files.
         :type ignore_drvs: ``bool``
+        :param ignore_tarballs: If true, ignore files which appear to
+                                be tarballs or zip files.
+        :type ignore_tarballs: ``bool``
         :param send_nars: If true, also create and send object NARs.
         :type send_nars: ``bool``
         :param compression_type: The type of compression to use for the NAR.
@@ -779,8 +791,19 @@ class NixCacheClient(object):
                     logging.debug("Path {} matches an ignore regex, skipping"
                                   .format(path))
                     continue
-                elif ignore_drvs is True and path.endswith(".drv"):
+                if ignore_drvs is True and path.endswith(".drv"):
+                    logging.debug("Path {} appears to be a derivation"
+                                  .format(path))
                     continue
+                if ignore_tarballs is True:
+                    try:
+                        mimetype = decode_str(magic.from_file(path, mime=True))
+                        if mimetype in TARBALL_MIMETYPES:
+                            logging.debug("Path {} appears to be a tarball"
+                                          .format(path))
+                            continue
+                    except Exception:
+                        pass
                 paths.append(path)
         logging.info("Found {} paths in the store.".format(len(paths)))
         self.send_objects(paths, send_nars=send_nars,
@@ -997,7 +1020,9 @@ def _get_args():
     for p in (sync, daemon):
         p.add_argument("--no-ignore-drvs", action="store_false",
                        help="Don't ignore .drv files when syncing")
-        p.set_defaults(ignore_drvs=True)
+        p.add_argument("--no-ignore-tarballs", action="store_false",
+                       help="Don't ignore tarball files when syncing")
+        p.set_defaults(ignore_drvs=True, ignore_tarballs=True)
 
     fetch = subparsers.add_parser("fetch",
                                    help="Fetch objects from a nix server.")
@@ -1040,6 +1065,11 @@ def _get_args():
                                default=os.environ.get("NIX_REPO_HTTP"),
                                help="Endpoint of nix server to send to.")
         subparser.set_defaults(log_level=os.getenv("LOG_LEVEL", "INFO"))
+        subparser.add_argument("--max-attempts", type=int, default=3,
+                               help="Maximum attempts to make for requests.")
+        subparser.add_argument("--no-max-attempts", action="store_const",
+                               const=None, dest="max_attempts",
+                               help="No maximum on number of attempts.")
         for level in ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"):
             subparser.add_argument("--" + level.lower(), dest="log_level",
                                    action="store_const", const=level)
@@ -1074,17 +1104,20 @@ def main():
         logging.getLogger(name).setLevel(logging.WARNING)
     max_jobs = 1 if getattr(args, "one", True) else args.max_jobs
     client = NixCacheClient(endpoint=args.endpoint, dry_run=args.dry_run,
-                            username=args.username, max_jobs=max_jobs)
+                            username=args.username, max_jobs=max_jobs,
+                            max_attempts=args.max_attempts)
     try:
         if args.command == "send":
             client.send_objects(args.paths, args.send_nars)
         elif args.command == "sync":
             client.sync_store(ignore=args.ignore, ignore_drvs=args.ignore_drvs,
+                              ignore_tarballs=args.ignore_tarballs,
                               send_nars=args.send_nars,
                               compression_type=args.compression_type)
         elif args.command == "daemon":
             client.watch_store(ignore=args.ignore,
                                ignore_drvs=args.ignore_drvs,
+                               ignore_tarballs=args.ignore_tarballs,
                                send_nars=args.send_nars,
                                compression_type=args.compression_type)
         elif args.command == "fetch":

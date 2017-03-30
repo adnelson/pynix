@@ -33,6 +33,7 @@ pythonPackages.buildPythonPackage rec {
     six
     datadiff
     rtyaml
+    python_magic
   ] ++ (if isPy3 then [] else [
     pythonPackages.futures
     pythonPackages.backports_lzma
