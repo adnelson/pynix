@@ -41,7 +41,8 @@ from pynix.binary_cache.nix_info_caches import PathReferenceCache
 from pynix.utils import (decode_str, strip_output, query_store, tell_size,
                          NIX_STORE_PATH, NIX_STATE_PATH, NIX_BIN_PATH,
                          NIX_DB_PATH, is_path_in_store)
-from pynix.narinfo import NarInfo
+from pynix.narinfo import (NarInfo, COMPRESSION_TYPES,
+                           COMPRESSION_TYPE_ALIASES, resolve_compression_type)
 from pynix.exceptions import (NoSuchObject, NoNarGenerated,
                               BaseHTTPError, NixImportFailed,
                               CouldNotUpdateHash, ClientError)
@@ -52,18 +53,7 @@ _PATH_REGEX=re.compile(r"([a-z0-9]{32})-[^' \n/]*$")
 _STORE_PATH_REGEX = re.compile(
     join(NIX_STORE_PATH, _PATH_REGEX.pattern))
 
-_NAR_CACHE_SIZE = int(os.getenv("NAR_CACHE_SIZE", 2048))
-COMPRESSION_TYPES = ("xz", "bzip2")
-COMPRESSION_TYPE_ALIASES = {"xzip": "xz", "bz2": "bzip2"}
-
-def _resolve_compression_type(compression_type):
-    if compression_type in COMPRESSION_TYPE_ALIASES:
-        return COMPRESSION_TYPE_ALIASES[compression_type]
-    elif compression_type in COMPRESSION_TYPES:
-        return compression_type
-    else:
-        raise ValueError("Invalid compression type: {}"
-                         .format(compression_type))
+_NAR_CACHE_SIZE = int(os.getenv("NAR_CACHE_SIZE", 4096))
 
 class NixServer(object):
     """Serves nix packages."""
@@ -78,7 +68,7 @@ class NixServer(object):
                           to permissions (e.g. on nixos).
         :type direct_db: ``bool``
         """
-        self._compression_type = _resolve_compression_type(compression_type)
+        self._compression_type = resolve_compression_type(compression_type)
         # Cache mapping object hashes to store paths.
         self._hashes_to_paths = {}
         # Cache mapping object hashes to store paths which have been validated.
@@ -416,9 +406,10 @@ class NixServer(object):
                 raise NixImportFailed(err)
             # The resulting path is printed to stdout. Grab it here.
             result_path = decode_str(out).strip()
-            # Spin off a thread to build a NAR of the path, to speed
-            # up future fetches.
-            self.build_nar(result_path, self._compression_type)
+            if request.headers.get("x-no-make-nar", "") == "":
+                # Spin off a thread to build a NAR of the path, to speed
+                # up future fetches.
+                self.build_nar(result_path, self._compression_type)
             # Return the path as an indicator of success.
             return (result_path, 200)
 
@@ -446,7 +437,7 @@ def _get_args():
         parser.add_argument("--" + t, action="store_const", const=t,
                             dest="compression_type",
                             help="Use {} compression for served NARs."
-                                 .format(_resolve_compression_type(t)))
+                                 .format(resolve_compression_type(t)))
     for level in ("CRITICAL", "ERROR", "INFO", "WARNING", "DEBUG"):
         parser.add_argument("--log-" + level.lower(), action="store_const",
                             const=level, dest="log_level",
