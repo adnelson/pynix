@@ -453,7 +453,8 @@ class NixCacheClient(object):
                 # Now that the nar has been sent, we can remove it because it
                 # takes up unnecessary space. However, we ignore errors on the
                 # off-chance that there are still objects which refer to it.
-                call(nix_cmd("nix-store", ["--delete", nar_path]), stderr=PIPE)
+                call(nix_cmd("nix-store", ["--delete", nar_path]),
+                     stderr=PIPE, stdout=PIPE)
 
         # Now we can send the object itself. Generate a dump of the
         # file and send it to the import url. For now we're not using
