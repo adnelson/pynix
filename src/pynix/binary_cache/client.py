@@ -442,25 +442,14 @@ class NixCacheClient(object):
         # If we're sending the NAR, send it *before* we send the
         # object; this will mean that whenever the server is asked for
         # a package, it will be able to answer quickly.
-        if self._send_nars is True and is_nar is False:
-            nar_path = NarInfo.get_nar_path(path, self._compression_type)
-            if nar_path not in self._objects_on_server:
-                logging.info("Creating {}-compressed NAR of {}"
-                             .format(self._compression_type, path))
-                NarInfo.build_nar(path, self._compression_type, quiet=True)
-                self.send_object(nar_path, is_nar=True)
-                # Now that the nar has been sent, we can remove it because it
-                # takes up unnecessary space. However, we ignore errors on the
-                # off-chance that there are still objects which refer to it.
-                call(nix_cmd("nix-store", ["--delete", nar_path]),
-                     stderr=PIPE, stdout=PIPE)
+        if self._send_nars is True:
+            self.send_nar(path)
 
         # Now we can send the object itself. Generate a dump of the
         # file and send it to the import url. For now we're not using
         # streaming because it's not entirely clear that this is
         # possible with current requests, or indeed possible in
         # general without knowing the file size.
-        session = self._connect()
         export = check_output(nix_cmd("nix-store", ["--export", path]))
         # For large files, show progress when compressing
         if len(export) > 1000000:
@@ -472,11 +461,6 @@ class NixCacheClient(object):
             data = gzip.compress(export)
         url = "{}/import-path".format(self._endpoint)
         headers = {"Content-Type": "application/x-gzip"}
-        if is_nar is True:
-            # Since we're making the NAR ourselves, include a header
-            # which can be read by the server so that it doesn't make
-            # a nar of the object it receives.
-            headers["x-no-make-nar"] = "true"
         try:
             msg = "Sending {}".format(basename(path))
             if remaining_objects is not None:
@@ -493,12 +477,50 @@ class NixCacheClient(object):
                           .format(self._endpoint, basename(path), msg))
             raise
 
-        # Check the response code.
         # Register that the store path has been sent.
         self._objects_on_server.add(path)
         # Remove the path if it is still in the set.
         if remaining_objects is not None and path in remaining_objects:
             remaining_objects.remove(path)
+
+    def send_nar(self, store_path):
+        """Send a NAR (nix-archive) of a given store path.
+
+        Differences from send_object:
+        * Hit the upload-nar route instead of import-path
+        * NARs don't have references, so no need to recur on those
+        * NARs are already compressed, so no need to gzip them
+        """
+        nar_dir = NarInfo.get_nar_dir(store_path, self._compression_type)
+        if nar_dir in self._objects_on_server:
+            return
+        logging.info("Creating {}-compressed NAR of {}"
+                     .format(self._compression_type, store_path))
+        nar_path = NarInfo.build_nar(store_path, self._compression_type)
+        if dirname(nar_path) != nar_dir:
+            raise RuntimeError("Unexpected NAR directory: {} is not in {}"
+                               .format(nar_path, nar_dir))
+        export = check_output(nix_cmd("nix-store", ["--export", nar_dir]))
+        url = "{}/upload-nar/{}/{}".format(self._endpoint,
+                                           self._compression_type,
+                                           basename(store_path))
+        try:
+            logging.info("Sending NAR of {} ({})"
+                         .format(basename(store_path), basename(nar_path)))
+            response = self._request(url, method="post", data=export)
+            self._objects_on_server.add(nar_dir)
+        except requests.exceptions.HTTPError as err:
+            if err.response.status_code != 404:
+                raise
+            logging.warn("Endpoint {} doesn't support NAR uploads, turning "
+                         "this option off".format(self._endpoint))
+            self._send_nars = False
+        finally:
+            # We can remove a sent NAR because it takes up unnecessary
+            # space. However, we ignore errors on the off-chance that
+            # there are still objects which refer to it.
+            call(nix_cmd("nix-store", ["--delete", nar_path]),
+                 stderr=PIPE, stdout=PIPE)
 
     def send_objects(self, paths):
         """Checks for which paths need to be sent, and sends those.
@@ -516,7 +538,7 @@ class NixCacheClient(object):
                     sys.stderr.write("{}/{}              \r"
                                      .format(i + 1, len(to_send)))
                     sys.stderr.flush()
-                nar_paths.add(NarInfo.get_nar_path(path))
+                nar_paths.add(NarInfo.get_nar_dir(path, self._compression_type))
             if sys.stderr.isatty():
                 sys.stderr.write("\n")
             logging.info("Checking for what NARs the server has...")
@@ -657,13 +679,14 @@ class NixCacheClient(object):
                 response.raise_for_status()
                 return response
             except requests.HTTPError as err:
-                if self._max_attempts is not None and \
-                   attempt >= self._max_attempts:
+                if err.response.status_code < 500 or \
+                   (self._max_attempts is not None and
+                    attempt >= self._max_attempts):
                     raise
                 else:
                     logging.warn("Received an error response ({}) from the "
                                  "server. Retrying (attempt {} out of {})"
-                                 .format(attempt, self._max_attempts))
+                                 .format(err, attempt, self._max_attempts))
                     attempt += 1
             except requests.ConnectionError as cerr:
                 logging.warn("Encountered connection error {}. Reinitializing "

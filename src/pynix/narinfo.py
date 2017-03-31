@@ -6,6 +6,7 @@ if sys.version_info >= (3, 0):
 else:
     from repoze.lru import lru_cache
 from io import BytesIO
+import logging
 import os
 from os.path import join, basename, dirname
 import yaml
@@ -42,6 +43,9 @@ def resolve_compression_type(compression_type):
 class NarInfo(object):
     # Cache of narinfo's that have been parsed, to avoid duplicate work.
     NARINFO_CACHE = {"xz": {}, "bzip2": {}}
+
+    # Cache mapping store objects to their compressed NAR paths.
+    NAR_PATH_CACHE = {"xz": {}, "bzip2": {}}
 
     def __init__(self, store_path, url, compression,
                  nar_size, nar_hash, file_size, file_hash,
@@ -204,9 +208,14 @@ class NarInfo(object):
     @classmethod
     def build_nar(cls, store_path, compression_type="xz", quiet=False):
         """Build a nix archive (nar) and return the resulting path."""
-        if compression_type not in ("xz", "bzip2"):
+        if compression_type not in cls.NAR_PATH_CACHE:
             raise ValueError("Unsupported compression type: {}"
                              .format(compression_type))
+        if store_path in cls.NAR_PATH_CACHE[compression_type]:
+            return cls.NAR_PATH_CACHE[compression_type][store_path]
+
+        logging.info("Kicking off NAR build of {}, {} compression"
+                     .format(basename(store_path), compression_type))
 
         # Construct a nix expression which will produce a nar.
         nar_expr = "".join([
@@ -217,24 +226,31 @@ class NarInfo(object):
             "})"])
 
         # Nix-build this expression, resulting in a store object.
-        compressed_path = strip_output(
+        nar_dir = strip_output(
             nix_cmd("nix-build", ["--expr", nar_expr, "--no-out-link"]),
             hide_stderr=quiet)
 
-        # This path will contain a compressed file; return its path.
+        return cls.register_nar_path(nar_dir, store_path, compression_type)
+
+    @classmethod
+    def register_nar_path(cls, nar_dir, store_path, compression_type):
+        """After a NAR has been built, this adds the path to the cache."""
+        # There should be a file with this extension in the directory.
         extension = ".nar." + ("bz2" if compression_type == "bzip2" else "xz")
-        contents = map(decode_str, os.listdir(compressed_path))
+        contents = map(decode_str, os.listdir(nar_dir))
         for filename in contents:
             if filename.endswith(extension):
-                return join(compressed_path, filename)
-        # This might happen if we run out of disk space or something
+                nar_path = join(nar_dir, filename)
+                cls.NAR_PATH_CACHE[compression_type][store_path] = nar_path
+                return nar_path
+        # This  might happen if we run out of disk space or something
         # else terrible.
-        raise NoNarGenerated(compressed_path, nar_extension)
+        raise NoNarGenerated(nar_dir, extension)
 
     @classmethod
     @lru_cache(1024)
-    def get_nar_path(cls, store_path, compression_type="xz"):
-        """Get the path of a nix archive without building it."""
+    def get_nar_dir(cls, store_path, compression_type):
+        """Get the directory of a nix archive without building it."""
         if compression_type not in ("xz", "bzip2"):
             raise ValueError("Unsupported compression type: {}"
                              .format(compression_type))
