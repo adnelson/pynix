@@ -47,7 +47,7 @@ from pynix import __version__
 from pynix.utils import (strip_output, decode_str, NIX_STORE_PATH,
                          NIX_STATE_PATH, NIX_DB_PATH, nix_cmd,
                          query_store, instantiate, tell_size,
-                         is_path_in_store)
+                         is_path_in_store, format_seconds)
 from pynix.exceptions import (CouldNotConnect, NixImportFailed, CliError,
                               ObjectNotBuilt, NixBuildError, NoSuchObject)
 from pynix.binary_cache.nix_info_caches import PathReferenceCache
@@ -120,6 +120,7 @@ class NixCacheClient(object):
         self._reference_cache = PathReferenceCache(db_con=self._db_con)
         # How many times to attempt fetching a package
         self._max_attempts = max_attempts
+        self._cancelled = False
 
     def _update_narinfo_cache(self, narinfo, write_to_disk):
         """Write a narinfo entry to the cache.
@@ -473,7 +474,7 @@ class NixCacheClient(object):
             data = gzip.compress(export)
         url = "{}/import-path".format(self._endpoint)
         headers = {"Content-Type": "application/x-gzip"}
-        if send_nar is True or is_nar is True:
+        if is_nar is True:
             # Since we're making the NAR ourselves, include a header
             # which can be read by the server so that it doesn't make
             # a nar of the object it receives.
@@ -627,14 +628,28 @@ class NixCacheClient(object):
         """Given an ordered list of paths, fetch all from a cache."""
         logging.info("Beginning fetches. Total of {} to fetch."
                      .format(tell_size(store_paths, "store object")))
-        for path in store_paths:
-            self._start_fetching(path)
-        for i, path in enumerate(store_paths):
-            logging.info("{}/{} ({})"
-                         .format(i + 1, len(store_paths), basename(path)))
-            self._finish_fetching(path)
-        logging.info("Finished fetching {}".format(
-            tell_size(store_paths, "path")))
+        start_time = datetime.now()
+        try:
+            for path in store_paths:
+                self._start_fetching(path)
+            for i, path in enumerate(store_paths):
+                logging.info("{}/{} ({})"
+                             .format(i + 1, len(store_paths), basename(path)))
+                self._finish_fetching(path)
+            seconds = (datetime.now() - start_time).seconds
+            logging.info("Finished fetching {}, took {}"
+                         .format(tell_size(store_paths, "path"),
+                                 format_seconds(seconds)))
+        except KeyboardInterrupt:
+            self._cancelled = True
+            print("Received keyboard interrupt. Cancelling running fetches...")
+            with self._fetch_lock:
+                for path, future in self._fetch_futures.items():
+                    if future.running():
+                        print("Cancelling fetch of", path)
+                    future.cancel()
+                print("Done cancelling futures")
+            raise
 
     def _request(self, url, method="get", **kwargs):
         """Make a request, with retry logic."""
@@ -661,6 +676,8 @@ class NixCacheClient(object):
     def _fetch_single(self, path):
         """Fetch a single path."""
         # Return if the path has already been fetched, or already exists.
+        if self._cancelled is True:
+            raise RuntimeError("Cancelled (" + path + ")")
         if self._have_fetched(path):
             return
         # First ensure that all referenced paths have been fetched.
@@ -710,6 +727,8 @@ class NixCacheClient(object):
     def _finish_fetching(self, path):
         """Given a path, wait until that path's fetch has finished. It
         must already have been started."""
+        if self._cancelled is True:
+            return
         with self._fetch_lock:
             if path not in self._fetch_futures:
                 raise RuntimeError("Fetch of path {} has not been started."
@@ -718,12 +737,16 @@ class NixCacheClient(object):
         # Now that we have the future, wait for it to finish before returning.
         future.result()
 
-    def watch_store(self, ignore, ignore_drvs=True, ignore_tarballs=True,
-                    send_nars=False, compression_type="xz"):
+    def watch_store(self, ignore=None, no_ignore=None, ignore_drvs=True,
+                    ignore_tarballs=True, send_nars=False,
+                    compression_type="xz"):
         """Watch the nix store's timestamp and sync whenever it changes.
 
-        :param ignore: A list of regexes of objects to ignore when syncing.
-        :type ignore: ``list`` of (``str`` or ``regex``)
+        :param ignore: A list of regexes of objects to ignore.
+        :type ignore: ``NoneType`` or ``list`` of (``str`` or ``regex``)
+        :param no_ignore: A list of regexes of objects to include, even
+                          if they would otherwise be ignored.
+        :type no_ignore: ``NoneType`` or ``list`` of (``str`` or ``regex``)
         :param ignore_drvs: If true, ignore any nix derivation files.
         :type ignore_drvs: ``bool``
         :param ignore_tarballs: If true, ignore files which appear to
@@ -750,7 +773,8 @@ class NixCacheClient(object):
                     logging.info("Store was modified at {}, syncing"
                                  .format(stamp.strftime("%H:%M:%S")))
                 try:
-                    self.sync_store(ignore=ignore, ignore_drvs=ignore_drvs,
+                    self.sync_store(ignore=ignore, no_ignore=no_ignore,
+                                    ignore_drvs=ignore_drvs,
                                     ignore_tarballs=ignore_tarballs,
                                     send_nars=send_nars)
                     prev_stamp = stamp
@@ -762,8 +786,9 @@ class NixCacheClient(object):
             exit("Successfully syncronized with {} {} times."
                  .format(self._endpoint, num_syncs))
 
-    def sync_store(self, ignore, ignore_drvs=True, ignore_tarballs=True,
-                   send_nars=False, compression_type="xz"):
+    def sync_store(self, ignore=None, no_ignore=None, ignore_drvs=True,
+                   ignore_tarballs=True, send_nars=False,
+                   compression_type="xz"):
         """Syncronize the local nix store to the endpoint.
 
         Reads all of the known paths in the nix SQLite database which
@@ -771,7 +796,10 @@ class NixCacheClient(object):
         :py:meth:`send_objects`.
 
         :param ignore: A list of regexes of objects to ignore.
-        :type ignore: ``list`` of (``str`` or ``regex``)
+        :type ignore: ``NoneType`` or ``list`` of (``str`` or ``regex``)
+        :param no_ignore: A list of regexes of objects to include, even
+                          if they would otherwise be ignored.
+        :type no_ignore: ``NoneType`` or ``list`` of (``str`` or ``regex``)
         :param ignore_drvs: If true, ignore any nix derivation files.
         :type ignore_drvs: ``bool``
         :param ignore_tarballs: If true, ignore files which appear to
@@ -782,31 +810,60 @@ class NixCacheClient(object):
         :param compression_type: The type of compression to use for the NAR.
         :type compression_type: ``str``
         """
-        ignore = [re.compile(r) for r in ignore]
+        ignore = [re.compile(r) for r in (ignore or [])]
+        no_ignore = [re.compile(r) for r in (no_ignore or [])]
         paths = []
+        ignored_due_to_regex = set()
+        ignored_derivations = set()
+        ignored_tarballs = set()
         with self._db_con as con:
             query = con.execute("SELECT path FROM ValidPaths")
             for result in query.fetchall():
                 path = result[0]
                 if any(ig.match(path) for ig in ignore):
-                    logging.debug("Path {} matches an ignore regex, skipping"
-                                  .format(path))
-                    continue
+                    if any(no_ig.match(path) for no_ig in no_ignore):
+                        logging.debug("Path {} would be ignored, but matches "
+                                      "a no-ignore regex".format(path))
+                    else:
+                        logging.debug("Path {} matches an ignore regex"
+                                      .format(path))
+                        ignored_due_to_regex.add(path)
+                        continue
                 if ignore_drvs is True and path.endswith(".drv"):
-                    logging.debug("Path {} appears to be a derivation"
-                                  .format(path))
-                    continue
+                    if any(no_ig.match(path) for no_ig in no_ignore):
+                        logging.debug("Path {} is a derivation, but matches "
+                                      "a no-ignore regex".format(path))
+                    else:
+                        logging.debug("Path {} appears to be a derivation"
+                                      .format(path))
+                        ignored_derivations.add(path)
+                        continue
                 if ignore_tarballs is True:
                     try:
                         mimetype = decode_str(magic.from_file(path, mime=True))
                         if mimetype in TARBALL_MIMETYPES:
-                            logging.debug("Path {} appears to be a tarball"
-                                          .format(path))
-                            continue
+                            if any(no_ig.match(path) for no_ig in no_ignore):
+                                logging.debug("Path {} is a tarball, but "
+                                              "matches a no-ignore regex"
+                                              .format(path))
+                            else:
+                                logging.debug("Path {} appears to be a tarball"
+                                              .format(path))
+                                ignored_tarballs.add(path)
+                                continue
                     except Exception:
                         pass
                 paths.append(path)
         logging.info("Found {} paths in the store.".format(len(paths)))
+        if len(ignored_due_to_regex) > 0:
+            logging.info("{} skipped due to matching an ignore regex"
+                         .format(tell_size(ignored_due_to_regex, "path")))
+        if len(ignored_derivations) > 0:
+            logging.info("{} skipped because --ignore-drvs"
+                         .format(tell_size(ignored_derivations, "derivation")))
+        if len(ignored_tarballs) > 0:
+            logging.info("{} skipped because --ignore-tarballs"
+                         .format(tell_size(ignored_tarballs, "tarball")))
         self.send_objects(paths, send_nars=send_nars,
                           compression_type=compression_type)
 
@@ -823,7 +880,8 @@ class NixCacheClient(object):
                              ", ".join(attributes), nix_file))
         deriv_paths = instantiate(nix_file, attributes=attributes,
                                   show_trace=show_trace)
-        logging.info("Building {}".format(tell_size(deriv_paths, "derivation")))
+        logging.info("Building {}"
+                     .format(tell_size(deriv_paths, "top-level derivation")))
         return self.build_derivations(deriv_paths, **kwargs)
 
     def build_derivations(self, deriv_paths, verbose=False, keep_going=True,
@@ -859,10 +917,16 @@ class NixCacheClient(object):
             logging.info("Building {} locally"
                          .format(tell_size(need_to_build, "derivation")))
             cmd = nix_cmd("nix-store", args)
+            build_start_time = datetime.now()
             try:
                 strip_output(cmd).split()
             except CalledProcessError as err:
                 self._handle_build_failure(need_to_build)
+            finally:
+                build_seconds = (datetime.now() - build_start_time).seconds
+                logging.info("Building derivations locally took {}"
+                             .format(format_seconds(build_seconds)))
+
         else:
             logging.info("No derivations needed to be built locally")
         if create_links is True:
@@ -874,6 +938,21 @@ class NixCacheClient(object):
         which failed.
         """
         # TODO: report exactly which derivations succeeded/failed.
+        failed_to_build = set()
+        for deriv, outputs in derivs_to_outputs.items():
+            if any(not exists(p) for p in deriv.output_paths(outputs)):
+                # Then this derivation wasn't built. However, it might
+                # not have failed to build; it might have been an
+                # upstream derivation that failed. To check this, see
+                # if all of its derivation inputs exist.
+                if all(exists(p) for p in deriv.input_derivation_paths):
+                    logging.debug("All inputs of {} exist, so it must have "
+                                  "failed to build.".format(deriv))
+                    failed_to_build.add(deriv)
+
+        logging.error("These derivations were attempted to build, but failed:")
+        for failed in failed_to_build:
+            logging.error("  " + failed.path)
         raise NixBuildError()
 
     def _verify(self, derivs_to_outputs):
@@ -1020,9 +1099,16 @@ def _get_args():
                                                       "xz"))
     for p in (sync, daemon):
         p.add_argument("--no-ignore-drvs", action="store_false",
+                       dest="ignore_drvs",
                        help="Don't ignore .drv files when syncing")
         p.add_argument("--no-ignore-tarballs", action="store_false",
+                       dest="ignore_tarballs",
                        help="Don't ignore tarball files when syncing")
+        p.add_argument("--ignore", nargs="*", default=[],
+                       help="Regexes of store paths to ignore.")
+        p.add_argument("--no-ignore", nargs="*", default=[],
+                       help="Don't ignore these, even if they would "
+                            "normally be ignored.")
         p.set_defaults(ignore_drvs=True, ignore_tarballs=True)
 
     fetch = subparsers.add_parser("fetch",
@@ -1083,11 +1169,6 @@ def _get_args():
                                default=False,
                                help="If true, reports which paths would "
                                     "be sent/fetched/built.")
-    for subparser in (sync, daemon):
-        subparser.add_argument("--ignore", nargs="*", default=[],
-                               help="Regexes of store paths to ignore.")
-        # It doesn't make sense to have the daemon run in dry-run mode.
-        subparser.set_defaults(dry_run=False)
     return parser.parse_args()
 
 def main():
@@ -1111,12 +1192,13 @@ def main():
         if args.command == "send":
             client.send_objects(args.paths, args.send_nars)
         elif args.command == "sync":
-            client.sync_store(ignore=args.ignore, ignore_drvs=args.ignore_drvs,
+            client.sync_store(ignore=args.ignore, no_ignore=args.no_ignore,
+                              ignore_drvs=args.ignore_drvs,
                               ignore_tarballs=args.ignore_tarballs,
                               send_nars=args.send_nars,
                               compression_type=args.compression_type)
         elif args.command == "daemon":
-            client.watch_store(ignore=args.ignore,
+            client.watch_store(ignore=args.ignore, no_ignore=args.no_ignore,
                                ignore_drvs=args.ignore_drvs,
                                ignore_tarballs=args.ignore_tarballs,
                                send_nars=args.send_nars,

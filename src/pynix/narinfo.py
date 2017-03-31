@@ -1,6 +1,10 @@
 """A python embedding of a NarInfo object."""
 import base64
-from functools import lru_cache
+import sys
+if sys.version_info >= (3, 0):
+    from functools import lru_cache
+else:
+    from repoze.lru import lru_cache
 from io import BytesIO
 import os
 from os.path import join, basename, dirname

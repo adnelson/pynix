@@ -170,7 +170,14 @@ class Derivation(object):
         """Get the path to an output with the given name."""
         if output_name not in self.output_mapping:
             raise ValueError("No output named {}".format(output_name))
-        return self.output_mapping[output_name]
+        path = self.output_mapping[output_name]
+        if isinstance(path, tuple):
+            path = path[0]
+        return path
+
+    def output_paths(self, output_names):
+        """Get paths of multiple outputs."""
+        return set(self.output_path(o) for o in output_names)
 
     def __eq__(self, other):
         """Test if one derivation is equal to another."""
