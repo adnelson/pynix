@@ -72,6 +72,7 @@ class NixCacheClient(object):
     """Wraps some state for sending store objects."""
     def __init__(self, endpoint, dry_run=False, username=None,
                  password=None, cache_location=None, cache_enabled=True,
+                 send_nars=False, compression_type="xz",
                  max_jobs=cpu_count(), max_attempts=3):
         #: Server running servenix (string).
         self._endpoint = endpoint
@@ -118,9 +119,14 @@ class NixCacheClient(object):
         self._db_con = sqlite3.connect(NIX_DB_PATH)
         # Caches nix path references.
         self._reference_cache = PathReferenceCache(db_con=self._db_con)
-        # How many times to attempt fetching a package
+        # How many times to attempt fetching a package.
         self._max_attempts = max_attempts
+        # Will be set to true if there's an interruption of some kind.
         self._cancelled = False
+        # Whether to send NARs when uploading
+        self._send_nars = send_nars
+        # How to compress NARs send during uploading
+        self._compression_type = resolve_compression_type(compression_type)
 
     def _update_narinfo_cache(self, narinfo, write_to_disk):
         """Write a narinfo entry to the cache.
@@ -412,21 +418,16 @@ class NixCacheClient(object):
             raise CouldNotConnect(self._endpoint, resp.status_code,
                                   resp.content)
 
-    def send_object(self, path, remaining_objects=None, is_nar=False,
-                    send_nar=False, compression_type="xz"):
+    def send_object(self, path, remaining_objects=None, is_nar=False):
         """Send a store object to a nix server.
 
         :param path: The path to the store object to send.
         :type path: ``str``
         :param remaining_objects: Set of remaining objects to send.
         :type remaining_objects: ``NoneType`` or ``set`` of ``str``
-        :param is_nar: If true, then we are sending a NAR. Tell the server
-                       so that it doesn't create a NAR of the NAR.
+        :param is_nar: If true, then we are sending a NAR. Don't
+                       create another NAR of this one.
         :type is_nar: ``bool``
-        :param send_nar: If true, also creates a NAR and sends it.
-        :type send_nar: ``bool``
-        :param compression_type: The type of compression to use for the NAR.
-        :type compression_type: ``str``
 
         Side effects:
         * Adds 0 or 1 paths to `self._objects_on_server`.
@@ -436,20 +437,17 @@ class NixCacheClient(object):
             return
         # First send all of the object's references. Skip self-references.
         for ref in self.get_references(path):
-            self.send_object(ref, remaining_objects=remaining_objects,
-                             send_nar=send_nar,
-                             compression_type=compression_type)
+            self.send_object(ref, remaining_objects=remaining_objects)
 
         # If we're sending the NAR, send it *before* we send the
         # object; this will mean that whenever the server is asked for
         # a package, it will be able to answer quickly.
-        if send_nar is True and is_nar is False:
-            compression_type = resolve_compression_type(compression_type)
-            nar_path = NarInfo.get_nar_path(path, compression_type)
+        if self._send_nars is True and is_nar is False:
+            nar_path = NarInfo.get_nar_path(path, self._compression_type)
             if nar_path not in self._objects_on_server:
                 logging.info("Creating {}-compressed NAR of {}"
-                             .format(compression_type, path))
-                NarInfo.build_nar(path, compression_type, quiet=True)
+                             .format(self._compression_type, path))
+                NarInfo.build_nar(path, self._compression_type, quiet=True)
                 self.send_object(nar_path, is_nar=True)
                 # Now that the nar has been sent, we can remove it because it
                 # takes up unnecessary space. However, we ignore errors on the
@@ -502,16 +500,14 @@ class NixCacheClient(object):
         if remaining_objects is not None and path in remaining_objects:
             remaining_objects.remove(path)
 
-    def send_objects(self, paths, send_nars=False, compression_type="xz"):
+    def send_objects(self, paths):
         """Checks for which paths need to be sent, and sends those.
 
         :param paths: Store paths to be sent.
         :type paths: ``list`` of ``str``
-        :param send_nars: If true, also create and send object NARs.
-        :type send_nars: ``bool``
         """
         to_send = self.query_path_closures(paths)
-        if send_nars is True and len(to_send) > 0:
+        if self._send_nars is True and len(to_send) > 0:
             logging.info("Getting paths of NARs...")
             nar_paths = set()
             for i, path in enumerate(to_send):
@@ -547,8 +543,7 @@ class NixCacheClient(object):
                          .format(self._endpoint))
         if self._dry_run is False:
             while len(to_send) > 0:
-                self.send_object(to_send.pop(), to_send, send_nar=send_nars,
-                                 compression_type=compression_type)
+                self.send_object(to_send.pop(), to_send)
             if num_to_send > 0:
                 logging.info("Sent {} paths to {}"
                              .format(num_to_send, self._endpoint))
@@ -640,16 +635,18 @@ class NixCacheClient(object):
             logging.info("Finished fetching {}, took {}"
                          .format(tell_size(store_paths, "path"),
                                  format_seconds(seconds)))
-        except KeyboardInterrupt:
+        except:
             self._cancelled = True
-            print("Received keyboard interrupt. Cancelling running fetches...")
-            with self._fetch_lock:
-                for path, future in self._fetch_futures.items():
-                    if future.running():
-                        print("Cancelling fetch of", path)
-                    future.cancel()
-                print("Done cancelling futures")
-            raise
+            logging.error("Received exception. Cancelling running fetches...")
+            try:
+                with self._fetch_lock:
+                    for path, future in self._fetch_futures.items():
+                        if future.running():
+                            logging.info("Cancelling fetch of", path)
+                            future.cancel()
+                        logging.info("Done cancelling futures")
+            finally:
+                raise
 
     def _request(self, url, method="get", **kwargs):
         """Make a request, with retry logic."""
@@ -738,8 +735,7 @@ class NixCacheClient(object):
         future.result()
 
     def watch_store(self, ignore=None, no_ignore=None, ignore_drvs=True,
-                    ignore_tarballs=True, send_nars=False,
-                    compression_type="xz"):
+                    ignore_tarballs=True):
         """Watch the nix store's timestamp and sync whenever it changes.
 
         :param ignore: A list of regexes of objects to ignore.
@@ -752,10 +748,6 @@ class NixCacheClient(object):
         :param ignore_tarballs: If true, ignore files which appear to
                                 be tarballs or zip files.
         :type ignore_tarballs: ``bool``
-        :param send_nars: If true, also create and send object NARs.
-        :type send_nars: ``bool``
-        :param compression_type: The type of compression to use for the NAR.
-        :type compression_type: ``str``
         """
         prev_stamp = None
         num_syncs = 0
@@ -775,8 +767,7 @@ class NixCacheClient(object):
                 try:
                     self.sync_store(ignore=ignore, no_ignore=no_ignore,
                                     ignore_drvs=ignore_drvs,
-                                    ignore_tarballs=ignore_tarballs,
-                                    send_nars=send_nars)
+                                    ignore_tarballs=ignore_tarballs)
                     prev_stamp = stamp
                     num_syncs += 1
                 except requests.exceptions.HTTPError as err:
@@ -787,8 +778,7 @@ class NixCacheClient(object):
                  .format(self._endpoint, num_syncs))
 
     def sync_store(self, ignore=None, no_ignore=None, ignore_drvs=True,
-                   ignore_tarballs=True, send_nars=False,
-                   compression_type="xz"):
+                   ignore_tarballs=True):
         """Syncronize the local nix store to the endpoint.
 
         Reads all of the known paths in the nix SQLite database which
@@ -805,10 +795,6 @@ class NixCacheClient(object):
         :param ignore_tarballs: If true, ignore files which appear to
                                 be tarballs or zip files.
         :type ignore_tarballs: ``bool``
-        :param send_nars: If true, also create and send object NARs.
-        :type send_nars: ``bool``
-        :param compression_type: The type of compression to use for the NAR.
-        :type compression_type: ``str``
         """
         ignore = [re.compile(r) for r in (ignore or [])]
         no_ignore = [re.compile(r) for r in (no_ignore or [])]
@@ -864,8 +850,7 @@ class NixCacheClient(object):
         if len(ignored_tarballs) > 0:
             logging.info("{} skipped because --ignore-tarballs"
                          .format(tell_size(ignored_tarballs, "tarball")))
-        self.send_objects(paths, send_nars=send_nars,
-                          compression_type=compression_type)
+        self.send_objects(paths)
 
     def build_fetch(self, nix_file, attributes, show_trace=True, **kwargs):
         """Given a nix file, instantiate the given attributes within the file,
@@ -1085,18 +1070,6 @@ def _get_args():
     daemon = subparsers.add_parser("daemon",
                                    help="Run as daemon, periodically "
                                         "syncing store.")
-    for p in (send, sync, daemon):
-        p.add_argument("--send-nars", action="store_true",
-                       default=os.getenv("SEND_NARS", "") != "",
-                       help="Also send NARs for the objects.")
-        for t in sorted(set(COMPRESSION_TYPES) |
-                        set(COMPRESSION_TYPE_ALIASES)):
-            p.add_argument("--" + t, action="store_const", const=t,
-                              dest="compression_type",
-                              help="Use {} compression for served NARs."
-                                   .format(resolve_compression_type(t)))
-            p.set_defaults(compression_type=os.getenv("COMPRESSION_TYPE",
-                                                      "xz"))
     for p in (sync, daemon):
         p.add_argument("--no-ignore-drvs", action="store_false",
                        dest="ignore_drvs",
@@ -1169,6 +1142,18 @@ def _get_args():
                                default=False,
                                help="If true, reports which paths would "
                                     "be sent/fetched/built.")
+        subparser.add_argument("--send-nars", action="store_true",
+                               default=os.getenv("SEND_NARS", "") != "",
+                               help="Also send NARs for the objects.")
+        for t in sorted(set(COMPRESSION_TYPES) |
+                        set(COMPRESSION_TYPE_ALIASES)):
+            subparser.add_argument("--" + t, action="store_const", const=t,
+                                   dest="compression_type",
+                                   help="Use {} compression for served NARs."
+                                        .format(resolve_compression_type(t)))
+            subparser.set_defaults(
+                compression_type=os.getenv("COMPRESSION_TYPE", "xz"))
+
     return parser.parse_args()
 
 def main():
@@ -1187,22 +1172,20 @@ def main():
     max_jobs = 1 if getattr(args, "one", True) else args.max_jobs
     client = NixCacheClient(endpoint=args.endpoint, dry_run=args.dry_run,
                             username=args.username, max_jobs=max_jobs,
+                            compression_type=args.compression_type,
+                            send_nars=args.send_nars,
                             max_attempts=args.max_attempts)
     try:
         if args.command == "send":
-            client.send_objects(args.paths, args.send_nars)
+            client.send_objects(args.paths)
         elif args.command == "sync":
             client.sync_store(ignore=args.ignore, no_ignore=args.no_ignore,
                               ignore_drvs=args.ignore_drvs,
-                              ignore_tarballs=args.ignore_tarballs,
-                              send_nars=args.send_nars,
-                              compression_type=args.compression_type)
+                              ignore_tarballs=args.ignore_tarballs)
         elif args.command == "daemon":
             client.watch_store(ignore=args.ignore, no_ignore=args.no_ignore,
                                ignore_drvs=args.ignore_drvs,
-                               ignore_tarballs=args.ignore_tarballs,
-                               send_nars=args.send_nars,
-                               compression_type=args.compression_type)
+                               ignore_tarballs=args.ignore_tarballs)
         elif args.command == "fetch":
             wait(list(client.fetch_objects(args.paths).values()))
         elif args.command == "build":
