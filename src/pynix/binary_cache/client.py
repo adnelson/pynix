@@ -75,7 +75,10 @@ class NixCacheClient(object):
                  send_nars=False, compression_type="xz",
                  max_jobs=cpu_count(), max_attempts=3):
         #: Server running servenix (string).
-        self._endpoint = endpoint
+        if endpoint:
+            self._endpoint = endpoint
+        else:
+            self._endpoint = None
         #: Base name of server (for caching).
         self._endpoint_server = urlparse(endpoint).netloc
         #: If true, no actual paths will be sent/fetched/built.
@@ -1035,7 +1038,12 @@ class NixCacheClient(object):
                     path = deriv.output_path(out)
                     paths_to_ask.append(path)
                     path_mapping[path] = (deriv, out)
-            query_result = self.query_paths(paths_to_ask)
+            if self._endpoint is None:
+                # If there's no endpoint, then it's the same as the
+                # server not having any paths.
+                query_result = {p: False for p in paths_to_ask}
+            else:
+                query_result = self.query_paths(paths_to_ask)
             for path, is_on_server in query_result.items():
                 if is_on_server is not True:
                     continue
@@ -1182,9 +1190,10 @@ def _get_args():
 def main():
     """Main entry point."""
     args = _get_args()
-    if args.endpoint is None:
-        exit("Endpoint is required. Use --endpoint or set NIX_REPO_HTTP.")
-    elif ENDPOINT_REGEX.match(args.endpoint) is None:
+    if not args.endpoint: # treat empty strings as None
+        args.endpoint = None
+    if args.endpoint is not None and \
+       ENDPOINT_REGEX.match(args.endpoint) is None:
         exit("Invalid endpoint: '{}' does not match '{}'."
              .format(args.endpoint, ENDPOINT_REGEX.pattern))
     log_level = getattr(logging, args.log_level.upper())
