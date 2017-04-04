@@ -1,13 +1,20 @@
 """A python embedding of a NarInfo object."""
 import base64
+import sys
+if sys.version_info >= (3, 0):
+    from functools import lru_cache
+else:
+    from repoze.lru import lru_cache
 from io import BytesIO
+import logging
 import os
 from os.path import join, basename, dirname
 import yaml
 from subprocess import check_output, CalledProcessError
 
+from pynix.derivation import Derivation
 from pynix.utils import decode_str, strip_output, nix_cmd, query_store
-from pynix.exceptions import NoNarGenerated
+from pynix.exceptions import NoNarGenerated, NixImportFailed
 
 # Magic 8-byte number that comes at the beginning of the export's bytes.
 EXPORT_INITIAL_MAGIC = b"\x01" + (b"\x00" * 7)
@@ -16,9 +23,29 @@ EXPORT_METADATA_MAGIC = b"NIXE\x00\x00\x00\x00"
 # A bytestring of 8 zeros, used below.
 EIGHT_ZEROS = bytes(8)
 
+# Compression types which are allowed for NARs.
+COMPRESSION_TYPES = ("xz", "bzip2")
+COMPRESSION_TYPE_ALIASES = {"xzip": "xz", "bz2": "bzip2"}
+
+def resolve_compression_type(compression_type):
+    """Turn a compression type string into a valid one.
+
+    :raises: ``ValueError`` if the compression type is invalid.
+    """
+    if compression_type in COMPRESSION_TYPE_ALIASES:
+        return COMPRESSION_TYPE_ALIASES[compression_type]
+    elif compression_type in COMPRESSION_TYPES:
+        return compression_type
+    else:
+        raise ValueError("Invalid compression type: {}"
+                         .format(compression_type))
+
 class NarInfo(object):
     # Cache of narinfo's that have been parsed, to avoid duplicate work.
     NARINFO_CACHE = {"xz": {}, "bzip2": {}}
+
+    # Cache mapping store objects to their compressed NAR paths.
+    NAR_PATH_CACHE = {"xz": {}, "bzip2": {}}
 
     def __init__(self, store_path, url, compression,
                  nar_size, nar_hash, file_size, file_hash,
@@ -179,8 +206,51 @@ class NarInfo(object):
         return cls.from_dict(yaml.load(string))
 
     @classmethod
-    def build_nar(cls, store_path, compression_type="xz"):
+    def build_nar(cls, store_path, compression_type="xz", quiet=False):
         """Build a nix archive (nar) and return the resulting path."""
+        if compression_type not in cls.NAR_PATH_CACHE:
+            raise ValueError("Unsupported compression type: {}"
+                             .format(compression_type))
+        if store_path in cls.NAR_PATH_CACHE[compression_type]:
+            return cls.NAR_PATH_CACHE[compression_type][store_path]
+
+        logging.info("Kicking off NAR build of {}, {} compression"
+                     .format(basename(store_path), compression_type))
+
+        # Construct a nix expression which will produce a nar.
+        nar_expr = "".join([
+            "(import <nix/nar.nix> {",
+            'storePath = "{}";'.format(store_path),
+            'hashAlgo = "sha256";',
+            'compressionType = "{}";'.format(compression_type),
+            "})"])
+
+        # Nix-build this expression, resulting in a store object.
+        nar_dir = strip_output(
+            nix_cmd("nix-build", ["--expr", nar_expr, "--no-out-link"]),
+            hide_stderr=quiet)
+
+        return cls.register_nar_path(nar_dir, store_path, compression_type)
+
+    @classmethod
+    def register_nar_path(cls, nar_dir, store_path, compression_type):
+        """After a NAR has been built, this adds the path to the cache."""
+        # There should be a file with this extension in the directory.
+        extension = ".nar." + ("bz2" if compression_type == "bzip2" else "xz")
+        contents = map(decode_str, os.listdir(nar_dir))
+        for filename in contents:
+            if filename.endswith(extension):
+                nar_path = join(nar_dir, filename)
+                cls.NAR_PATH_CACHE[compression_type][store_path] = nar_path
+                return nar_path
+        # This  might happen if we run out of disk space or something
+        # else terrible.
+        raise NoNarGenerated(nar_dir, extension)
+
+    @classmethod
+    @lru_cache(1024)
+    def get_nar_dir(cls, store_path, compression_type):
+        """Get the directory of a nix archive without building it."""
         if compression_type not in ("xz", "bzip2"):
             raise ValueError("Unsupported compression type: {}"
                              .format(compression_type))
@@ -194,18 +264,10 @@ class NarInfo(object):
             "})"])
 
         # Nix-build this expression, resulting in a store object.
-        compressed_path = strip_output(
-            nix_cmd( "nix-build", ["--expr", nar_expr, "--no-out-link"]))
-
-        # This path will contain a compressed file; return its path.
-        extension = ".nar." + ("bz2" if compression_type == "bzip2" else "xz")
-        contents = map(decode_str, os.listdir(compressed_path))
-        for filename in contents:
-            if filename.endswith(extension):
-                return join(compressed_path, filename)
-        # This might happen if we run out of disk space or something
-        # else terrible.
-        raise NoNarGenerated(compressed_path, nar_extension)
+        derivation_path = strip_output(
+            nix_cmd("nix-instantiate", ["--expr", nar_expr, "--no-gc-warning"]))
+        derivation = Derivation.parse_derivation_file(derivation_path)
+        return derivation.outputs["out"]
 
     @classmethod
     def from_store_path(cls, store_path, compression_type="xz"):

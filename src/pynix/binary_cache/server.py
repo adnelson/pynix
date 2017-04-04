@@ -41,7 +41,8 @@ from pynix.binary_cache.nix_info_caches import PathReferenceCache
 from pynix.utils import (decode_str, strip_output, query_store, tell_size,
                          NIX_STORE_PATH, NIX_STATE_PATH, NIX_BIN_PATH,
                          NIX_DB_PATH, is_path_in_store)
-from pynix.narinfo import NarInfo
+from pynix.narinfo import (NarInfo, COMPRESSION_TYPES,
+                           COMPRESSION_TYPE_ALIASES, resolve_compression_type)
 from pynix.exceptions import (NoSuchObject, NoNarGenerated,
                               BaseHTTPError, NixImportFailed,
                               CouldNotUpdateHash, ClientError)
@@ -52,18 +53,7 @@ _PATH_REGEX=re.compile(r"([a-z0-9]{32})-[^' \n/]*$")
 _STORE_PATH_REGEX = re.compile(
     join(NIX_STORE_PATH, _PATH_REGEX.pattern))
 
-_NAR_CACHE_SIZE = int(os.getenv("NAR_CACHE_SIZE", 2048))
-COMPRESSION_TYPES = ("xz", "bzip2")
-COMPRESSION_TYPE_ALIASES = {"xzip": "xz", "bz2": "bzip2"}
-
-def _resolve_compression_type(compression_type):
-    if compression_type in COMPRESSION_TYPE_ALIASES:
-        return COMPRESSION_TYPE_ALIASES[compression_type]
-    elif compression_type in COMPRESSION_TYPES:
-        return compression_type
-    else:
-        raise ValueError("Invalid compression type: {}"
-                         .format(compression_type))
+_NAR_CACHE_SIZE = int(os.getenv("NAR_CACHE_SIZE", 4096))
 
 class NixServer(object):
     """Serves nix packages."""
@@ -78,7 +68,7 @@ class NixServer(object):
                           to permissions (e.g. on nixos).
         :type direct_db: ``bool``
         """
-        self._compression_type = _resolve_compression_type(compression_type)
+        self._compression_type = resolve_compression_type(compression_type)
         # Cache mapping object hashes to store paths.
         self._hashes_to_paths = {}
         # Cache mapping object hashes to store paths which have been validated.
@@ -220,7 +210,7 @@ class NixServer(object):
                       .format(tell_size(paths, "path")))
         for path in paths:
             if not isabs(path):
-                path = os.path.join(NIX_STORE_PATH, path)
+                path = join(NIX_STORE_PATH, path)
             _order(path)
         logging.debug("Finished computing fetch order.")
         return order
@@ -381,6 +371,22 @@ class NixServer(object):
                                  {"Content-Type": "application/octet-stream"})
 
 
+        def import_to_nix_store(content_type, data):
+            """Extracts request data and imports into the nix store."""
+            if content_type == "application/x-gzip":
+                data = gzip.decompress(data)
+            elif content_type not in (None, "", "application/octet-stream"):
+                msg = "Unsupported content type '{}'".format(content_type)
+                raise ClientError(msg)
+            proc = Popen([join(NIX_BIN_PATH, "nix-store"), "--import"],
+                         stdin=PIPE, stderr=PIPE, stdout=PIPE)
+            # Get the request data and send it to the subprocess.
+            out, err = proc.communicate(input=data)
+            if proc.wait() != 0:
+                raise NixImportFailed(err)
+            # The resulting path is printed to stdout. Return it.
+            return decode_str(out).strip()
+
         @app.route("/import-path", methods=["POST"])
         def import_path():
             """Receives a new store object.
@@ -401,26 +407,30 @@ class NixServer(object):
             NAR will be created automatically.
             """
             content_type = request.headers.get("content-type")
-            if content_type in (None, "", "application/octet-stream"):
-                data = request.data
-            elif content_type == "application/x-gzip":
-                data = gzip.decompress(request.data)
-            else:
-                msg = "Unsupported content type '{}'".format(content_type)
-                raise ClientError(msg)
-            proc = Popen([join(NIX_BIN_PATH, "nix-store"), "--import"],
-                         stdin=PIPE, stderr=PIPE, stdout=PIPE)
-            # Get the request data and send it to the subprocess.
-            out, err = proc.communicate(input=data)
-            if proc.wait() != 0:
-                raise NixImportFailed(err)
-            # The resulting path is printed to stdout. Grab it here.
-            result_path = decode_str(out).strip()
+            result_path = import_to_nix_store(content_type, request.data)
             # Spin off a thread to build a NAR of the path, to speed
             # up future fetches.
             self.build_nar(result_path, self._compression_type)
             # Return the path as an indicator of success.
             return (result_path, 200)
+
+        @app.route("/upload-nar/<compression_type>/<store_path_basename>",
+                   methods=["POST"])
+        def upload_nar(compression_type, store_path_basename):
+            """Upload the NAR of a store path.
+
+            :param compression_type: How this NAR was compressed.
+            :type  compression_type: ``str``
+            :param store_path: The basename of the path that the NAR
+                               is a compression of.
+            :type  store_path: ``str``
+            """
+            content_type = request.headers.get("content-type")
+            nar_dir = import_to_nix_store(content_type, request.data)
+            store_path = join(NIX_STORE_PATH, store_path_basename)
+            nar_path = NarInfo.register_nar_path(nar_dir, store_path,
+                                                 compression_type)
+            return (nar_path, 200)
 
         @app.errorhandler(BaseHTTPError)
         def handle_http_error(error):
@@ -446,7 +456,7 @@ def _get_args():
         parser.add_argument("--" + t, action="store_const", const=t,
                             dest="compression_type",
                             help="Use {} compression for served NARs."
-                                 .format(_resolve_compression_type(t)))
+                                 .format(resolve_compression_type(t)))
     for level in ("CRITICAL", "ERROR", "INFO", "WARNING", "DEBUG"):
         parser.add_argument("--log-" + level.lower(), action="store_const",
                             const=level, dest="log_level",

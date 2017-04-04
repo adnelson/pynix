@@ -160,3 +160,14 @@ def is_path_in_store(store_path, db_con=None):
             return True
         except CalledProcessError:
             return False
+
+
+def format_seconds(seconds):
+    """Format a number of seconds into a human-readable string."""
+    if seconds < 60:
+        return "{} seconds".format(seconds)
+    elif seconds < 3600:
+        return "{:02d}:{:02d}".format(seconds // 60, seconds % 60)
+    else:
+        return ("{:02d}:{:02d}:{:02d}"
+                .format(seconds // 3600, (seconds // 60) % 60, seconds % 60))
