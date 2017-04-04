@@ -14,7 +14,7 @@ from subprocess import check_output, CalledProcessError
 
 from pynix.derivation import Derivation
 from pynix.utils import decode_str, strip_output, nix_cmd, query_store
-from pynix.exceptions import NoNarGenerated
+from pynix.exceptions import NoNarGenerated, NixImportFailed
 
 # Magic 8-byte number that comes at the beginning of the export's bytes.
 EXPORT_INITIAL_MAGIC = b"\x01" + (b"\x00" * 7)
