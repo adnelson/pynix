@@ -669,7 +669,7 @@ class NixCacheClient(object):
                         if future.running():
                             logging.info("Cancelling fetch of", path)
                             future.cancel()
-                        logging.info("Done cancelling futures")
+                    logging.info("Done cancelling futures")
             finally:
                 raise
 
@@ -727,7 +727,7 @@ class NixCacheClient(object):
                              .format(narinfo.compression))
         # Once extracted, convert it into a nix export object and import.
         export = narinfo.nar_to_export(data)
-        imported_path = export.import_to_store()
+        imported_path = export.import_to_store(db_con=self._db_con)
         self._register_as_fetched(path)
 
     def _register_as_fetched(self, path):

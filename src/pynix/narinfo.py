@@ -40,6 +40,7 @@ def resolve_compression_type(compression_type):
         raise ValueError("Invalid compression type: {}"
                          .format(compression_type))
 
+
 class NarInfo(object):
     # Cache of narinfo's that have been parsed, to avoid duplicate work.
     NARINFO_CACHE = {"xz": {}, "bzip2": {}}
@@ -347,13 +348,20 @@ class NarExport(object):
             if not os.path.isabs(path):
                 raise ValueError("Paths must be absolute ({}).".format(path))
 
-    def import_to_store(self):
+    def import_to_store(self, db_con=None):
         """Import this NarExport into the local nix store."""
-        try:
-            return strip_output(nix_cmd("nix-store", ["--import"]),
-                                input=self.to_bytes())
-        except CalledProcessError:
-            raise NixImportFailed("See above stderr")
+        # Ensure that all of the dependent paths are valid.
+        for ref_path in self.references:
+            if not is_path_in_store(ref_path, db_con=db_con):
+                raise NixImportFailed("Reference {} is not in the nix store"
+                                      .format(ref_path))
+        proc = Popen(nix_cmd("nix-store", ["--import", "-vvvvv"]),
+                     stdin=PIPE, stdout=PIPE, stderr=PIPE)
+        out, err = proc.communicate(input=self.to_bytes())
+        if proc.returncode == 0:
+            return decode_str(out)
+        else:
+            raise NixImportFailed(err, store_path=self.store_path)
 
     def to_bytes(self):
         """Convert a nar export into bytes.
