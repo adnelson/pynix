@@ -696,6 +696,66 @@ class NixCacheClient(object):
                              "connection".format(cerr))
                 self._session = None
 
+    def fetch_batch(self, paths):
+        """Fetch multiple paths in a batch request.
+
+        First initializes a batch fetch session with the server. Then
+        repeatedly makes request for a batch fetch tarball, until all
+        paths have been fetched.
+        """
+        # Initialize a session
+        url = urljoin(self._endpoint, "init-batch-fetch")
+        data = {"paths": paths}
+        response = self._request(url, method="post", data={"paths": paths},
+                                 headers={"Content-Type": "application/json"})
+        token = response.json()["token"]
+        num_total_paths = response.json()["num_total_paths"]
+
+        logging.info("Batch-fetching {} total paths".format(num_total_paths))
+        # Fetch paths until there are none left to fetch
+        while self._fetch_single_batch(token) > 0:
+            pass
+
+        logging.info("Finished batch fetch.")
+
+    def _fetch_single_batch(self, token):
+        """Unpack a batch fetch tarball and import files into the nix store.
+
+        Each response from the server should be a tarball containing
+        an info file and any number of compressed NARs. The info file
+        is called 'info.json' and is a JSON dictionary containing:
+
+          * import_ordering: What order to import the NARs in.
+          * nar_mapping: Mapping from nar path -> narinfo dictionary.
+          * paths_remaining: How many paths are remaining to be fetched.
+
+        This function will extract the info and use the contained
+        ordering to extract each nar file and import it into the nix
+        store.
+
+        :return: The number of imported and remaining paths.
+        :rtype: ``dict``, "remaining" and "imported" keys mapping to ``int``
+        """
+        fetch_url = urljoin(self._endpoint, "batch-fetch/" + token)
+        response = self._request(fetch_url)
+        bio = BytesIO(response.content)
+        tar = tarfile.open(fileobj=bio, mode="r")
+        member_map = {m.name: m for m in tar.getmembers()}
+        if "info.json" not in member_map:
+            raise ValueError("No info.json included in batch response tarball")
+        info = json.load(tar.extractfile(member_map["info.json"]).read())
+        remaining = info["paths_remaining"]
+        nar_mapping = info["nar_mapping"]
+        for nar_path in info["import_ordering"]:
+            narinfo = NarInfo.from_dict(nar_mapping[nar_path])
+            nar_bytes = tar.extractfile(member_map[nar_path]).read()
+            narinfo.import_to_store(nar_bytes)
+            self._register_as_fetched(narinfo.store_path)
+        logging.info("Imported {} new paths.".format(len(nar_mapping)))
+        if remaining > 0:
+            logging.info("{} paths remain to be fetched.".format(remaining))
+        return remaining
+
     def _fetch_single(self, path):
         """Fetch a single path."""
         # Return if the path has already been fetched, or already exists.
@@ -715,19 +775,7 @@ class NixCacheClient(object):
                      .format(basename(path), self._endpoint))
         response = self._request(url)
 
-        # Figure out how to extract the content.
-        if narinfo.compression.lower() in ("xz", "xzip"):
-            data = lzma.decompress(response.content)
-        elif narinfo.compression.lower() in ("bz2", "bzip2"):
-            data = bz2.decompress(response.content)
-        elif narinfo.compression.lower() in ("gzip", "gz"):
-            data = gzip.decompress(response.content)
-        else:
-            raise ValueError("Unsupported narinfo compression type {}"
-                             .format(narinfo.compression))
-        # Once extracted, convert it into a nix export object and import.
-        export = narinfo.nar_to_export(data)
-        imported_path = export.import_to_store(db_con=self._db_con)
+        narinfo.import_to_store(response.content)
         self._register_as_fetched(path)
 
     def _register_as_fetched(self, path):
@@ -1151,6 +1199,10 @@ def _get_args():
                        help="Alias for '--max-jobs=1 --stop-on-failure'")
         p.set_defaults(show_trace=True, keep_going=True, print_paths=True)
 
+    for p in (fetch, build, build_derivations):
+        p.add_argument("-b", "--batch", action="store_true", default=False,
+                       help="Fetch from the server in batch mode.")
+
     for subparser in (send, sync, daemon, fetch, build, build_derivations):
         subparser.add_argument("-e", "--endpoint",
                                default=os.environ.get("NIX_REPO_HTTP"),
@@ -1219,7 +1271,10 @@ def main():
                                ignore_drvs=args.ignore_drvs,
                                ignore_tarballs=args.ignore_tarballs)
         elif args.command == "fetch":
-            wait(list(client.fetch_objects(args.paths).values()))
+            if args.batch is True:
+                client.fetch_batch(args.paths)
+            else:
+                wait(list(client.fetch_objects(args.paths).values()))
         elif args.command == "build":
             keep_going = False if args.one else args.keep_going
             result_derivs = client.build_fetch(

@@ -10,10 +10,11 @@ import logging
 import os
 from os.path import join, basename, dirname
 import yaml
-from subprocess import check_output, CalledProcessError
+from subprocess import check_output, Popen, PIPE
 
 from pynix.derivation import Derivation
-from pynix.utils import decode_str, strip_output, nix_cmd, query_store
+from pynix.utils import (decode_str, strip_output, nix_cmd, query_store,
+                         is_path_in_store)
 from pynix.exceptions import NoNarGenerated, NixImportFailed
 
 # Magic 8-byte number that comes at the beginning of the export's bytes.
@@ -169,6 +170,24 @@ class NarInfo(object):
         return NarExport(self.store_path, nar_bytes=nar_bytes,
                          references=self.abs_references,
                          deriver=self.abs_deriver, signature=self.signature)
+
+    def import_to_store(self, compressed_nar):
+        """Given a compressed NAR, extract it and import it into the nix store.
+
+        :param compressed_nar: The bytes of a NAR, compressed.
+        :type  compressed_nar: ``str``
+        """
+        # Figure out how to extract the content.
+        if self.compression.lower() in ("xz", "xzip"):
+            data = lzma.decompress(response.content)
+        elif self.compression.lower() in ("bz2", "bzip2"):
+            data = bz2.decompress(response.content)
+        else:
+            data = gzip.decompress(response.content)
+
+        # Once extracted, convert it into a nix export object and import.
+        export = self.nar_to_export(data)
+        imported_path = export.import_to_store()
 
     @classmethod
     def from_dict(cls, dictionary):
@@ -350,11 +369,6 @@ class NarExport(object):
 
     def import_to_store(self, db_con=None):
         """Import this NarExport into the local nix store."""
-        # Ensure that all of the dependent paths are valid.
-        for ref_path in self.references:
-            if not is_path_in_store(ref_path, db_con=db_con):
-                raise NixImportFailed("Reference {} is not in the nix store"
-                                      .format(ref_path))
         proc = Popen(nix_cmd("nix-store", ["--import", "-vvvvv"]),
                      stdin=PIPE, stdout=PIPE, stderr=PIPE)
         out, err = proc.communicate(input=self.to_bytes())
