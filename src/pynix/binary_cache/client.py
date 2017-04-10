@@ -26,6 +26,7 @@ else:
     from backports import lzma
 import gzip
 import bz2
+from urllib.parse import urljoin
 
 # Special-case here to address a runtime bug I've encountered
 try:
@@ -1199,10 +1200,6 @@ def _get_args():
                        help="Alias for '--max-jobs=1 --stop-on-failure'")
         p.set_defaults(show_trace=True, keep_going=True, print_paths=True)
 
-    for p in (fetch, build, build_derivations):
-        p.add_argument("-b", "--batch", action="store_true", default=False,
-                       help="Fetch from the server in batch mode.")
-
     for subparser in (send, sync, daemon, fetch, build, build_derivations):
         subparser.add_argument("-e", "--endpoint",
                                default=os.environ.get("NIX_REPO_HTTP"),
@@ -1271,10 +1268,7 @@ def main():
                                ignore_drvs=args.ignore_drvs,
                                ignore_tarballs=args.ignore_tarballs)
         elif args.command == "fetch":
-            if args.batch is True:
-                client.fetch_batch(args.paths)
-            else:
-                wait(list(client.fetch_objects(args.paths).values()))
+            client.fetch_batch(args.paths)
         elif args.command == "build":
             keep_going = False if args.one else args.keep_going
             result_derivs = client.build_fetch(
