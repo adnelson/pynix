@@ -107,7 +107,7 @@ class NarInfo(object):
                         for k, v in vars(self).items())
         return "NarInfo({})".format(args)
 
-    def as_dict(self):
+    def to_dict(self):
         """Generate a dictionary representation."""
         result = {
             "Url": self.url,
@@ -127,7 +127,7 @@ class NarInfo(object):
 
     def to_string(self):
         """Generate a string representation."""
-        as_dict = self.as_dict()
+        as_dict = self.to_dict()
         as_dict["References"] = " ".join(as_dict["References"])
         return "\n".join("{}: {}".format(k, v) for k, v in as_dict.items())
 
@@ -200,7 +200,7 @@ class NarInfo(object):
         """Given a dictionary representation, convert it to a NarInfo.
 
         :param dictionary: Dictionary representation, in the form
-                           given by `self.as_dict()`, except that keys
+                           given by `self.to_dict()`, except that keys
                            are case insensitive.
         :type dictionary: ``dict``
 
@@ -373,7 +373,7 @@ class NarExport(object):
             if not os.path.isabs(path):
                 raise ValueError("Paths must be absolute ({}).".format(path))
 
-    def import_to_store(self, db_con=None):
+    def import_to_store(self):
         """Import this NarExport into the local nix store."""
         proc = Popen(nix_cmd("nix-store", ["--import", "-vvvvv"]),
                      stdin=PIPE, stdout=PIPE, stderr=PIPE)

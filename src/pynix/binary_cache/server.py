@@ -301,7 +301,11 @@ class NixServer(object):
                 # make a compressed NAR out of this
                 nar_path = self.build_nar(path, self._compression_type).result()
                 nar_path_basename = basename(nar_path)
-                nar_mapping[nar_path_basename] = basename(path)
+                narinfo = NarInfo.from_store_path(
+                    path,
+                    compression_type=self._compression_type)
+                nar_mapping[nar_path_basename] = narinfo.to_dict()
+
                 tarinfo = tar.gettarinfo(name=nar_path,
                                          arcname=nar_path_basename)
                 # Add it to the tarball
@@ -492,7 +496,11 @@ class NixServer(object):
 
             A token is returned which can be used to fetch the objects.
             """
-            req = request.json
+            try:
+                req = request.json
+            except Exception as err:
+                raise ClientError("Invalid JSON in request.") from err
+
             if not isinstance(req, dict):
                 raise ClientError("Request should be a JSON dictionary")
             elif "paths" not in req:
@@ -572,6 +580,8 @@ class NixServer(object):
         def handle_http_error(error):
             if error.status_code >= 500:
                 logging.exception(error)
+            else:
+                logging.error(error)
             logging.error(error.message)
             response = jsonify(error.to_dict())
             response.status_code = error.status_code
