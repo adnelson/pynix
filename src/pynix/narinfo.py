@@ -3,18 +3,25 @@ import base64
 import sys
 if sys.version_info >= (3, 0):
     from functools import lru_cache
+    import lzma
+    from io import BytesIO
 else:
     from repoze.lru import lru_cache
-from io import BytesIO
+    from backports import lzma
+    from StringIO import StringIO as BytesIO
 import logging
 import os
 from os.path import join, basename, dirname
 import yaml
-from subprocess import check_output, CalledProcessError
+from subprocess import check_output, Popen, PIPE
+import gzip
+import bz2
 
 from pynix.derivation import Derivation
-from pynix.utils import decode_str, strip_output, nix_cmd, query_store
+from pynix.utils import (decode_str, strip_output, nix_cmd, query_store,
+                         is_path_in_store)
 from pynix.exceptions import NoNarGenerated, NixImportFailed
+
 
 # Magic 8-byte number that comes at the beginning of the export's bytes.
 EXPORT_INITIAL_MAGIC = b"\x01" + (b"\x00" * 7)
@@ -39,6 +46,7 @@ def resolve_compression_type(compression_type):
     else:
         raise ValueError("Invalid compression type: {}"
                          .format(compression_type))
+
 
 class NarInfo(object):
     # Cache of narinfo's that have been parsed, to avoid duplicate work.
@@ -99,7 +107,7 @@ class NarInfo(object):
                         for k, v in vars(self).items())
         return "NarInfo({})".format(args)
 
-    def as_dict(self):
+    def to_dict(self):
         """Generate a dictionary representation."""
         result = {
             "Url": self.url,
@@ -119,7 +127,7 @@ class NarInfo(object):
 
     def to_string(self):
         """Generate a string representation."""
-        as_dict = self.as_dict()
+        as_dict = self.to_dict()
         as_dict["References"] = " ".join(as_dict["References"])
         return "\n".join("{}: {}".format(k, v) for k, v in as_dict.items())
 
@@ -169,12 +177,30 @@ class NarInfo(object):
                          references=self.abs_references,
                          deriver=self.abs_deriver, signature=self.signature)
 
+    def import_to_store(self, compressed_nar):
+        """Given a compressed NAR, extract it and import it into the nix store.
+
+        :param compressed_nar: The bytes of a NAR, compressed.
+        :type  compressed_nar: ``str``
+        """
+        # Figure out how to extract the content.
+        if self.compression.lower() in ("xz", "xzip"):
+            data = lzma.decompress(compressed_nar)
+        elif self.compression.lower() in ("bz2", "bzip2"):
+            data = bz2.decompress(compressed_nar)
+        else:
+            data = gzip.decompress(compressed_nar)
+
+        # Once extracted, convert it into a nix export object and import.
+        export = self.nar_to_export(data)
+        imported_path = export.import_to_store()
+
     @classmethod
     def from_dict(cls, dictionary):
         """Given a dictionary representation, convert it to a NarInfo.
 
         :param dictionary: Dictionary representation, in the form
-                           given by `self.as_dict()`, except that keys
+                           given by `self.to_dict()`, except that keys
                            are case insensitive.
         :type dictionary: ``dict``
 
@@ -349,11 +375,13 @@ class NarExport(object):
 
     def import_to_store(self):
         """Import this NarExport into the local nix store."""
-        try:
-            return strip_output(nix_cmd("nix-store", ["--import"]),
-                                input=self.to_bytes())
-        except CalledProcessError:
-            raise NixImportFailed("See above stderr")
+        proc = Popen(nix_cmd("nix-store", ["--import", "-vvvvv"]),
+                     stdin=PIPE, stdout=PIPE, stderr=PIPE)
+        out, err = proc.communicate(input=self.to_bytes())
+        if proc.returncode == 0:
+            return decode_str(out)
+        else:
+            raise NixImportFailed(err, store_path=self.store_path)
 
     def to_bytes(self):
         """Convert a nar export into bytes.

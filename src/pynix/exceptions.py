@@ -82,8 +82,12 @@ class NixOperationError(RuntimeError):
 class NixImportFailed(BaseHTTPError, NixOperationError, CliError):
     """Raised when we couldn't import a store object."""
     OPERATION = "nix-store --import"
-    def __init__(self, err_message):
-        message = "Couldn't perform the import: {}".format(err_message)
+    def __init__(self, err_message, store_path=None):
+        if store_path is not None:
+            message = ("When attempting to import {}: {}"
+                       .format(store_path, err_message))
+        else:
+            message = "Couldn't perform the import: {}".format(err_message)
         BaseHTTPError.__init__(self, message=message)
         self.EXIT_MESSAGE = message
 

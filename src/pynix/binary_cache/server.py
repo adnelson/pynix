@@ -3,12 +3,17 @@ import argparse
 import json
 import logging
 import os
+from io import BytesIO
 from os.path import exists, isdir, isabs, join, basename, dirname
 import re
 import gzip
 from subprocess import Popen, PIPE, CalledProcessError
+import tarfile
+from threading import RLock
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import cpu_count
+import uuid
+
 # Special-case here to address a runtime bug I've encountered.
 # Essentially having python libraries other than those
 # specifically built for this library in a PYTHONPATH can cause a
@@ -55,9 +60,12 @@ _STORE_PATH_REGEX = re.compile(
 
 _NAR_CACHE_SIZE = int(os.getenv("NAR_CACHE_SIZE", 4096))
 
+
 class NixServer(object):
     """Serves nix packages."""
     def __init__(self, compression_type="xz", direct_db=True,
+                 # Default to 100 mb max tarball size
+                 max_tarball_size=(100 * 1024 * 1024),
                  max_workers=cpu_count()):
         """Initializer.
 
@@ -86,7 +94,12 @@ class NixServer(object):
         else:
             self._nar_extension = ".nar.xz"
 
+        if max_tarball_size <= 0:
+            raise ValueError("Max tarball size must be > 0")
+        self._max_tarball_size = max_tarball_size
         self._pool = ThreadPoolExecutor(max_workers=max_workers)
+
+        self._fetch_sessions = {}
 
         logging.info("Nix store path: {}".format(NIX_STORE_PATH))
         logging.info("Nix state path: {}".format(NIX_STATE_PATH))
@@ -214,6 +227,113 @@ class NixServer(object):
             _order(path)
         logging.debug("Finished computing fetch order.")
         return order
+
+    def initialize_batch_fetch(self, paths, max_size=None):
+        """Given a set of paths to fetch, begin a batch fetch session.
+
+        In a batch fetch session, multiple packages are sent in a
+        single response. Packages are grouped in tarballs, which
+        include compressed NARs as well as a text file specifying the
+        order to import in. The client can repeatedly request to
+        continue fetching packages until all packages have been
+        fetched.
+
+        This function creates a token for this fetch session and
+        initializes the ordered list of paths to return.
+        """
+        if max_size is None:
+            max_size = self._max_tarball_size
+        elif not isinstance(max_size, int) or max_size <= 0:
+            raise ClientError("Invalid max size: must be integer > 0")
+        token = uuid.uuid4().hex
+        ordered = self._compute_fetch_order(paths)
+        fetch_session = {
+            # Create a lock to syncronize access to this session.
+            "lock": RLock(),
+            "initial_path_list": paths,
+            # Note that we're reversing the order here; this is so that we
+            # can just use the list.pop() method when continuing the fetch.
+            "ordered_paths": [path for path, _ in reversed(ordered)],
+            "max_size": max_size,
+        }
+        self._fetch_sessions[token] = fetch_session
+        logging.info("Created new fetch session under token {}".format(token))
+        logging.debug("Session: {}".format(fetch_session))
+        return {"token": token, "num_total_paths": len(ordered)}
+
+    def batch_fetch(self, fetch_token):
+        """Continue a batch fetch. It must have already been initialized.
+
+        Each fetch session has a list of paths to be fetched, in
+        reverse-dependency order. We start by creating a tarball. Then
+        we pull items off of this list, build their compressed NARs,
+        and add them to the tarball. Once we either run out of items
+        in the list, or the tarball grows larger than the maximum
+        size, we return the bytes of the tarball.
+
+        After all paths have been sent, the token is removed from the
+        fetch sessions dictionary.
+
+        :param fetch_token: A key into the fetch_sessions dictionary.
+        :type  fetch_token: ``str``
+
+        :return: The bytes of a tarball containing all paths to be fetched.
+        """
+        if fetch_token not in self._fetch_sessions:
+            raise ClientError("Invalid fetch token {}".format(fetch_token),
+                              status_code=404)
+        session = self._fetch_sessions[fetch_token]
+        with session["lock"]:
+            # Initialize a new tarball
+            tar_bytes = BytesIO()
+            tar = tarfile.open(fileobj=tar_bytes, mode="w|")
+            import_ordering = []
+            nar_mapping = {}
+            total_size = 0
+            max_size = min(self._max_tarball_size, session["max_size"])
+            # Add paths to the tarball until it gets too big
+            while total_size <= max_size:
+                if len(session["ordered_paths"]) == 0:
+                    # When we've run out of paths, delete the session.
+                    del self._fetch_sessions[fetch_token]
+                    break
+                path = session["ordered_paths"].pop()
+                # make a compressed NAR out of this
+                nar_path = self.build_nar(path, self._compression_type).result()
+                nar_path_basename = basename(nar_path)
+                narinfo = NarInfo.from_store_path(
+                    path,
+                    compression_type=self._compression_type)
+                nar_mapping[nar_path_basename] = narinfo.to_dict()
+
+                tarinfo = tar.gettarinfo(name=nar_path,
+                                         arcname=nar_path_basename)
+                # Add it to the tarball
+                tar.add(name=nar_path, arcname=nar_path_basename)
+                # Add its order to the ordering
+                import_ordering.append(nar_path_basename)
+                total_size += tarinfo.size
+
+            logging.info("Packed {} paths into a tarball, total size {} bytes"
+                         .format(len(import_ordering), total_size))
+            logging.info("{} paths remain to be fetched in this session."
+                         .format(len(session["ordered_paths"])))
+
+            # Add the info file to the tarball
+            info_json = json.dumps({
+                "import_ordering": import_ordering,
+                "compression_type": self._compression_type,
+                "nar_mapping": nar_mapping,
+                "paths_remaining": len(session["ordered_paths"]),
+            })
+            info_bytes = info_json.encode("utf-8")
+            info_tarinfo = tarfile.TarInfo("info.json")
+            info_tarinfo.size = len(info_bytes)
+            tar.addfile(tarinfo=info_tarinfo, fileobj=BytesIO(info_bytes))
+
+            # Close the tarfile and return the contents
+            tar.close()
+            return tar_bytes.getvalue()
 
     def check_in_store(self, store_path):
         """Check that a store path exists in the nix store.
@@ -370,6 +490,30 @@ class NixServer(object):
             return make_response(gzip.compress(paths_j.encode("utf-8")), 200,
                                  {"Content-Type": "application/octet-stream"})
 
+        @app.route("/init-batch-fetch", methods=["POST"])
+        def init_batch_fetch():
+            """Initialize a batch fetching session with a set of paths in JSON.
+
+            A token is returned which can be used to fetch the objects.
+            """
+            try:
+                req = request.json
+            except Exception as err:
+                raise ClientError("Invalid JSON in request.") from err
+
+            if not isinstance(req, dict):
+                raise ClientError("Request should be a JSON dictionary")
+            elif "paths" not in req:
+                raise ClientError("'paths' key is missing")
+            max_size = req.get("max_size")
+            info = self.initialize_batch_fetch(req["paths"], max_size)
+            return jsonify(info)
+
+        @app.route("/batch-fetch/<token>")
+        def batch_fetch(token):
+            """Fetch some paths from a initialized session."""
+            tar_bytes = self.batch_fetch(token)
+            return (tar_bytes, 200, {"Content-Type": "application/x-tar"})
 
         def import_to_nix_store(content_type, data):
             """Extracts request data and imports into the nix store."""
@@ -436,6 +580,8 @@ class NixServer(object):
         def handle_http_error(error):
             if error.status_code >= 500:
                 logging.exception(error)
+            else:
+                logging.error(error)
             logging.error(error.message)
             response = jsonify(error.to_dict())
             response.status_code = error.status_code
@@ -463,6 +609,9 @@ def _get_args():
                             help="Set log level to " + level + ".")
     parser.add_argument("--max-workers", type=int, default=cpu_count(),
                         help="Maximum concurrent NAR builder threads.")
+    parser.add_argument("--max-tarball-size", type=int,
+                        default=100 * 1024 * 1024,
+                        help="Maximum tarball size for batch fetches")
     parser.add_argument("--no-db", action="store_false", dest="direct_db",
                         help="Disable direct-database mode.")
     parser.set_defaults(direct_db=os.getenv("NO_DIRECT_DB", "") == "",
@@ -478,6 +627,7 @@ def main():
                         format="%(message)s")
     nixserver = NixServer(compression_type=args.compression_type,
                           direct_db=args.direct_db,
+                          max_tarball_size=args.max_tarball_size,
                           max_workers=args.max_workers)
     app = nixserver.make_app()
     app.run(port=args.port, host=args.host)

@@ -4,6 +4,7 @@ from copy import copy
 from datetime import datetime
 import getpass
 import gzip
+from io import BytesIO
 import json
 import logging
 import os
@@ -14,18 +15,15 @@ import shutil
 from subprocess import (Popen, PIPE, check_output, CalledProcessError,
                         check_call, call)
 import sys
+import tarfile
 import tempfile
 from threading import Thread, RLock, BoundedSemaphore
 from six.moves.urllib_parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, Future, wait, as_completed
 from multiprocessing import cpu_count
 import yaml
-if sys.version_info >= (3, 0):
-    import lzma
-else:
-    from backports import lzma
 import gzip
-import bz2
+from urllib.parse import urljoin
 
 # Special-case here to address a runtime bug I've encountered
 try:
@@ -669,7 +667,7 @@ class NixCacheClient(object):
                         if future.running():
                             logging.info("Cancelling fetch of", path)
                             future.cancel()
-                        logging.info("Done cancelling futures")
+                    logging.info("Done cancelling futures")
             finally:
                 raise
 
@@ -677,14 +675,18 @@ class NixCacheClient(object):
         """Make a request, with retry logic."""
         attempt = 1
         while True:
+            logging.debug("Requesting to url '{}', method '{}', attempt {}"
+                          .format(url, method, attempt))
             try:
                 response = getattr(self._connect(), method)(url, **kwargs)
                 response.raise_for_status()
                 return response
             except requests.HTTPError as err:
                 if err.response.status_code < 500 or \
-                   (self._max_attempts is not None and
-                    attempt >= self._max_attempts):
+                       (self._max_attempts is not None and
+                        attempt >= self._max_attempts):
+                    import pdb; pdb.set_trace()
+                    logging.error(decode_str(response.content))
                     raise
                 else:
                     logging.warn("Received an error response ({}) from the "
@@ -695,6 +697,68 @@ class NixCacheClient(object):
                 logging.warn("Encountered connection error {}. Reinitializing "
                              "connection".format(cerr))
                 self._session = None
+
+    def fetch_batch(self, paths):
+        """Fetch multiple paths in a batch request.
+
+        First initializes a batch fetch session with the server. Then
+        repeatedly makes request for a batch fetch tarball, until all
+        paths have been fetched.
+        """
+        # Initialize a session
+        url = urljoin(self._endpoint, "init-batch-fetch")
+        data = json.dumps({"paths": paths})
+        response = self._request(url, method="post", data=data,
+                                 headers={"Content-Type": "application/json"})
+        token = response.json()["token"]
+        num_total_paths = response.json()["num_total_paths"]
+
+        logging.info("Batch-fetching {} total paths".format(num_total_paths))
+        # Fetch paths until there are none left to fetch
+        while self._fetch_single_batch(token) > 0:
+            pass
+
+        logging.info("Finished batch fetch.")
+
+    def _fetch_single_batch(self, token):
+        """Unpack a batch fetch tarball and import files into the nix store.
+
+        Each response from the server should be a tarball containing
+        an info file and any number of compressed NARs. The info file
+        is called 'info.json' and is a JSON dictionary containing:
+
+          * import_ordering: What order to import the NARs in.
+          * nar_mapping: Mapping from nar path -> narinfo dictionary.
+          * paths_remaining: How many paths are remaining to be fetched.
+
+        This function will extract the info and use the contained
+        ordering to extract each nar file and import it into the nix
+        store.
+
+        :return: The number of imported and remaining paths.
+        :rtype: ``dict``, "remaining" and "imported" keys mapping to ``int``
+        """
+        fetch_url = urljoin(self._endpoint, "batch-fetch/" + token)
+        response = self._request(fetch_url)
+        bio = BytesIO(response.content)
+        tar = tarfile.open(fileobj=bio, mode="r")
+        member_map = {m.name: m for m in tar.getmembers()}
+        if "info.json" not in member_map:
+            raise ValueError("No info.json included in batch response tarball")
+        import pdb; pdb.set_trace()
+        info_str = decode_str(tar.extractfile(member_map["info.json"]).read())
+        info = json.loads(info_str)
+        remaining = info["paths_remaining"]
+        nar_mapping = info["nar_mapping"]
+        for nar_path in info["import_ordering"]:
+            narinfo = NarInfo.from_dict(nar_mapping[nar_path])
+            nar_bytes = tar.extractfile(member_map[nar_path]).read()
+            narinfo.import_to_store(nar_bytes)
+            self._register_as_fetched(narinfo.store_path)
+        logging.info("Imported {} new paths.".format(len(nar_mapping)))
+        if remaining > 0:
+            logging.info("{} paths remain to be fetched.".format(remaining))
+        return remaining
 
     def _fetch_single(self, path):
         """Fetch a single path."""
@@ -715,19 +779,7 @@ class NixCacheClient(object):
                      .format(basename(path), self._endpoint))
         response = self._request(url)
 
-        # Figure out how to extract the content.
-        if narinfo.compression.lower() in ("xz", "xzip"):
-            data = lzma.decompress(response.content)
-        elif narinfo.compression.lower() in ("bz2", "bzip2"):
-            data = bz2.decompress(response.content)
-        elif narinfo.compression.lower() in ("gzip", "gz"):
-            data = gzip.decompress(response.content)
-        else:
-            raise ValueError("Unsupported narinfo compression type {}"
-                             .format(narinfo.compression))
-        # Once extracted, convert it into a nix export object and import.
-        export = narinfo.nar_to_export(data)
-        imported_path = export.import_to_store()
+        narinfo.import_to_store(response.content)
         self._register_as_fetched(path)
 
     def _register_as_fetched(self, path):
@@ -1219,7 +1271,7 @@ def main():
                                ignore_drvs=args.ignore_drvs,
                                ignore_tarballs=args.ignore_tarballs)
         elif args.command == "fetch":
-            wait(list(client.fetch_objects(args.paths).values()))
+            client.fetch_batch(args.paths)
         elif args.command == "build":
             keep_going = False if args.one else args.keep_going
             result_derivs = client.build_fetch(
