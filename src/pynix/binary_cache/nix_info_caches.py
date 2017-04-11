@@ -38,7 +38,7 @@ class PathReferenceCache(object):
     slow, however.
     """
     def __init__(self, location=NIX_REFERENCE_CACHE_PATH, max_jobs=cpu_count(),
-                 direct_db=True, db_con=None):
+                 direct_db=True, db_con=None, create_db_con_each_time=False):
         self._location = location
         self._pool = ThreadPoolExecutor(max_workers=max_jobs)
         self._cache_update_lock = RLock()
@@ -54,21 +54,9 @@ class PathReferenceCache(object):
         # will use a direct connection to the database rather than
         # using nix-store. This is much faster, but is unavailable on
         # some systems.
-        if direct_db is not True:
-            self._db_con = None
-        elif db_con is not None:
-            self._db_con = db_con
-        else:
-            try:
-                query = "select * from ValidPaths limit 1"
-                db_con = sqlite3.connect(NIX_DB_PATH)
-                db_con.execute(query).fetchall()
-                # If this succeeds, assign the db_con attribute.
-                self._db_con = db_con
-            except Exception as err:
-                logging.warn("Path cache can't connect to the database ({}). "
-                             "Can't use direct-database mode :(".format(err))
-                self._db_con = None
+        self._create_db_con_each_time = create_db_con_each_time
+        if direct_db is True:
+            self._test_db_con()
 
     @property
     def _path_references(self):
@@ -76,6 +64,44 @@ class PathReferenceCache(object):
         if self.__path_references is None:
             self.__path_references = self._cache_load_future.result()
         return self.__path_references
+
+    @property
+    def db_con(self):
+        """Create a DB connection, if one is available."""
+        if self._db_accessible is False:
+            # We've determined the db is not accessible.
+            return None
+        elif self._create_db_con_each_time is True:
+            # Initiate a new DB connection.
+            return sqlite3.connect(NIX_DB_PATH)
+        elif self._db_con is not None:
+            # We've established a persistent connection.
+            return self._db_con
+        else:
+            self._db_con = sqlite3.connect(NIX_DB_PATH)
+            return self._db_con
+
+    def _test_db_con(self):
+        """Test that we can connect to the nix DB.
+
+        In addition, if not configured to create a new DB connection
+        each time, this function will set `self._db_con` to a SQLite3
+        connection if successful.
+
+        :return: True if the database is accessible.
+        :rtype: ``bool``
+        """
+        try:
+            query = "select * from ValidPaths limit 1"
+            db_con = sqlite3.connect(NIX_DB_PATH)
+            db_con.execute(query).fetchall()
+            if self._create_db_con_each_time is False:
+                self._db_con = db_con
+            self._db_accessible = True
+        except Exception as err:
+            logging.warn("Path cache can't connect to the database ({}). "
+                         "Can't use direct-database mode :(".format(err))
+            self._db_accessible = False
 
     def has_record(self, store_path):
         """Return true if we have an entry for the given store path."""
@@ -96,8 +122,8 @@ class PathReferenceCache(object):
         :type references: ``str``
         """
         if not store_path.startswith(NIX_STORE_PATH):
-            raise ValueError("Must record an absolute store path, and "
-                             "must live in the nix store.")
+            raise ValueError("Path '{}' must start with '{}'"
+                             .format(store_path, NIX_STORE_PATH))
         if store_path in self._path_references:
             # If it's already in this dictionary, then it's already on disk.
             return
@@ -168,9 +194,10 @@ class PathReferenceCache(object):
 
         :raises: :py:class:`NoSuchObject` if the object doesn't exist.
         """
+        path = join(NIX_STORE_PATH, path)
         if path not in self._path_references:
-            if self._db_con is not None:
-                with self._db_con as con:
+            if self.db_con is not None:
+                with self.db_con as con:
                     obj_id = con.execute(GET_ID_QUERY, (path,)).fetchone()
                     if obj_id is None:
                         raise NoSuchObject("No path {} recorded".format(path))

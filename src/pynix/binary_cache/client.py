@@ -47,7 +47,8 @@ from pynix.utils import (strip_output, decode_str, NIX_STORE_PATH,
                          query_store, instantiate, tell_size,
                          is_path_in_store, format_seconds)
 from pynix.exceptions import (CouldNotConnect, NixImportFailed, CliError,
-                              ObjectNotBuilt, NixBuildError, NoSuchObject)
+                              ObjectNotBuilt, NixBuildError, NoSuchObject,
+                              OperationNotSupported)
 from pynix.binary_cache.nix_info_caches import PathReferenceCache
 from pynix.narinfo import (NarInfo, resolve_compression_type,
                            COMPRESSION_TYPES, COMPRESSION_TYPE_ALIASES)
@@ -68,9 +69,9 @@ TARBALL_MIMETYPES = set(['application/x-gzip', 'application/x-xz',
 
 class NixCacheClient(object):
     """Wraps some state for sending store objects."""
-    def __init__(self, endpoint, dry_run=False, username=None,
-                 password=None, cache_location=None, cache_enabled=True,
-                 send_nars=False, compression_type="xz",
+    def __init__(self, endpoint, dry_run=False, username=None, password=None,
+                 cache_location=None, cache_enabled=True, send_nars=False,
+                 compression_type="xz", use_batch_fetching=True,
                  max_jobs=cpu_count(), max_attempts=3):
         #: Server running servenix (string).
         if endpoint:
@@ -119,7 +120,8 @@ class NixCacheClient(object):
         # Connection to the nix state database.
         self._db_con = sqlite3.connect(NIX_DB_PATH)
         # Caches nix path references.
-        self._reference_cache = PathReferenceCache(db_con=self._db_con)
+        self._reference_cache = PathReferenceCache(
+            db_con=self._db_con, create_db_con_each_time=True)
         # How many times to attempt fetching a package.
         self._max_attempts = max_attempts
         # Will be set to true if there's an interruption of some kind.
@@ -128,6 +130,8 @@ class NixCacheClient(object):
         self._send_nars = send_nars
         # How to compress NARs send during uploading
         self._compression_type = resolve_compression_type(compression_type)
+        # Whether to use batch fetching when available
+        self._use_batch_fetching = use_batch_fetching
 
     def _update_narinfo_cache(self, narinfo, write_to_disk):
         """Write a narinfo entry to the cache.
@@ -162,6 +166,7 @@ class NixCacheClient(object):
         :return: Information on the archived path.
         :rtype: :py:class:`NarInfo`
         """
+        path = join(NIX_STORE_PATH, path)
         if path not in self._narinfo_cache:
             write_to_disk = True
             cache_path = join(NIX_NARINFO_CACHE, self._endpoint_server,
@@ -213,10 +218,10 @@ class NixCacheClient(object):
                               "locally, and can't query the server"
                               .format(path))
                 raise
-            narinfo = self.get_narinfo(path)
-            refs = [r for r in narinfo.abs_references if r != path]
-            self._reference_cache.record_references(path, refs)
-            return refs
+        narinfo = self.get_narinfo(path)
+        refs = [r for r in narinfo.abs_references if r != path]
+        self._reference_cache.record_references(narinfo.store_path, refs)
+        return refs
 
     def query_paths(self, paths):
         """Given a list of paths, see which the server has.
@@ -627,20 +632,43 @@ class NixCacheClient(object):
         except (requests.HTTPError, AssertionError) as err:
             logging.info("Server doesn't support compute-fetch-order "
                          "route. Have to do it ourselves...")
-            order = []
-            order_set = set()
-            def _order(path):
-                if path not in order_set:
-                    for ref in self.get_references(path, query_server=True):
-                        _order(ref)
-                    order.append(path)
-                    order_set.add(path)
-            logging.debug("Computing a fetch order for {}"
-                          .format(tell_size(paths, "path")))
-            for path in paths:
-                _order(path)
-            logging.debug("Finished computing fetch order.")
-            return order
+        order = []
+        order_set = set()
+        def _order(path):
+            if path not in order_set:
+                for ref in self.get_references(path, query_server=True):
+                    _order(ref)
+                order.append(path)
+                order_set.add(path)
+        logging.debug("Computing a fetch order for {}"
+                      .format(tell_size(paths, "path")))
+        for path in paths:
+            _order(path)
+        logging.debug("Finished computing fetch order.")
+        return order
+
+    def _fetch_unordered_paths(self, paths_to_fetch):
+        """Fetch paths which are not ordered and might not be the full closure.
+
+        :param paths_to_fetch: List of paths desired to be fetched.
+        :type  paths_to_fetch: ``list`` of ``str``
+        """
+        if self._use_batch_fetching is True:
+            try:
+                self._fetch_batch(paths_to_fetch)
+                return
+            except OperationNotSupported:
+                logging.info("Batch fetching not supported by {}. "
+                             "falling back to individual fetches."
+                             .format(self._endpoint))
+            self._use_batch_fetching = False
+            self._fetch_unordered_paths(paths_to_fetch)
+        else:
+            # Figure out the order to fetch them in.
+            logging.info("Computing fetch order...")
+            fetch_order = self._compute_fetch_order(paths_to_fetch)
+            # Perform the fetches.
+            self._fetch_ordered_paths(fetch_order)
 
     def _fetch_ordered_paths(self, store_paths):
         """Given an ordered list of paths, fetch all from a cache."""
@@ -685,8 +713,6 @@ class NixCacheClient(object):
                 if err.response.status_code < 500 or \
                        (self._max_attempts is not None and
                         attempt >= self._max_attempts):
-                    import pdb; pdb.set_trace()
-                    logging.error(decode_str(response.content))
                     raise
                 else:
                     logging.warn("Received an error response ({}) from the "
@@ -698,7 +724,7 @@ class NixCacheClient(object):
                              "connection".format(cerr))
                 self._session = None
 
-    def fetch_batch(self, paths):
+    def _fetch_batch(self, paths):
         """Fetch multiple paths in a batch request.
 
         First initializes a batch fetch session with the server. Then
@@ -706,10 +732,19 @@ class NixCacheClient(object):
         paths have been fetched.
         """
         # Initialize a session
+        logging.info("Initializing a batch fetching session")
         url = urljoin(self._endpoint, "init-batch-fetch")
         data = json.dumps({"paths": paths})
-        response = self._request(url, method="post", data=data,
-                                 headers={"Content-Type": "application/json"})
+        headers = {"Content-Type": "application/json"}
+        try:
+            response = self._request(url, method="post", data=data,
+                                     headers=headers)
+        except requests.HTTPError as err:
+            if err.response.status_code == 404:
+                raise OperationNotSupported("No support for batch fetching") \
+                    from None
+            else:
+                raise
         token = response.json()["token"]
         num_total_paths = response.json()["num_total_paths"]
 
@@ -745,7 +780,6 @@ class NixCacheClient(object):
         member_map = {m.name: m for m in tar.getmembers()}
         if "info.json" not in member_map:
             raise ValueError("No info.json included in batch response tarball")
-        import pdb; pdb.set_trace()
         info_str = decode_str(tar.extractfile(member_map["info.json"]).read())
         info = json.loads(info_str)
         remaining = info["paths_remaining"]
@@ -964,11 +998,7 @@ class NixCacheClient(object):
             for output in outputs:
                 paths_to_fetch.append(deriv.output_path(output))
         if len(paths_to_fetch) > 0:
-            # Figure out the order to fetch them in.
-            logging.info("Computing fetch order...")
-            fetch_order = self._compute_fetch_order(paths_to_fetch)
-            # Perform the fetches.
-            self._fetch_ordered_paths(fetch_order)
+            self._fetch_unordered_paths(paths_to_fetch)
             self._verify(need_to_fetch)
         # Build up the command for nix store to build the remaining paths.
         if len(need_to_build) > 0:
@@ -1203,6 +1233,12 @@ def _get_args():
                        help="Alias for '--max-jobs=1 --stop-on-failure'")
         p.set_defaults(show_trace=True, keep_going=True, print_paths=True)
 
+    for p in (fetch, build, build_derivations):
+        p.add_argument("--batch", help="Use batch fetching when available.")
+        p.add_argument("--no-batch", action="store_false", dest="batch",
+                       help="Disable batch fetching")
+        p.set_defaults(batch=os.getenv("NO_BATCH", "") == "")
+
     for subparser in (send, sync, daemon, fetch, build, build_derivations):
         subparser.add_argument("-e", "--endpoint",
                                default=os.environ.get("NIX_REPO_HTTP"),
@@ -1243,6 +1279,9 @@ def main():
     """Main entry point."""
     args = _get_args()
     if not args.endpoint: # treat empty strings as None
+        if args.command in ("send", "sync", "daemon", "fetch"):
+            exit("Operation '{}' requires an endpoint to be specified."
+                 .format(args.command))
         args.endpoint = None
     if args.endpoint is not None and \
        ENDPOINT_REGEX.match(args.endpoint) is None:
@@ -1258,6 +1297,7 @@ def main():
                             username=args.username, max_jobs=max_jobs,
                             compression_type=args.compression_type,
                             send_nars=args.send_nars,
+                            use_batch_fetching=args.batch,
                             max_attempts=args.max_attempts)
     try:
         if args.command == "send":
@@ -1271,7 +1311,7 @@ def main():
                                ignore_drvs=args.ignore_drvs,
                                ignore_tarballs=args.ignore_tarballs)
         elif args.command == "fetch":
-            client.fetch_batch(args.paths)
+            client._fetch_unordered_paths(args.paths)
         elif args.command == "build":
             keep_going = False if args.one else args.keep_going
             result_derivs = client.build_fetch(

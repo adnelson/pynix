@@ -131,3 +131,7 @@ class CouldNotConnect(Exception):
 
     def __str__(self):
         return self._message
+
+class OperationNotSupported(Exception):
+    """Raised by the client when a server does not support an operation."""
+    pass
