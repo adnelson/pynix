@@ -3,19 +3,25 @@ import base64
 import sys
 if sys.version_info >= (3, 0):
     from functools import lru_cache
+    import lzma
+    from io import BytesIO
 else:
     from repoze.lru import lru_cache
-from io import BytesIO
+    from backports import lzma
+    from StringIO import StringIO as BytesIO
 import logging
 import os
 from os.path import join, basename, dirname
 import yaml
 from subprocess import check_output, Popen, PIPE
+import gzip
+import bz2
 
 from pynix.derivation import Derivation
 from pynix.utils import (decode_str, strip_output, nix_cmd, query_store,
                          is_path_in_store)
 from pynix.exceptions import NoNarGenerated, NixImportFailed
+
 
 # Magic 8-byte number that comes at the beginning of the export's bytes.
 EXPORT_INITIAL_MAGIC = b"\x01" + (b"\x00" * 7)
@@ -179,11 +185,11 @@ class NarInfo(object):
         """
         # Figure out how to extract the content.
         if self.compression.lower() in ("xz", "xzip"):
-            data = lzma.decompress(response.content)
+            data = lzma.decompress(compressed_nar)
         elif self.compression.lower() in ("bz2", "bzip2"):
-            data = bz2.decompress(response.content)
+            data = bz2.decompress(compressed_nar)
         else:
-            data = gzip.decompress(response.content)
+            data = gzip.decompress(compressed_nar)
 
         # Once extracted, convert it into a nix export object and import.
         export = self.nar_to_export(data)

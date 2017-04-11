@@ -4,6 +4,7 @@ from copy import copy
 from datetime import datetime
 import getpass
 import gzip
+from io import BytesIO
 import json
 import logging
 import os
@@ -14,18 +15,14 @@ import shutil
 from subprocess import (Popen, PIPE, check_output, CalledProcessError,
                         check_call, call)
 import sys
+import tarfile
 import tempfile
 from threading import Thread, RLock, BoundedSemaphore
 from six.moves.urllib_parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, Future, wait, as_completed
 from multiprocessing import cpu_count
 import yaml
-if sys.version_info >= (3, 0):
-    import lzma
-else:
-    from backports import lzma
 import gzip
-import bz2
 from urllib.parse import urljoin
 
 # Special-case here to address a runtime bug I've encountered
@@ -678,6 +675,8 @@ class NixCacheClient(object):
         """Make a request, with retry logic."""
         attempt = 1
         while True:
+            logging.debug("Requesting to url '{}', method '{}', attempt {}"
+                          .format(url, method, attempt))
             try:
                 response = getattr(self._connect(), method)(url, **kwargs)
                 response.raise_for_status()
@@ -686,7 +685,8 @@ class NixCacheClient(object):
                 if err.response.status_code < 500 or \
                        (self._max_attempts is not None and
                         attempt >= self._max_attempts):
-                    logging.error(response.content)
+                    import pdb; pdb.set_trace()
+                    logging.error(decode_str(response.content))
                     raise
                 else:
                     logging.warn("Received an error response ({}) from the "
@@ -707,8 +707,8 @@ class NixCacheClient(object):
         """
         # Initialize a session
         url = urljoin(self._endpoint, "init-batch-fetch")
-        data = {"paths": paths}
-        response = self._request(url, method="post", data={"paths": paths},
+        data = json.dumps({"paths": paths})
+        response = self._request(url, method="post", data=data,
                                  headers={"Content-Type": "application/json"})
         token = response.json()["token"]
         num_total_paths = response.json()["num_total_paths"]
@@ -745,7 +745,9 @@ class NixCacheClient(object):
         member_map = {m.name: m for m in tar.getmembers()}
         if "info.json" not in member_map:
             raise ValueError("No info.json included in batch response tarball")
-        info = json.load(tar.extractfile(member_map["info.json"]).read())
+        import pdb; pdb.set_trace()
+        info_str = decode_str(tar.extractfile(member_map["info.json"]).read())
+        info = json.loads(info_str)
         remaining = info["paths_remaining"]
         nar_mapping = info["nar_mapping"]
         for nar_path in info["import_ordering"]:
