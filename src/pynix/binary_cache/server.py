@@ -498,8 +498,8 @@ class NixServer(object):
             elif "paths" not in req:
                 raise ClientError("'paths' key is missing")
             max_size = req.get("max_size")
-            token = self.initialize_batch_fetch(req["paths"], max_size)
-            return (token, 200)
+            info = self.initialize_batch_fetch(req["paths"], max_size)
+            return jsonify(info)
 
         @app.route("/batch-fetch/<token>")
         def batch_fetch(token):

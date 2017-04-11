@@ -684,8 +684,9 @@ class NixCacheClient(object):
                 return response
             except requests.HTTPError as err:
                 if err.response.status_code < 500 or \
-                   (self._max_attempts is not None and
-                    attempt >= self._max_attempts):
+                       (self._max_attempts is not None and
+                        attempt >= self._max_attempts):
+                    logging.error(response.content)
                     raise
                 else:
                     logging.warn("Received an error response ({}) from the "
