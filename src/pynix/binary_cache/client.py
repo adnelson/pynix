@@ -1233,13 +1233,13 @@ def _get_args():
                        help="Alias for '--max-jobs=1 --stop-on-failure'")
         p.set_defaults(show_trace=True, keep_going=True, print_paths=True)
 
-    for p in (fetch, build, build_derivations):
-        p.add_argument("--batch", help="Use batch fetching when available.")
-        p.add_argument("--no-batch", action="store_false", dest="batch",
-                       help="Disable batch fetching")
-        p.set_defaults(batch=os.getenv("NO_BATCH", "") == "")
-
     for subparser in (send, sync, daemon, fetch, build, build_derivations):
+        subparser.add_argument("--batch",
+                               help="Use batch fetching when available.")
+        subparser.add_argument("--no-batch", action="store_false",
+                               dest="batch", help="Disable batch fetching")
+        subparser.set_defaults(batch=os.getenv("NO_BATCH", "") == "")
+
         subparser.add_argument("-e", "--endpoint",
                                default=os.environ.get("NIX_REPO_HTTP"),
                                help="Endpoint of nix server to send to.")
@@ -1268,7 +1268,7 @@ def _get_args():
                         set(COMPRESSION_TYPE_ALIASES)):
             subparser.add_argument("--" + t, action="store_const", const=t,
                                    dest="compression_type",
-                                   help="Use {} compression for served NARs."
+                                   help="Use {} compression for sent NARs."
                                         .format(resolve_compression_type(t)))
             subparser.set_defaults(
                 compression_type=os.getenv("COMPRESSION_TYPE", "xz"))
