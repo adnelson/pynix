@@ -154,7 +154,7 @@ class NixCacheClient(object):
             return
         tempfile_fd, tempfile_path = tempfile.mkstemp()
         with os.fdopen(tempfile_fd, "w") as f:
-            f.write(json.dumps(narinfo.as_dict()))
+            f.write(json.dumps(narinfo.to_dict()))
         shutil.move(tempfile_path, narinfo_path)
 
     def get_narinfo(self, path):
