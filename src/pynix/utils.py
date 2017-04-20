@@ -3,7 +3,8 @@ import base64
 import os
 from os import getenv
 from os.path import exists, join, dirname, isdir, realpath
-from subprocess import check_output, PIPE, Popen, CalledProcessError
+import sqlite3
+from subprocess import call, check_output, PIPE, Popen, CalledProcessError
 
 import six
 
@@ -75,6 +76,21 @@ assert isdir(NIX_STATE_PATH), \
 
 NIX_DB_PATH = getenv("NIX_DB_PATH", join(NIX_STATE_PATH, "nix/db/db.sqlite"))
 
+# This variable is true when we detect we're on a nixos linux.
+if os.getenv("IS_NIXOS", "") != "":
+    IS_NIXOS = True
+else:
+    IS_NIXOS = (call("nixos-version", shell=True, stderr=PIPE) == 0 or
+                isdir("/etc/nixos"))
+
+try:
+    NIX_DB_CON = sqlite3.connect(NIX_DB_PATH)
+    with NIX_DB_CON:
+        query = NIX_DB_CON.execute("select * from ValidPaths limit 1")
+        query.fetchall()
+except Exception as e:
+    NIX_DB_CON = None
+
 def nix_cmd(command_name, args=None):
     """Build a nix command, using the absolute path to the given nix binary.
 
@@ -137,11 +153,13 @@ def tell_size(obj, word, suffix="s"):
     else:
         return "{} {}{}".format(len(obj), word, suffix)
 
-def is_path_in_store(store_path, db_con=None):
+def is_path_in_store(store_path, db_con=NIX_DB_CON):
     """Check if a path is in the nix store.
 
     Optionally provide a database connection which speeds things up.
     """
+    # Ensure path is absolute
+    store_path = join(NIX_STORE_PATH, store_path)
     # If we have a connection to the database, all we have to
     # do is look in the database.
     if db_con is not None:

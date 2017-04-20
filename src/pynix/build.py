@@ -1,10 +1,11 @@
 """Build nix derivations."""
 import json
 import sys
-from os.path import exists, basename
+from os.path import basename
 
 import requests
 from pynix.derivation import Derivation
+from pynix.utils import is_path_in_store
 
 def needed_to_build(deriv, outputs=None, needed=None, need_fetch=None,
                     existing=None, on_server=None):
@@ -61,7 +62,7 @@ def needed_to_build(deriv, outputs=None, needed=None, need_fetch=None,
     # So then, we don't know if we need to build this derivation.
     # We can see by checking the outputs.
     for output in outputs:
-        if exists(deriv.output_mapping[output]):
+        if is_path_in_store(deriv.output_mapping[output]):
             if deriv not in existing:
                 existing[deriv] = set()
             existing[deriv].add(output)
