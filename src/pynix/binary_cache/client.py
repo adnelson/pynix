@@ -740,11 +740,8 @@ class NixCacheClient(object):
             response = self._request(url, method="post", data=data,
                                      headers=headers)
         except requests.HTTPError as err:
-            if err.response.status_code == 404:
-                raise OperationNotSupported("No support for batch fetching") \
-                    from None
-            else:
-                raise
+            msg = "No support for batch fetching"
+            raise OperationNotSupported(msg) from None
         token = response.json()["token"]
         num_total_paths = response.json()["num_total_paths"]
 
