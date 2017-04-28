@@ -309,7 +309,7 @@ class NixCacheClient(object):
                 to_send.add(path)
         return to_send
 
-    def _connect(self, first_time=True):
+    def _connect(self, first_time=True, attempts=5):
         """Connect to a binary cache.
 
         Serves two purposes: verifying that the client can
@@ -323,6 +323,9 @@ class NixCacheClient(object):
         :param first_time: Whether this is the first time it's being
             called, so that we can tailor the error messaging.
         :type first_time: ``bool``
+
+        :param attempts: How many more times to try connecting
+        :type  attempts: ``int``
 
         :return: Either None or a Session object.
         :rtype: ``NoneType`` or :py:class:`requests.sessions.Session`
@@ -377,26 +380,34 @@ class NixCacheClient(object):
             self._auth = session.auth = auth
             self._session = session
             return self._session
-        elif resp.status_code == 401 and sys.stdin.isatty():
-            # Authorization failed. Give the user a chance to set new auth.
-            msg = "\033[31mAuthorization failed!\033[0m\n" \
-                  if not first_time else ""
-            msg += "Please enter \033[1musername\033[0m"
-            msg += " for {}".format(self._endpoint) if first_time else ""
-            if self._username is not None:
-                msg += " (default '{}'): ".format(self._username)
+        elif resp.status_code == 401:
+            if attempts > 0:
+                time.sleep(2)
+                logging.info("Invalid response. Retrying...")
+                return self._connect(first_time=False, attempts=attempts-1)
+            elif sys.stdin.isatty():
+                # Authorization failed. Give the user a chance to set new auth.
+                msg = "\033[31mAuthorization failed!\033[0m\n" \
+                      if not first_time else ""
+                msg += "Please enter \033[1musername\033[0m"
+                msg += " for {}".format(self._endpoint) if first_time else ""
+                if self._username is not None:
+                    msg += " (default '{}'): ".format(self._username)
+                else:
+                    msg += ": "
+                try:
+                    username = six.moves.input(msg).strip()
+                    if username != "":
+                        self._username = username
+                    os.environ.pop("NIX_BINARY_CACHE_PASSWORD", None)
+                    self._password = None
+                except (KeyboardInterrupt, EOFError):
+                    logging.info("\nBye!")
+                    sys.exit()
+                return self._connect(first_time=False)
             else:
-                msg += ": "
-            try:
-                username = six.moves.input(msg)
-                if username != "":
-                    self._username = username
-                os.environ.pop("NIX_BINARY_CACHE_PASSWORD", None)
-                self._password = None
-            except (KeyboardInterrupt, EOFError):
-                logging.info("\nBye!")
-                sys.exit()
-            return self._connect(first_time=False)
+                raise CouldNotConnect(self._endpoint, resp.status_code,
+                                      resp.content)
         else:
             raise CouldNotConnect(self._endpoint, resp.status_code,
                                   resp.content)
