@@ -562,11 +562,14 @@ class NixCacheClient(object):
         logging.info("Finished fetching {}".format(
             tell_size(store_paths, "path")))
 
-    def _fetch_single(self, path):
+    def _fetch_single(self, path, retries_remaining=3):
         """Fetch a single path."""
         # Return if the path has already been fetched, or already exists.
         if self._have_fetched(path):
             return
+        elif retries_remaining < 0:
+            logging.error("Too many retries for path {}!".format(path))
+            raise ObjectNotBuilt(path)
         # First ensure that all referenced paths have been fetched.
         for ref in self.get_references(path):
             self._finish_fetching(ref)
@@ -593,6 +596,10 @@ class NixCacheClient(object):
         # Once extracted, convert it into a nix export object and import.
         export = narinfo.nar_to_export(data)
         imported_path = export.import_to_store()
+        if not is_path_in_store(imported_path):
+            logging.warn("Couldn't import fetched object for " + path)
+            return self._fetch_single(
+                path, retries_remaining=(retries_remaining - 1))
         self._register_as_fetched(path)
 
     def _register_as_fetched(self, path):
@@ -667,7 +674,7 @@ class NixCacheClient(object):
         """
         ignore = [re.compile(r) for r in ignore]
         paths = []
-        with self._db_con:
+        with self._db_con as con:
             query = con.execute("SELECT path FROM ValidPaths")
             for result in query.fetchall():
                 path = result[0]
@@ -709,7 +716,6 @@ class NixCacheClient(object):
             fetch_order = self._compute_fetch_order(paths_to_fetch)
             # Perform the fetches.
             self._fetch_ordered_paths(fetch_order)
-            self._verify(need_to_fetch)
         # Build up the command for nix store to build the remaining paths.
         if len(need_to_build) > 0:
             args = ["--max-jobs", str(self._max_jobs), "--no-gc-warning",
@@ -736,17 +742,6 @@ class NixCacheClient(object):
         """
         # TODO: report exactly which derivations succeeded/failed.
         raise NixBuildError()
-
-    def _verify(self, derivs_to_outputs):
-        """Given a derivation-output mapping, verify all paths."""
-        logging.info("Verifying that we successfully created {}"
-                     .format(tell_size(derivs_to_outputs, "store path")))
-        for deriv, outputs in derivs_to_outputs.items():
-            for output in outputs:
-                path = deriv.output_path(output)
-                logging.debug("Verifying path {}".format(basename(path)))
-                if not is_path_in_store(path, db_con=self._db_con):
-                    raise ObjectNotBuilt(path)
 
     def _create_symlinks(self, derivs_to_outputs, use_deriv_name):
         """Create symlinks to all built derivations.
@@ -931,7 +926,7 @@ def main():
     # Hide noisy logging of some external libs
     for name in ("requests", "urllib", "urllib2", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
-    max_jobs = 1 if args.one else args.max_jobs
+    max_jobs = 1 if getattr(args, "one", False) else args.max_jobs
     client = NixCacheClient(endpoint=args.endpoint, dry_run=args.dry_run,
                             username=args.username, max_jobs=max_jobs)
     try:

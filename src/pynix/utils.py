@@ -1,5 +1,6 @@
 """Some utility functions to support store operations."""
 import base64
+import logging
 import os
 from os import getenv
 from os.path import exists, join, dirname, isdir, realpath
@@ -83,13 +84,27 @@ else:
     IS_NIXOS = (call("nixos-version", shell=True, stderr=PIPE) == 0 or
                 isdir("/etc/nixos"))
 
-try:
-    NIX_DB_CON = sqlite3.connect(NIX_DB_PATH)
-    with NIX_DB_CON:
-        query = NIX_DB_CON.execute("select * from ValidPaths limit 1")
-        query.fetchall()
-except Exception as e:
-    NIX_DB_CON = None
+NIX_DB_ACCESSIBLE = None
+
+def connect_nix_db():
+    """Attempt to connect to the nix DB, otherwise return None."""
+    global NIX_DB_ACCESSIBLE
+    if NIX_DB_ACCESSIBLE is False:
+        return None
+    try:
+        connection = sqlite3.connect(NIX_DB_PATH)
+        if NIX_DB_ACCESSIBLE is None:
+            # Case: we don't know if the DB is accessible. Test it.
+            with connection:
+                query = connection.execute("select * from ValidPaths limit 1")
+                query.fetchall()
+            # Set to True so that we don't test unnecessarily later.
+            NIX_DB_ACCESSIBLE = True
+            return connection
+    except Exception as e:
+        # An exception was raised trying to connect to the DB.
+        NIX_DB_ACCESSIBLE = False
+        return None
 
 def nix_cmd(command_name, args=None):
     """Build a nix command, using the absolute path to the given nix binary.
@@ -153,11 +168,12 @@ def tell_size(obj, word, suffix="s"):
     else:
         return "{} {}{}".format(len(obj), word, suffix)
 
-def is_path_in_store(store_path, db_con=NIX_DB_CON):
+def is_path_in_store(store_path, db_con=None, hide_stderr=True):
     """Check if a path is in the nix store.
 
     Optionally provide a database connection which speeds things up.
     """
+    db_con = db_con or connect_nix_db()
     # Ensure path is absolute
     store_path = join(NIX_STORE_PATH, store_path)
     # If we have a connection to the database, all we have to
@@ -169,12 +185,16 @@ def is_path_in_store(store_path, db_con=NIX_DB_CON):
         if len(results) > 0:
             return True
         else:
+            logging.debug("Tried to look up {} in the nix DB, not there."
+                          .format(store_path))
             return False
     else:
         # Otherwise we have to use the slower method :( Subprocess
         # into nix-store and execute a query.
         try:
-            query_store(store_path, "--hash", hide_stderr=True)
+            query_store(store_path, "--hash", hide_stderr=hide_stderr)
             return True
         except CalledProcessError:
+            logging.debug("Tried to use nix-store to query path {}, but "
+                          "got an error".format(store_path))
             return False
