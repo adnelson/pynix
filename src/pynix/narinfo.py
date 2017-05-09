@@ -110,7 +110,7 @@ class NarInfo(object):
     def to_dict(self):
         """Generate a dictionary representation."""
         result = {
-            "Url": self.url,
+            "URL": self.url,
             "StorePath": self.store_path,
             "Compression": self.compression,
             "NarHash": self.nar_hash,
