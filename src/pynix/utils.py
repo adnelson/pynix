@@ -100,6 +100,7 @@ def connect_nix_db():
                 query.fetchall()
             # Set to True so that we don't test unnecessarily later.
             NIX_DB_ACCESSIBLE = True
+        if NIX_DB_ACCESSIBLE is True:
             return connection
     except Exception as e:
         # An exception was raised trying to connect to the DB.
