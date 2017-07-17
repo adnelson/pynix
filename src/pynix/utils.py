@@ -58,10 +58,16 @@ def strip_output(command, input=None, hide_stderr=False):
 # Load nix paths from environment
 if "NIX_BIN_PATH" in os.environ:
     NIX_BIN_PATH = os.environ["NIX_BIN_PATH"]
+    assert exists(join(NIX_BIN_PATH, "nix-build")), \
+        "Couldn't determine a valid nix binary path. Set NIX_BIN_PATH"
 else:
-    NIX_BIN_PATH = dirname(realpath(strip_output("type -p nix-env")))
-assert exists(join(NIX_BIN_PATH, "nix-build")), \
-    "Couldn't determine a valid nix binary path. Set NIX_BIN_PATH"
+    for bin_path in os.environ["PATH"].split(os.pathsep):
+        if isdir(bin_path) and "nix-env" in os.listdir(bin_path):
+            NIX_BIN_PATH = realpath(bin_path)
+            break
+    else:
+        raise RuntimeError("nix-env isn't in the PATH")
+
 # The store path can be given explicitly, or else it will be
 # inferred to be 2 levels up from the bin path. E.g., if the
 # bin path is /foo/bar/123-nix/bin, the store directory will
