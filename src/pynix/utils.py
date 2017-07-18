@@ -169,7 +169,8 @@ def tell_size(obj, word, suffix="s"):
     else:
         return "{} {}{}".format(len(obj), word, suffix)
 
-def is_path_in_store(store_path, db_con=None, hide_stderr=True):
+def is_path_in_store(store_path, db_con=None, hide_stderr=True,
+                     ignore_db_con=False):
     """Check if a path is in the nix store.
 
     Optionally provide a database connection which speeds things up.
@@ -179,10 +180,19 @@ def is_path_in_store(store_path, db_con=None, hide_stderr=True):
     store_path = join(NIX_STORE_PATH, store_path)
     # If we have a connection to the database, all we have to
     # do is look in the database.
-    if db_con is not None:
+    if db_con is not None and ignore_db_con is False:
         query = "select path from ValidPaths where path = ?"
-        with db_con:
-            results = db_con.execute(query, (store_path,)).fetchall()
+        try:
+            with db_con:
+                results = db_con.execute(query, (store_path,)).fetchall()
+        except sqlite3.OperationalError as err:
+            # This can happen under heavy disk load; if so fall back
+            # to querying with the nix-store executable.
+            logging.exception(err)
+            return is_path_in_store(store_path,
+                                    db_con=None,
+                                    hide_stderr=hide_stderr,
+                                    ignore_db_con=True)
         if len(results) > 0:
             return True
         else:
