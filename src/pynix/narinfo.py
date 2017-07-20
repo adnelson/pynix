@@ -4,7 +4,7 @@ from io import BytesIO
 import os
 from os.path import join, basename, dirname
 import yaml
-from subprocess import check_output, CalledProcessError
+from subprocess import call, check_output, CalledProcessError
 
 from pynix.utils import decode_str, strip_output, nix_cmd, query_store
 from pynix.exceptions import NoNarGenerated, NixImportFailed
@@ -291,6 +291,7 @@ class NarExport(object):
             return strip_output(nix_cmd("nix-store", ["--import"]),
                                 input=self.to_bytes())
         except CalledProcessError:
+            call(nix_cmd("nix-store", ["--delete", self.store_path]))
             raise NixImportFailed("See above stderr")
 
     def to_bytes(self):
