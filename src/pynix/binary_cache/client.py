@@ -16,7 +16,7 @@ import sys
 import tempfile
 from threading import Thread, RLock, BoundedSemaphore
 from six.moves.urllib_parse import urlparse
-from concurrent.futures import ThreadPoolExecutor, Future, wait, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import cpu_count
 import yaml
 if sys.version_info >= (3, 0):
@@ -606,8 +606,9 @@ class NixCacheClient(object):
                              .format(narinfo.compression))
         # Once extracted, convert it into a nix export object and import.
         export = narinfo.nar_to_export(data)
-        imported_path = export.import_to_store()
-        if not is_path_in_store(imported_path):
+        try:
+            imported_path = export.import_to_store()
+        except NixImportFailed:
             logging.warn("Couldn't import fetched object for " + path)
             return self._fetch_single(
                 path, retries_remaining=(retries_remaining - 1))
@@ -948,7 +949,8 @@ def main():
         elif args.command == "daemon":
             client.watch_store(args.ignore)
         elif args.command == "fetch":
-            wait(list(client.fetch_objects(args.paths).values()))
+            fetch_order = client._compute_fetch_order(args.paths)
+            client._fetch_ordered_paths(fetch_order)
         elif args.command == "build":
             keep_going = False if args.one else args.keep_going
             result_derivs = client.build_fetch(
