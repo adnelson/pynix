@@ -3,11 +3,12 @@ import base64
 import logging
 import os
 from os import getenv
-from os.path import exists, join, dirname, isdir, realpath
+from os.path import exists, join, dirname, isdir, realpath, isfile
 import sqlite3
 from subprocess import call, check_output, PIPE, Popen, CalledProcessError
 
 import six
+import magic
 
 from pynix.exceptions import NixInstantiationError
 
@@ -80,8 +81,13 @@ assert isdir(NIX_STORE_PATH), \
 NIX_STATE_PATH = getenv("NIX_STATE_PATH", join(dirname(NIX_STORE_PATH), "var"))
 assert isdir(NIX_STATE_PATH), \
     "Nix state directory {} doesn't exist".format(NIX_STATE_PATH)
+# Nix reads this env variable; set it here
+os.environ["NIX_STATE_DIR"] = NIX_STATE_PATH
 
 NIX_DB_PATH = getenv("NIX_DB_PATH", join(NIX_STATE_PATH, "nix/db/db.sqlite"))
+
+# Nix also reads this variable...
+os.environ["NIX_DB_DIR"] = dirname(NIX_DB_PATH)
 
 # This variable is true when we detect we're on a nixos linux.
 if os.getenv("IS_NIXOS", "") != "":
@@ -215,3 +221,26 @@ def is_path_in_store(store_path, db_con=None, hide_stderr=True,
             logging.debug("Tried to use nix-store to query path {}, but "
                           "got an error".format(store_path))
             return False
+
+# Mimetypes of tarball files
+TARBALL_MIMETYPES = set(['application/x-gzip', 'application/x-xz',
+                         'application/x-bzip2', 'application/zip'])
+
+
+def is_tarball(store_path):
+    """Return true if the path is a tarball, or a directory which only
+       contains a tarball.
+    :param store_path: A nix store path.
+    :type store_path: ``str``
+
+    :return: True if the store path appears to be a tarball.
+    :rtype: ``bool``
+    """
+    if isfile(store_path):
+        path = store_path
+    elif isdir(store_path) and len(os.listdir(store_path)) == 1:
+        path = join(store_path, os.listdir(store_path)[0])
+    else:
+        return False
+    mimetype = decode_str(magic.from_file(path, mime=True))
+    return mimetype in TARBALL_MIMETYPES

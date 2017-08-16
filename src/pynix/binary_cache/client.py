@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from os.path import (join, exists, isdir, isfile, expanduser, basename,
-                     getmtime)
+                     getmtime, splitext)
 import re
 import shutil
 from subprocess import (Popen, PIPE, check_output, CalledProcessError,
@@ -45,7 +45,7 @@ from pynix import __version__
 from pynix.utils import (strip_output, decode_str, NIX_STORE_PATH,
                          NIX_STATE_PATH, NIX_DB_PATH, nix_cmd,
                          query_store, instantiate, tell_size,
-                         is_path_in_store)
+                         is_path_in_store, is_tarball)
 from pynix.exceptions import (CouldNotConnect, NixImportFailed, CliError,
                               ObjectNotBuilt, NixBuildError, NoSuchObject)
 from pynix.binary_cache.nix_info_caches import PathReferenceCache
@@ -60,6 +60,7 @@ ENDPOINT_REGEX = re.compile(r"https?://([\w_-]+)(\.[\w_-]+)*(:\d+)?$")
 
 # Limit of how many paths to show, so the screen doesn't flood.
 SHOW_PATHS_LIMIT = int(os.environ.get("SHOW_PATHS_LIMIT", 25))
+
 
 class NixCacheClient(object):
     """Wraps some state for sending store objects."""
@@ -642,11 +643,15 @@ class NixCacheClient(object):
         # Now that we have the future, wait for it to finish before returning.
         future.result()
 
-    def watch_store(self, ignore):
+    def watch_store(self, ignore, include_drvs=False, include_tarballs=False):
         """Watch the nix store's timestamp and sync whenever it changes.
 
         :param ignore: A list of regexes of objects to ignore when syncing.
         :type ignore: ``list`` of (``str`` or ``regex``)
+        :param include_drvs: Send derivation files to the repo.
+        :type include_drvs: ``bool``
+        :param include_tarballs: Include tarballs.
+        :type include_tarballs: ``bool``
         """
         prev_stamp = None
         num_syncs = 0
@@ -664,7 +669,7 @@ class NixCacheClient(object):
                     logging.info("Store was modified at {}, syncing"
                                  .format(stamp.strftime("%H:%M:%S")))
                 try:
-                    self.sync_store(ignore)
+                    self.sync_store(ignore, include_drvs, include_tarballs)
                     prev_stamp = stamp
                     num_syncs += 1
                 except requests.exceptions.HTTPError as err:
@@ -674,7 +679,7 @@ class NixCacheClient(object):
             exit("Successfully syncronized with {} {} times."
                  .format(self._endpoint, num_syncs))
 
-    def sync_store(self, ignore):
+    def sync_store(self, ignore, include_drvs=False, include_tarballs=False):
         """Syncronize the local nix store to the endpoint.
 
         Reads all of the known paths in the nix SQLite database which
@@ -683,6 +688,10 @@ class NixCacheClient(object):
 
         :param ignore: A list of regexes of objects to ignore.
         :type ignore: ``list`` of (``str`` or ``regex``)
+        :param include_drvs: Include derivation files, normally not necessary.
+        :type include_drvs: ``bool``
+        :param include_tarballs: Include tarballs.
+        :type include_tarballs: ``bool``
         """
         ignore = [re.compile(r) for r in ignore]
         paths = []
@@ -690,11 +699,16 @@ class NixCacheClient(object):
             query = con.execute("SELECT path FROM ValidPaths")
             for result in query.fetchall():
                 path = result[0]
-                if any(ig.match(path) for ig in ignore):
+                if splitext(path)[1] == ".drv" and include_drvs is not True:
+                    logging.debug("Skipping derivation {}".format(path))
+                elif include_tarballs is not True and is_tarball(path):
+                    logging.debug("Path {} appears to be a tarball, skipping"
+                                  .format(path))
+                elif any(ig.match(path) for ig in ignore):
                     logging.debug("Path {} matches an ignore regex, skipping"
                                   .format(path))
-                    continue
-                paths.append(path)
+                else:
+                    paths.append(path)
         logging.info("Found {} paths in the store.".format(len(paths)))
         self.send_objects(paths)
 
@@ -921,6 +935,12 @@ def _get_args():
     for subparser in (sync, daemon):
         subparser.add_argument("--ignore", nargs="*", default=[],
                                help="Regexes of store paths to ignore.")
+        subparser.add_argument("--include-drvs", action="store_true",
+                               default=False,
+                               help="Send .drv files to repo.")
+        subparser.add_argument("--include-tarballs", action="store_true",
+                               default=False,
+                               help="Send tarball files to repo.")
         # It doesn't make sense to have the daemon run in dry-run mode.
         subparser.set_defaults(dry_run=False)
     return parser.parse_args()
@@ -945,9 +965,11 @@ def main():
         if args.command == "send":
             client.send_objects(args.paths)
         elif args.command == "sync":
-            client.sync_store(args.ignore)
+            client.sync_store(args.ignore, args.include_drvs,
+                              args.include_tarballs)
         elif args.command == "daemon":
-            client.watch_store(args.ignore)
+            client.watch_store(args.ignore, args.include_drvs,
+                               args.include_tarballs)
         elif args.command == "fetch":
             fetch_order = client._compute_fetch_order(args.paths)
             client._fetch_ordered_paths(fetch_order)
