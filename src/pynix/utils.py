@@ -144,18 +144,32 @@ def query_store(store_path, query, hide_stderr=False):
     result = strip_output(command, hide_stderr=hide_stderr)
     return result
 
-def instantiate(nix_file, attributes=None, show_trace=True):
+def instantiate(nix_file=None, attributes=None, nix_expr=None,
+                show_trace=True):
     """Wraps a call to nix-instantiate."""
-    attributes = [] if attributes is None else attributes
-    command = nix_cmd("nix-instantiate", [nix_file, "--no-gc-warning"])
+    if nix_expr is not None:
+        command = nix_cmd("nix-instantiate", ["-E", nix_expr])
+        logging.info("Instantiating nix expression {}"
+                     .format(repr(nix_expr)))
+    elif nix_file is not None:
+        logging.info("Instantiating attribute{} {} from path {}"
+                     .format("s" if len(attributes) > 1 else "",
+                             ", ".join(attributes), nix_file))
+        attributes = [] if attributes is None else attributes
+        command = nix_cmd("nix-instantiate", [nix_file])
+        for attr in attributes:
+            command.extend(["-A", attr])
+    else:
+        raise ValueError("Either an expression or a nix file must be given.")
+    command.append("--no-gc-warning")
     if show_trace is True:
         command.append("--show-trace")
-    for attr in attributes:
-        command.extend(["-A", attr])
     try:
         return strip_output(command).split()
     except CalledProcessError as err:
-        six.raise_from(NixInstantiationError(nix_file, attributes), err)
+        six.raise_from(NixInstantiationError(nix_file=nix_file,
+                                             nix_expr=nix_expr,
+                                             attributes=attributes), err)
 
 def tell_size(obj, word, suffix="s"):
     """Useful when you want to write a message to the user.

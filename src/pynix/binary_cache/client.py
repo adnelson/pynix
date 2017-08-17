@@ -698,8 +698,9 @@ class NixCacheClient(object):
         logging.info("Found {} paths in the store.".format(len(paths)))
         self.send_objects(paths)
 
-    def build_fetch(self, nix_file, attributes, verbose=False, show_trace=True,
-                    keep_going=True, create_links=False, use_deriv_name=True):
+    def build_fetch(self, nix_file=None, attributes=None, nix_expr=None,
+                    verbose=False, show_trace=True, keep_going=True,
+                    create_links=False, use_deriv_name=True):
         """Given a nix file, instantiate the given attributes within the file,
         query the server for which files can be fetched, and then
         build/fetch everything.
@@ -707,11 +708,8 @@ class NixCacheClient(object):
         :return: A dictionary mapping derivations to outputs that were built.
         :rtype: ``dict``
         """
-        logging.info("Instantiating attribute{} {} from path {}"
-                     .format("s" if len(attributes) > 1 else "",
-                             ", ".join(attributes), nix_file))
-        deriv_paths = instantiate(nix_file, attributes=attributes,
-                                  show_trace=show_trace)
+        deriv_paths = instantiate(nix_file=nix_file, attributes=attributes,
+                                  nix_expr=nix_expr, show_trace=show_trace)
         derivs_to_outputs = parse_deriv_paths(deriv_paths)
         need_to_build, need_to_fetch = self.preview_build(deriv_paths)
         if self._dry_run is True:
@@ -882,7 +880,9 @@ def _get_args():
     build.add_argument("-P", "--path", default=os.getcwd(),
                        help="Base path to evaluate.")
     build.add_argument("attributes", nargs="*",
-                       help="Expressions to evaluate.")
+                       help="Attributes to evaluate.")
+    build.add_argument("--nix-expr", "-E",
+                       help="Nix expression to evaluate.")
     build.add_argument("-v", "--verbose", action="store_true", default=False,
                        help="Show verbose output.")
     build.add_argument("--no-trace", action="store_false", dest="show_trace",
@@ -955,8 +955,9 @@ def main():
             keep_going = False if args.one else args.keep_going
             result_derivs = client.build_fetch(
                 nix_file=args.path, attributes=args.attributes,
-                verbose=args.verbose, show_trace=args.show_trace,
-                keep_going=keep_going, create_links=args.create_links,
+                nix_expr=args.nix_expr, verbose=args.verbose,
+                show_trace=args.show_trace, keep_going=keep_going,
+                create_links=args.create_links,
                 use_deriv_name=not args.generic_link_name)
             if args.dry_run is False and args.print_paths is True:
                 for deriv, outputs in result_derivs.items():

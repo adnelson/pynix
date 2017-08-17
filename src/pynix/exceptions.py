@@ -90,10 +90,13 @@ class NixImportFailed(BaseHTTPError, NixOperationError, CliError):
 class NixInstantiationError(NixOperationError, CliError):
     """Raised when nix-instantiate fails."""
     OPERATION = "nix-instantiate"
-    def __init__(self, nix_file, attributes):
+    def __init__(self, nix_file=None, attributes=None, nix_expr=None):
         self.nix_file = nix_file
-        self.attributes = attributes
-        if len(attributes) == 0:
+        self.nix_expr = nix_expr
+        self.attributes = attributes or []
+        if nix_expr is not None:
+            message = "Couldn't evaluate expression {}".format(repr(nix_expr))
+        elif len(attributes) == 0:
             message = "Couldn't evaluate file {}".format(nix_file)
         elif len(attributes) == 1:
             message = ("Couldn't evaluate attribute {} from file {}"
