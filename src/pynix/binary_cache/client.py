@@ -11,7 +11,7 @@ from os.path import (join, exists, isdir, isfile, expanduser, basename,
 import re
 import shutil
 from subprocess import (Popen, PIPE, check_output, CalledProcessError,
-                        check_call)
+                        check_call, call)
 import sys
 import tempfile
 from threading import Thread, RLock, BoundedSemaphore
@@ -42,12 +42,13 @@ import requests
 import six
 
 from pynix import __version__
-from pynix.utils import (strip_output, decode_str, NIX_STORE_PATH,
+from pynix.utils import (strip_output, decode_str, NIX_STORE_PATH, Streamer,
                          NIX_STATE_PATH, NIX_DB_PATH, nix_cmd,
                          query_store, instantiate, tell_size,
                          is_path_in_store, is_tarball)
 from pynix.exceptions import (CouldNotConnect, NixImportFailed, CliError,
-                              ObjectNotBuilt, NixBuildError, NoSuchObject)
+                              ObjectNotBuilt, NixBuildError, NoSuchObject,
+                              NixExportFailed)
 from pynix.binary_cache.nix_info_caches import PathReferenceCache
 from pynix.narinfo import NarInfo
 from pynix.build import needed_to_build_multi, parse_deriv_paths
@@ -66,7 +67,7 @@ class NixCacheClient(object):
     """Wraps some state for sending store objects."""
     def __init__(self, endpoint, dry_run=False, username=None,
                  password=None, cache_location=None, cache_enabled=True,
-                 max_jobs=cpu_count()):
+                 max_jobs=cpu_count(), delete_invalid_paths=False):
         #: Server running servenix (string).
         self._endpoint = endpoint
         #: Base name of server (for caching).
@@ -82,6 +83,8 @@ class NixCacheClient(object):
             self._username = None
         #: Ignored if username is None.
         self._password = password
+        #: If an invalid path is encountered, attempt to delete it.
+        self._delete_invalid_paths = delete_invalid_paths
         #: Set at a later point, if username is not None.
         self._auth = None
         #: Used to avoid unnecessary overhead in handshakes etc.
@@ -436,21 +439,36 @@ class NixCacheClient(object):
         # possible with current requests, or indeed possible in
         # general without knowing the file size.
         session = self._connect()
-        export = check_output(nix_cmd("nix-store", ["--export", path]))
+        proc = Popen(nix_cmd("nix-store", ["--export", path]),
+                     stdout=PIPE, stderr=PIPE)
+        export, err = proc.communicate()
+        if proc.returncode != 0:
+            logging.error("Export of path {} failed.".format(path))
+            deleted = False
+            if self._delete_invalid_paths is True:
+                logging.warn("Deleting {}. You can retry send afterwards."
+                             .format(path))
+                nix_store_args = ["--delete", path, "--ignore-liveness"]
+                result = call(nix_cmd("nix-store", nix_store_args))
+                deleted = result == 0
+            raise NixExportFailed(path, decode_str(err), deleted=deleted)
         # For large files, show progress when compressing
         if len(export) > 1000000:
             logging.info("Compressing {}".format(basename(path)))
             cmd = "pv -ptef -s {} | gzip".format(len(export))
             proc = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE)
             data = proc.communicate(input=export)[0]
+            log_func = logging.info
         else:
             data = gzip.compress(export)
+            log_func = logging.debug
         url = "{}/import-path".format(self._endpoint)
         headers = {"Content-Type": "application/x-gzip"}
+        streamer = Streamer(path, data, log_func)
         try:
             logging.info("Sending {} ({} remaining)"
                          .format(basename(path), len(remaining_objects)))
-            response = session.post(url, data=data, headers=headers)
+            response = session.post(url, data=streamer, headers=headers)
             response.raise_for_status()
         except requests.exceptions.HTTPError as err:
             try:
@@ -932,6 +950,12 @@ def _get_args():
                                default=False,
                                help="If true, reports which paths would "
                                     "be sent/fetched/built.")
+        subparser.add_argument("--log-to", default=None,
+                               help="Log to this file (else stdout)")
+        subparser.add_argument("--log-format", help="Logging format.")
+        subparser.add_argument("--delete-invalid-paths", action="store_true",
+                               default=False,
+                               help="Attempt to delete invalid paths")
     for subparser in (sync, daemon):
         subparser.add_argument("--ignore", nargs="*", default=[],
                                help="Regexes of store paths to ignore.")
@@ -953,16 +977,24 @@ def main():
     elif ENDPOINT_REGEX.match(args.endpoint) is None:
         exit("Invalid endpoint: '{}' does not match '{}'."
              .format(args.endpoint, ENDPOINT_REGEX.pattern))
-    log_level = getattr(logging, args.log_level.upper())
-    logging.basicConfig(level=log_level, format="%(message)s")
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()),
+        format=args.log_format,
+        filename=args.log_to
+    )
     # Hide noisy logging of some external libs
     for name in ("requests", "urllib", "urllib2", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
     max_jobs = 1 if getattr(args, "one", False) else args.max_jobs
     client = NixCacheClient(endpoint=args.endpoint, dry_run=args.dry_run,
-                            username=args.username, max_jobs=max_jobs)
+                            username=args.username, max_jobs=max_jobs,
+                            delete_invalid_paths=args.delete_invalid_paths)
     try:
         if args.command == "send":
+            for path in args.paths:
+                if not is_path_in_store(path):
+                    raise CliError("Path {} is not registered as a valid "
+                                   "path in the nix database.".format(path))
             client.send_objects(args.paths)
         elif args.command == "sync":
             client.sync_store(args.ignore, args.include_drvs,

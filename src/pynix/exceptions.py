@@ -28,6 +28,9 @@ class CliError(Exception):
     """
     EXIT_MESSAGE = None
     RETURN_CODE = 1
+    def __init__(self, message=None, return_code=1):
+        self.EXIT_MESSAGE = message
+        self.RETURN_CODE = return_code
     def exit(self):
         _name = type(self).__name__
         if self.EXIT_MESSAGE is not None:
@@ -86,6 +89,16 @@ class NixImportFailed(BaseHTTPError, NixOperationError, CliError):
         message = "Couldn't perform the import: {}".format(err_message)
         BaseHTTPError.__init__(self, message=message)
         self.EXIT_MESSAGE = message
+
+class NixExportFailed(NixOperationError, CliError):
+    """Raised when the nix-store --export command fails."""
+    OPERATION = "nix-store --export"
+    def __init__(self, path, stderr, deleted=False):
+        message = "Couldn't export {}. Stderr:\n{}".format(path, stderr)
+        if deleted is True:
+            message += "\nThe path was deleted; you may retry."
+        self.EXIT_MESSAGE = message
+
 
 class NixInstantiationError(NixOperationError, CliError):
     """Raised when nix-instantiate fails."""

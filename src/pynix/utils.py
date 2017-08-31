@@ -1,11 +1,17 @@
 """Some utility functions to support store operations."""
 import base64
+import sys
+if sys.version_info >= (3, 0):
+    from io import BytesIO
+else:
+    from StringIO import StringIO as BytesIO
 import logging
 import os
 from os import getenv
-from os.path import exists, join, dirname, isdir, realpath, isfile
+from os.path import exists, join, dirname, isdir, realpath, isfile, basename
 import sqlite3
 from subprocess import call, check_output, PIPE, Popen, CalledProcessError
+import time
 
 import six
 import magic
@@ -93,8 +99,8 @@ os.environ["NIX_DB_DIR"] = dirname(NIX_DB_PATH)
 if os.getenv("IS_NIXOS", "") != "":
     IS_NIXOS = True
 else:
-    IS_NIXOS = (call("nixos-version", shell=True, stderr=PIPE) == 0 or
-                isdir("/etc/nixos"))
+    result = call("nixos-version", shell=True, stdout=PIPE, stderr=PIPE)
+    IS_NIXOS = result == 0 or isdir("/etc/nixos")
 
 NIX_DB_ACCESSIBLE = None
 
@@ -258,3 +264,40 @@ def is_tarball(store_path):
         return False
     mimetype = decode_str(magic.from_file(path, mime=True))
     return mimetype in TARBALL_MIMETYPES
+
+
+class Streamer(BytesIO):
+    """Wrapper around BytesIO which show progress of reads."""
+    def __init__(self, path, data, log_func):
+        BytesIO.__init__(self, data)
+        self._streamed = 0
+        self._len = len(data)
+        self._len_mb = len(data) / 1048576.0
+        self._path = basename(path)
+        self._log_func = log_func
+        self._start_time = time.time()
+        self._last_percent_ten = None
+        self._last_print_time = self._start_time
+
+    def read(self, *args, **kwargs):
+        """Read from the source, printing progress.
+
+        Only prints if at least a half-second has elapsed.
+        """
+        result = BytesIO.read(self, *args, **kwargs)
+        self._streamed += len(result)
+        bytes_per_sec = self._streamed / (time.time() - self._start_time)
+        percent = 100.0 * (float(self._streamed) / self._len)
+        percent_ten = int(percent) // 10
+        if len(result) > 0:
+            if time.time() - self._last_print_time > 0.5:
+                streamed = self._streamed / 1048576.0
+                self._log_func(
+                    "{}: {:.2f}/{:.2f}MB ({:.2f}%), {:.2f} bytes/sec"
+                    .format(self._path, streamed, self._len_mb,
+                            percent, bytes_per_sec))
+                self._last_print_time = time.time()
+        else:
+            self._log_func("{}: completed in {:2f} seconds"
+                           .format(self._path, time.time() - self._start_time))
+        return result
