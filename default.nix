@@ -43,7 +43,7 @@ pythonPackages.buildPythonPackage rec {
     pythonPackages.repoze_lru
   ]);
   checkPhase = ''
-      if ${getOwner} ${pkgs.nix} >/dev/null 2>&1; then
+    if ${getOwner} ${pkgs.nix} >/dev/null 2>&1; then
       echo "Skipping tests due to not working on root-owned nix store"
     else
       nosetests tests
