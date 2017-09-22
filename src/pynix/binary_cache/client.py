@@ -6,7 +6,7 @@ import gzip
 import json
 import logging
 import os
-from os.path import (join, exists, isdir, isfile, expanduser, basename,
+from os.path import (join, isdir, isfile, expanduser, basename,
                      getmtime, splitext)
 import re
 import shutil
@@ -525,7 +525,7 @@ class NixCacheClient(object):
         """
         if path in self._paths_fetched:
             return True
-        elif exists(path):
+        elif is_path_in_store(path):
             self._paths_fetched.add(path)
             return True
         else:
