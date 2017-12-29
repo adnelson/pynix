@@ -84,13 +84,14 @@ assert isdir(NIX_STORE_PATH), \
     "Nix store directory {} doesn't exist".format(NIX_STORE_PATH)
 # The state path can be given explicitly, or else it will be
 # inferred to be sibling to the store directory.
-NIX_STATE_PATH = getenv("NIX_STATE_PATH", join(dirname(NIX_STORE_PATH), "var"))
+NIX_STATE_PATH = getenv("NIX_STATE_PATH",
+                        join(dirname(NIX_STORE_PATH), "var", "nix"))
 assert isdir(NIX_STATE_PATH), \
     "Nix state directory {} doesn't exist".format(NIX_STATE_PATH)
 # Nix reads this env variable; set it here
 os.environ["NIX_STATE_DIR"] = NIX_STATE_PATH
 
-NIX_DB_PATH = getenv("NIX_DB_PATH", join(NIX_STATE_PATH, "nix/db/db.sqlite"))
+NIX_DB_PATH = getenv("NIX_DB_PATH", join(NIX_STATE_PATH, "db", "db.sqlite"))
 
 # Nix also reads this variable...
 os.environ["NIX_DB_DIR"] = dirname(NIX_DB_PATH)
